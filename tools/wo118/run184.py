@@ -121,7 +121,8 @@ def host_log():
 def up():
     st = load()
     if not listening(PORT):
-        r = subprocess.Popen([live.dotnet(), RELAY, '--port', str(PORT)], cwd=os.path.dirname(RELAY),
+        urls = ['--urls', os.environ.get('KCDMP_TEST_URLS', 'http://127.0.0.1:5273')]
+        r = subprocess.Popen([live.dotnet(), RELAY, '--bind', '127.0.0.1', '--port', str(PORT)] + urls, cwd=os.path.dirname(RELAY),
                              stdout=open(os.path.join(LOGDIR, 'relay.log'), 'a'), stderr=subprocess.STDOUT, creationflags=DETACHED)
         for _ in range(40):
             if listening(PORT):

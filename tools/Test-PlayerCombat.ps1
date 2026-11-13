@@ -132,8 +132,8 @@ if (-not $RelayExe) {
     if (-not $RelayExe) { throw "no built KcdMpServer.exe found -- run: dotnet build dotnet\KcdMp.Server\KcdMp.Server.csproj" }
 }
 Write-Host "starting an isolated relay on port $Port (http $HttpPort) so a live session is untouched..."
-$env:ASPNETCORE_URLS = "http://localhost:$HttpPort"
-$relayProc = Start-Process -FilePath $RelayExe -ArgumentList "--port $Port" -PassThru -WindowStyle Hidden
+$env:ASPNETCORE_URLS = "http://127.0.0.1:$HttpPort"
+$relayProc = Start-Process -FilePath $RelayExe -ArgumentList "--bind", "127.0.0.1", "--port", "$Port", "--Urls", "http://127.0.0.1:$HttpPort" -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 2
 if ($relayProc.HasExited) { throw "the relay exited immediately (port $Port already in use?)" }
 

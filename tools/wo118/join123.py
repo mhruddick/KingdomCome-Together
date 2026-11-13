@@ -52,7 +52,7 @@ def up(agent, relay):
         sys.exit('an agent is already running (pid %s) -- `down` first; two agents would fight' % ', '.join(map(str, running)))
     st = {}
     if not listening(7778):
-        r = subprocess.Popen(launch(os.path.abspath(relay)) + ['--port', '7778'], cwd=os.path.dirname(os.path.abspath(relay)),
+        r = subprocess.Popen(launch(os.path.abspath(relay)) + ['--bind', '127.0.0.1', '--port', '7778', '--urls', 'http://127.0.0.1:5273'], cwd=os.path.dirname(os.path.abspath(relay)),
                              stdout=open(os.path.join(live.LOGS, 'relay123.log'), 'w'), stderr=subprocess.STDOUT, creationflags=DETACHED)
         st['relay'] = r.pid
         for _ in range(40):
