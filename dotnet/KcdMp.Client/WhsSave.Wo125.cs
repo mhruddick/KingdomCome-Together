@@ -57,7 +57,10 @@ public static partial class WhsSave
     {
         var rec = NodeBytes(raw, HenryChain(raw)[^1]);
         var items = RecordItemSet(rec);
+        var ps = ExtractPersonalStash(raw);
+        items.UnionWith(PersonalStashItemSet(ps));
         var p = new HenryParts { Record = rec, Build = build, Seed = ReadSeed(raw), Origin = origin };
+        p.Extensions[PersonalStashExtensionKey] = ps;
         for (int i = 0; i < SideBlocks.Length; i++) p.Side[i] = Payload(raw, PathNodes(raw, SideBlocks[i])[^1]);
         foreach (var (entry, key) in KeyEntries(raw).Entries)
             if (items.Contains(key)) p.KeyEntries.Add(entry);

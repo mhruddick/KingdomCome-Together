@@ -26,6 +26,7 @@ public class WhsSaveTests
     }
     private static byte[] Cat(params byte[][] parts) => parts.SelectMany(p => p).ToArray();
     private static byte[] U32(uint v) { var b = new byte[4]; BinaryPrimitives.WriteUInt32LittleEndian(b, v); return b; }
+    private static byte[] U64(ulong v) { var b = new byte[8]; BinaryPrimitives.WriteUInt64LittleEndian(b, v); return b; }
     private static byte[] G(string guid) => new Guid(guid).ToByteArray();   // bytes_le, as the save stores it
 
     private const string Henry = WhsSave.HenrySoul;
@@ -49,6 +50,8 @@ public class WhsSaveTests
         public uint Story = 1000, Strength = 500;
         public byte[] Renown = [1, 2, 3, 4];
         public List<Item> Items = [];
+        public List<Item> PersonalStashItems = [];
+        public List<(ulong Lo, ulong Hi, byte[] Body)> WorldStashes = [];
         public List<string> Equipped = [];
         public List<string> Perks = [];
         public bool Field1300;
@@ -102,7 +105,14 @@ public class WhsSaveTests
         var souls = Tlv(0x1161, Cat(NpcRecord(s), HenryRecord(s), bohuta));
         var rpg = Tlv(0x7308, Cat(Tlv(0x3529, Cat(Tlv(0x1160, new byte[4]), souls)), Tlv(0x352C, Encoding.ASCII.GetBytes(s.World)),
                                   Tlv(0x352D, [0x2D, s.Side, 1, 1, 1, 1, 1]), Tlv(0x352E, [0x2E, s.Side, 2, 2, 2, 2, 2])));
-        var ent = Tlv(0x7302, Cat(Tlv(0x000A, Encoding.ASCII.GetBytes(s.World + "-qim")), Tlv(0x000B, keys)));
+        var stashEntries = new List<byte[]>();
+        foreach (var ws in s.WorldStashes)
+            stashEntries.Add(Tlv(0x0000, Cat(U64(ws.Lo), U64(ws.Hi), ws.Body)));
+        if (s.PersonalStashItems.Count > 0)
+            stashEntries.Add(Tlv(0x0000, Cat(U64(WhsSave.PersonalStashId.Lo), U64(WhsSave.PersonalStashId.Hi),
+                Tlv(0x0005, Cat(s.PersonalStashItems.Select(ItemRec).ToArray())))));
+        var stash0006 = stashEntries.Count == 0 ? [] : Cat(stashEntries.ToArray());
+        var ent = Tlv(0x7302, Cat(Tlv(0x0006, stash0006), Tlv(0x000A, Encoding.ASCII.GetBytes(s.World + "-qim")), Tlv(0x000B, keys)));
         var pm = Tlv(0x7309, Cat(Tlv(0x0000, [0x90, s.Side, 3, 3, 3, 3, 3]), Tlv(0x0001, [0x91, s.Side, 4, 4, 4, 4, 4]), Tlv(0x0002, Encoding.ASCII.GetBytes(s.World))));
         var gui = Tlv(0x7301, [0x71, s.Side, 5, 5, 5, 5, 5]);
         var cry = Tlv(0x01F7, Cat(Tlv(0x20A9, Cat(Encoding.ASCII.GetBytes("GameState\0"), Encoding.ASCII.GetBytes(s.World))),
