@@ -40,6 +40,8 @@ public static partial class WhsSave
         public byte[]?[] Side = new byte[]?[6];
         /// <summary>0x05AD key-binding entries (whole TLV nodes) naming one of this Henry's own items.</summary>
         public List<byte[]> KeyEntries = [];
+        /// <summary>Named extension blobs carried by v2+ Henry blocks (empty on v1 blocks).</summary>
+        public SortedDictionary<string, byte[]> Extensions = new(StringComparer.Ordinal);
         public string Build = "";
         public uint? Seed;
         public string Origin = OriginSave;
@@ -73,25 +75,34 @@ public static partial class WhsSave
     // ------------------------------------------------------------------ the stored block
 
     private static readonly byte[] BlockMagic = "KCDMPHB1"u8.ToArray();
-    private const int BlockVersion = 1;
+    public const int BlockVersion = 2;
+    public const int MaxBlockExtensions = 256;
+    public const int MaxBlockExtensionBytes = 64 * 1024 * 1024;
 
     /// <summary>
     /// <code>
-    ///   "KCDMPHB1" [u32 version=1] [str build] [u8 hasSeed][u32 seed] [str origin]
+    ///   "KCDMPHB1" [u32 version=2] [str build] [u8 hasSeed][u32 seed] [str origin]
     ///   [u32 len][player_henry record]
     ///   [u8 6] { [i32 len (-1 = the host's block stays)][payload] } x6
     ///   [u32 n] { [u16 len][0x05AD entry] } x n
+    ///   [i32 extCount] { [u16 keyLen][utf8 key][i32 valLen][bytes] } x extCount   (v2+)
     ///   [32-byte SHA-256 of everything before]
     /// </code>
     /// No save header, no world: nothing but Henry.
     /// </summary>
-    public static byte[] SerializeBlock(HenryParts p)
+    public static byte[] SerializeBlock(HenryParts p) => SerializeBlockCore(p, BlockVersion);
+
+    public static byte[] SerializeBlockV1(HenryParts p) => SerializeBlockCore(p, 1);
+
+    private static byte[] SerializeBlockCore(HenryParts p, int version)
     {
+        if (version >= 2 && p.Extensions.Count > MaxBlockExtensions)
+            throw new InvalidDataException($"Henry block extension count {p.Extensions.Count} exceeds {MaxBlockExtensions}");
         using var ms = new MemoryStream();
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
             w.Write(BlockMagic);
-            w.Write(BlockVersion);
+            w.Write(version);
             void Str(string s) { var b = Encoding.UTF8.GetBytes(s); w.Write((ushort)b.Length); w.Write(b); }
             Str(p.Build);
             w.Write((byte)(p.Seed is null ? 0 : 1));
@@ -107,6 +118,21 @@ public static partial class WhsSave
             }
             w.Write(p.KeyEntries.Count);
             foreach (var e in p.KeyEntries) { w.Write((ushort)e.Length); w.Write(e); }
+            if (version >= 2)
+            {
+                w.Write(p.Extensions.Count);
+                foreach (var (ek, ev) in p.Extensions)
+                {
+                    if (string.IsNullOrEmpty(ek)) throw new InvalidDataException("Henry block extension key must not be empty");
+                    var kb = Encoding.UTF8.GetBytes(ek);
+                    if (kb.Length > ushort.MaxValue) throw new InvalidDataException("Henry block extension key length out of range");
+                    if (ev is null || ev.Length > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block extension value length out of range");
+                    w.Write((ushort)kb.Length);
+                    w.Write(kb);
+                    w.Write(ev.Length);
+                    w.Write(ev);
+                }
+            }
         }
         var body = ms.ToArray();
         var o = new byte[body.Length + 32];
@@ -115,7 +141,7 @@ public static partial class WhsSave
         return o;
     }
 
-    /// <summary>Parse and fully check a stored block. Throws <see cref="InvalidDataException"/> on anything wrong.</summary>
+    /// <summary>Parse and fully check a stored block (v1 or v2). Throws <see cref="InvalidDataException"/> on anything wrong.</summary>
     public static HenryParts ParseBlock(byte[] b)
     {
         if (b.Length < BlockMagic.Length + 4 + 32 || !b.AsSpan(0, BlockMagic.Length).SequenceEqual(BlockMagic))
@@ -124,12 +150,20 @@ public static partial class WhsSave
             throw new InvalidDataException("Henry block hash mismatch");
         var p = new HenryParts();
         using var r = new BinaryReader(new MemoryStream(b, 0, b.Length - 32), Encoding.UTF8);
+        byte[] ExactBytes(int len)
+        {
+            if (len == 0) return [];
+            if (len < 0 || r.BaseStream.Length - r.BaseStream.Position < len) throw new InvalidDataException("Henry block truncated");
+            var buf = r.ReadBytes(len);
+            if (buf.Length != len) throw new InvalidDataException("Henry block truncated");
+            return buf;
+        }
         try
         {
-            r.ReadBytes(BlockMagic.Length);
+            ExactBytes(BlockMagic.Length);
             int ver = r.ReadInt32();
-            if (ver != BlockVersion) throw new InvalidDataException($"Henry block version {ver}");
-            string Str() => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
+            if (ver is not (1 or BlockVersion)) throw new InvalidDataException($"Henry block version {ver}");
+            string Str() => Encoding.UTF8.GetString(ExactBytes(r.ReadUInt16()));
             p.Build = Str();
             bool hasSeed = r.ReadByte() == 1;
             uint seed = r.ReadUInt32();
@@ -137,20 +171,34 @@ public static partial class WhsSave
             p.Origin = Str();
             int rl = r.ReadInt32();
             if (rl < 38 || rl > 16 * 1024 * 1024) throw new InvalidDataException("Henry block record length out of range");
-            p.Record = r.ReadBytes(rl);
+            p.Record = ExactBytes(rl);
             int n = r.ReadByte();
             if (n != SideBlocks.Length) throw new InvalidDataException($"Henry block carries {n} side blocks, not {SideBlocks.Length}");
             p.Side = new byte[]?[n];
             for (int i = 0; i < n; i++)
             {
                 int l = r.ReadInt32();
-                if (l < -1 || l > 64 * 1024 * 1024) throw new InvalidDataException("Henry block side length out of range");
-                p.Side[i] = l < 0 ? null : r.ReadBytes(l);
-                if (l > 0 && p.Side[i]!.Length != l) throw new InvalidDataException("Henry block truncated");
+                if (l < -1 || l > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block side length out of range");
+                p.Side[i] = l < 0 ? null : ExactBytes(l);
             }
             int k = r.ReadInt32();
             if (k < 0 || k > 100000) throw new InvalidDataException("Henry block key count out of range");
-            for (int i = 0; i < k; i++) p.KeyEntries.Add(r.ReadBytes(r.ReadUInt16()));
+            for (int i = 0; i < k; i++) p.KeyEntries.Add(ExactBytes(r.ReadUInt16()));
+            if (ver >= 2)
+            {
+                int extCount = r.ReadInt32();
+                if (extCount < 0 || extCount > MaxBlockExtensions) throw new InvalidDataException("Henry block extension count out of range");
+                for (int i = 0; i < extCount; i++)
+                {
+                    int keyLen = r.ReadUInt16();
+                    if (keyLen == 0) throw new InvalidDataException("Henry block extension key must not be empty");
+                    string key = Encoding.UTF8.GetString(ExactBytes(keyLen));
+                    int valLen = r.ReadInt32();
+                    if (valLen < 0 || valLen > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block extension value length out of range");
+                    var val = ExactBytes(valLen);
+                    if (!p.Extensions.TryAdd(key, val)) throw new InvalidDataException($"Henry block duplicate extension key '{key}'");
+                }
+            }
             if (r.BaseStream.Position != r.BaseStream.Length) throw new InvalidDataException("Henry block has trailing bytes");
         }
         catch (EndOfStreamException) { throw new InvalidDataException("Henry block truncated"); }
@@ -465,6 +513,9 @@ public static partial class WhsSave
         }
         if (a.KeyEntries.Count != b.KeyEntries.Count || a.KeyEntries.Zip(b.KeyEntries).Any(p => !p.First.AsSpan().SequenceEqual(p.Second)))
             o.Add($"keys ({a.KeyEntries.Count} vs {b.KeyEntries.Count})");
+        foreach (var k in a.Extensions.Keys.Union(b.Extensions.Keys).OrderBy(x => x, StringComparer.Ordinal))
+            if (!a.Extensions.TryGetValue(k, out var ex) || !b.Extensions.TryGetValue(k, out var ey) || !ex.AsSpan().SequenceEqual(ey))
+                o.Add($"ext {k} ({(a.Extensions.TryGetValue(k, out var ex2) ? ex2.Length : -1)} vs {(b.Extensions.TryGetValue(k, out var ey2) ? ey2.Length : -1)} B)");
         return o;
     }
 
