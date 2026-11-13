@@ -310,6 +310,27 @@ LOG = {}
 check("T1 loot_live off: the host makes no live session", KCD2MP_W217HostOpen(1, "bandit_3") == false and #events("w217_blist") == 0)
 KCD2MP_W217Set("loot_live", "on")
 
+-- ================= M2.1: coordinate-tagged world chest addressing =================
+world()
+local function mkWorldChest(slotKey, rawName, cls, x, y, z)
+    NEXTID = NEXTID + 1
+    local e = { class = cls or "Stash", id = NEXTID, px = x, py = y, pz = z, inventory = mkInventory(), hidden = false }
+    e.GetName = function() return rawName end
+    e.GetWorldPos = function(self) return { x = self.px, y = self.py, z = self.pz } end
+    ENTS[slotKey] = e
+    return e
+end
+local stA = mkWorldChest("stash19_near", "Stash19", "Stash", 2176.15, -1450.25, 31.75)
+local stB = mkWorldChest("stash19_far", "Stash19", "Stash", 3107.15, -1450.25, 31.75)
+local stOther = mkWorldChest("chest_adjacent", "stash[Chest/chest3_c1d92081]", "Stash", 2176.60, -1450.25, 31.75)
+local ckA = KCD2MP_W217ChestKey(stA)
+local ckB = KCD2MP_W217ChestKey(stB)
+local ckOther = KCD2MP_W217ChestKey(stOther)
+check("M2.1 duplicate-named chests at different spots have distinct wire-safe keys", ckA ~= nil and ckB ~= nil and ckA ~= ckB and string.match(ckA, "^[A-Za-z0-9_]+$") ~= nil and #ckA <= 80, ckA)
+check("M2.1 sphere lookup resolves each Stash19 to its own coordinates, never the 931 m namesake", KCD2MP_W217ResolveChestKey(ckA) == stA and KCD2MP_W217ResolveChestKey(ckB) == stB)
+check("M2.1 adjacent chest with different name hash never cross-matches", KCD2MP_W217ResolveChestKey(ckOther) == stOther)
+check("M2.1 System.GetEntityByName resolves wc_ chest keys while NPC names stay unchanged", System.GetEntityByName(ckA) == stA and not KCD2MP_W217IsChestKey("bandit_1"))
+
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0
 for _, r in ipairs(RESULTS) do if r:sub(1, 4) == "PASS" then pass = pass + 1 else fail = fail + 1 end end

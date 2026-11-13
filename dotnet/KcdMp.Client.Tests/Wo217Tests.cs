@@ -146,4 +146,51 @@ public class Wo217Tests
         Assert.NotEqual(Protocol.LootAskTakeReq, Protocol.LootAskTakedown);
         Assert.NotEqual(Protocol.LootHostBodyList, Protocol.LootHostBuild);
     }
+
+    [Fact]
+    public void M2_world_chest_keys_fit_body_name_wire_rules_and_round_trip_coords_and_name_hash()
+    {
+        var k1 = Wo217LootRules.EncodeChestKey("Stash", "Stash19", 2176.15f, -1450.25f, 31.75f);
+        var k2 = Wo217LootRules.EncodeChestKey("Stash", "Stash19", 3107.15f, -1450.25f, 31.75f);
+        Assert.NotNull(k1);
+        Assert.NotNull(k2);
+        Assert.NotEqual(k1, k2);   // duplicate-named world chests at distinct coordinates get distinct wire keys
+        Assert.Matches(Wo134Rules.BodyName, k1!);
+        Assert.True(Wo217LootRules.IsChestKey(k1));
+        Assert.False(Wo217LootRules.IsChestKey("tsem_bandit_1"));
+
+        Assert.True(Wo217LootRules.TryDecodeChestKey(k1, out string cls, out float x, out float y, out float z, out string h8));
+        Assert.Equal("Stash", cls);
+        Assert.Equal(2176.15f, x, 2);
+        Assert.Equal(-1450.25f, y, 2);
+        Assert.Equal(31.75f, z, 2);
+        Assert.Equal(Wo217LootRules.ChestHash("Stash19"), h8);
+
+        // Long nested level container names with punctuation fit within the 80-char BodyName budget and stay distinct
+        const string nestedA = "stash[profession/seller/shop_inside11:profession/seller/shop_base2[profession/seller/shop_inside11]:Chest/chest3_fec43193]";
+        const string nestedB = "stash[profession/seller/shop_inside11:profession/seller/shop_base2[profession/seller/shop_inside11]:Chest/chest3_aaaaaaaa]";
+        var ka = Wo217LootRules.EncodeChestKey("CartStash", nestedA, -99999.99f, -99999.99f, -99999.99f);
+        var kb = Wo217LootRules.EncodeChestKey("CartStash", nestedB, -99999.99f, -99999.99f, -99999.99f);
+        Assert.NotNull(ka);
+        Assert.NotNull(kb);
+        Assert.NotEqual(ka, kb);
+        Assert.True(ka!.Length <= 80);
+        Assert.Matches(Wo134Rules.BodyName, ka);
+        Assert.True(Wo217LootRules.TryDecodeChestKey(ka, out string nCls, out _, out _, out _, out string nHash));
+        Assert.Equal("CartStash", nCls);
+        Assert.Equal(Wo217LootRules.ChestHash(nestedA), nHash);
+
+        // LootMsg wire fit check at worst-case chest key length + 8-item BodyList chunk
+        string clsGuid = "4cea28a0-0814-405a-bf24-4fd711f7eb63";
+        string chunk = string.Join(",", Enumerable.Range(1, 8).Select(i => $"userdata__0000012{i}:{clsGuid}:99999:0.8500:0:1:ttac_blacksmith"));
+        var pkt = new LootMsg(Protocol.LootHostBodyList, 0, $"{ka} 999 8 8 {chunk}").BuildUp(Protocol.LootHostUp, 1);
+        Assert.True(Protocol.IsUpLenOk(Protocol.LootHostUp, pkt.Length - 3));
+
+        // Invalid classes / coordinates / malformed strings are rejected
+        Assert.Null(Wo217LootRules.EncodeChestKey("NPC", "bandit_1", 1, 2, 3));
+        Assert.Null(Wo217LootRules.EncodeChestKey("Stash", "", 1, 2, 3));
+        Assert.Null(Wo217LootRules.EncodeChestKey("Stash", "Stash19", 100000f, 0, 0));
+        Assert.False(Wo217LootRules.TryDecodeChestKey("wc_X_p1_p2_p3_00000000_c", out _, out _, out _, out _, out _));
+        Assert.False(Wo217LootRules.TryDecodeChestKey("wc_S_p1_p2_p3_00000000_bad\"quote", out _, out _, out _, out _, out _));
+    }
 }

@@ -257,206 +257,57 @@ public partial class GameBridge
                     && Wo134Rules.TryCoord(f[2], out float gy) && Wo134Rules.TryCoord(f[3], out float gz):
                 await ExecLuaAsync($"if KCD2MP_W134ItemGone then KCD2MP_W134ItemGone(\"{gcls:D}\", {Wo134Rules.F3(gx)}, {Wo134Rules.F3(gy)}, {Wo134Rules.F3(gz)}) end");
                 return;
-            case Protocol.LootHostLedger when Wo134Rules.ParseLedgerPart(m.Text) is { } lp:
-                Wo134OnLedgerPart(lp.Part, lp.N, lp.Rows);
-                await Wo134ApplyIfReadyAsync(timeout: false);
+            case Protocol.LootHostLedger when Wo134Rules.ParseLedgerPart(m.Text) is not null:
+                // M2: per-player chest delta replay is retired; world chests share the host's save via WO-217 live sync.
                 return;
         }
         Interlocked.Increment(ref _w134Dropped);
         Console.WriteLine($"MP-WO134 joiner: malformed {Protocol.LootHostName(m.Kind)} from the host -- dropped ({Q(m.Text.Length > 60 ? m.Text[..60] : m.Text)})");
     }
 
-    // ---------------------------------------------------------------- chests: recording
+    // ---------------------------------------------------------------- chests (retired per-player replay; M2 shared world chests)
 
     private void Wo134OnChestEvent(string arg)
     {
-        var e = Wo134Rules.ParseChestEvent(arg);
-        if (e is null) { Console.WriteLine($"MP-WO134 chests: malformed w134_chest '{arg}'"); return; }
-        lock (_w134Gate)
-        {
-            // A join or a host reload is loading a world: whatever the mod saw change now
-            // is the load, never the player (found live beside a chest at a rejoin).
-            if (_jj is not null || _rewinding || _rejoinPending || _w134ApplyTag is not null)
-            {
-                Console.WriteLine($"MP-WO134 chests: '{arg}' ignored -- a join or reload is loading this world");
-                return;
-            }
-            if (_joinedWorld && _joinedTag is string jt)
-            {
-                _w134JoinerLedger.Add(e);
-                Console.WriteLine($"MP-WO134 chests: joiner {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (world {jt}; ledger {_w134JoinerLedger.Entries.Count}, stored with the next Henry snapshot)");
-                return;
-            }
-            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : null;
-            if (tag is null)
-            {
-                if (_w134HostPending.Count < 2000) _w134HostPending.Add(e);
-                Console.WriteLine($"MP-WO134 chests: host {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (the world is not identified yet: held, {_w134HostPending.Count})");
-                return;
-            }
-            Wo134HostLedgerFor(tag).Add(e);
-            _w134HostDirty = true;
-            Console.WriteLine($"MP-WO134 chests: host {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (world {tag}; ledger {_w134HostLedger!.Entries.Count})");
-        }
-    }
-
-    private Wo134Rules.Ledger Wo134HostLedgerFor(string tag)
-    {
-        if (_w134HostTag != tag || _w134HostLedger is null)
-        {
-            if (_w134HostTag is string old && _w134HostLedger is { } ol && _w134HostDirty) { try { _chestStore.SaveCurrent(old, ol); } catch (IOException) { } }
-            _w134HostTag = tag;
-            _w134HostLedger = _chestStore.Current(tag);
-            _w134HostDirty = false;
-        }
-        if (_w134HostPending.Count > 0)
-        {
-            foreach (var p in _w134HostPending) _w134HostLedger.Add(p);
-            _w134HostPending.Clear();
-            _w134HostDirty = true;
-        }
-        return _w134HostLedger;
+        // M2: non-personal world chests are shared live via WO-217 and persisted in the host's .whs save.
     }
 
     private void Wo134FlushHost()
     {
-        lock (_w134Gate)
-        {
-            if (!_w134HostDirty || _w134HostTag is not string tag || _w134HostLedger is not { } l) return;
-            try { _chestStore.SaveCurrent(tag, l); _w134HostDirty = false; }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Console.WriteLine($"MP-WO134 chests: the host ledger was not written: {ex.Message}"); }
-        }
     }
 
-    /// <summary>WO-125's host identify: a save written pairs the running ledger; a save loaded brings its paired ledger back.</summary>
+    /// <summary>WO-125's host identify hook (M2: per-player chest ledger pairing retired; used for world-scoped loot sidecars).</summary>
     private void Wo134OnHostWorld(string tag, string md5, bool loaded)
     {
         lock (_w134Gate)
         {
-            var cur = Wo134HostLedgerFor(tag);
-            try
-            {
-                if (!loaded)
-                {
-                    _chestStore.Pair(tag, md5, cur);
-                    _chestStore.SaveCurrent(tag, cur);
-                    _w134HostDirty = false;
-                    Console.WriteLine($"MP-WO134 chests: host save md5 {md5[..8]}: ledger paired ({cur.Entries.Count} entries)");
-                }
-                else if (_chestStore.Paired(tag, md5) is { } p)
-                {
-                    _w134HostLedger = p;
-                    _chestStore.SaveCurrent(tag, p);
-                    _w134HostDirty = false;
-                    Console.WriteLine($"MP-WO134 chests: host loaded md5 {md5[..8]}: its paired ledger is back ({p.Entries.Count} entries)");
-                }
-                else Console.WriteLine($"MP-WO134 chests: host loaded md5 {md5[..8]}: no ledger paired with it (a save from before WO-134, or made with no session) -- the running ledger is kept ({cur.Entries.Count} entries)");
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-            {
-                Console.WriteLine($"MP-WO134 chests: host ledger pairing failed: {ex.Message}");
-            }
+            _w134HostTag = tag;
+            _w134HostDirty = false;
         }
     }
 
-    // ---------------------------------------------------------------- chests: a join
+    /// <summary>Host: the joiner is in the world (M2: chest ledger replay retired; loose-item tombstones replay here).</summary>
+    private Task Wo134OnJoinerReadyAsync(byte joiner) => Task.CompletedTask;
 
-    /// <summary>Host: the joiner is in the world -- send it this world's ledger.</summary>
-    private async Task Wo134SendLedgerAsync(byte joiner)
-    {
-        Wo134Rules.Ledger l;
-        lock (_w134Gate)
-        {
-            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : null;
-            l = tag is null ? new Wo134Rules.Ledger() : Wo134HostLedgerFor(tag).Clone();
-        }
-        var parts = Wo134Rules.LedgerParts(l);
-        foreach (var p in parts) await Wo134SendAsync(Protocol.LootHostUp, joiner, Protocol.LootHostLedger, 0, p);
-        Console.WriteLine($"MP-WO134 chests: host ledger sent to ghost {joiner}: {l.Entries.Count} entries in {parts.Count} part(s)");
-    }
+    /// <summary>WO-125 restore hook (M2: per-player chest ledger sidecar retired).</summary>
+    private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = null;
 
-    private uint _w134RxStamp;   // WO-206 E: the world epoch the host's ledger parts were stamped with (one ledger, one epoch)
-
-    private void Wo134OnLedgerPart(int part, int n, List<Wo134Rules.Entry> rows)
-    {
-        lock (_w134Gate)
-        {
-            if (part == 1) { _w134RxParts.Clear(); _w134RxN = n; _w134RxStamp = _w206FrameStamp; }
-            if (n != _w134RxN || _w206FrameStamp != _w134RxStamp) return;   // WO-206 E: a part of another world's ledger is not this one's
-            _w134RxParts[part] = rows;
-            if (_w134RxParts.Count == _w134RxN)
-            {
-                var l = new Wo134Rules.Ledger();
-                foreach (var kv in _w134RxParts) l.Entries.AddRange(kv.Value);
-                _w134RxLedger = l;
-                _w134RxParts.Clear();
-                Console.WriteLine($"MP-WO134 chests: the host's ledger arrived ({l.Entries.Count} entries)");
-            }
-        }
-    }
-
-    /// <summary>WO-125: the restore picked this snapshot (null = a first join): its chest ledger is the joiner's again.</summary>
-    private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = s;
-
-    /// <summary>After the join's Ready: the joiner's ledger is the restored one; wait for the host's, then apply both.</summary>
+    /// <summary>After the join's Ready (M2: per-player chest ledger apply retired; host's .whs save is the chest truth).</summary>
     private void Wo134AfterReady(string tag)
     {
         lock (_w134Gate)
         {
-            string? json = _w134RestoreSnap is { } s && s.Tag == tag ? _henry.LoadChestLedger(s) : null;
-            _w134JoinerLedger = Wo134Rules.Ledger.FromJson(json);
-            Console.WriteLine($"MP-WO134 chests: joiner ledger for world {tag}: {_w134JoinerLedger.Entries.Count} entries ({(_w134RestoreSnap is null ? "a first join: empty" : json is null ? "the restored snapshot has none" : "from the restored snapshot " + _w134RestoreSnap.Short)})");
             _w134RestoreSnap = null;
-            _w134ApplyTag = tag;
-            _w134ApplySinceUtc = DateTime.UtcNow;
+            _w134ApplyTag = null;
             _w134RxLedger = null;
             _w134RxParts.Clear();
         }
     }
 
-    /// <summary>WO-125: a snapshot was stored -- its chest ledger goes beside it.</summary>
+    /// <summary>WO-125 snapshot stored hook (M2: per-player chest ledger sidecar retired).</summary>
     private void Wo134OnSnapshotStored(HenryStore.Snapshot snap)
     {
-        try
-        {
-            string json;
-            lock (_w134Gate) json = _w134JoinerLedger.ToJson();
-            _henry.StoreChestLedger(snap, json);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            Console.WriteLine($"MP-WO134 chests: the joiner ledger was not stored with snapshot {snap.Short}: {ex.Message}");
-        }
     }
 
-    private async Task Wo134ApplyIfReadyAsync(bool timeout)
-    {
-        List<Wo134Rules.Entry> rows;
-        string tag;
-        bool hostIn;
-        Wo134Rules.Ledger hostLedger, ownLedger;
-        uint stamp;
-        lock (_w134Gate)
-        {
-            if (_w134ApplyTag is not string t) return;
-            hostIn = _w134RxLedger is not null;
-            bool late = (DateTime.UtcNow - _w134ApplySinceUtc).TotalSeconds > 15;
-            if (!hostIn && !late && !timeout) return;
-            tag = t;
-            _w134ApplyTag = null;
-            stamp = _w134RxStamp;
-            // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
-            if (hostIn && !Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; hostIn = false; }
-            hostLedger = _w134RxLedger ?? new Wo134Rules.Ledger();
-            ownLedger = _w134JoinerLedger.Clone();
-            rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
-        }
-        if (!hostIn) Console.WriteLine("MP-WO134 chests: the host's ledger did not arrive within 15 s -- only this joiner's own takes are applied");
-        var calls = Wo134Rules.ApplyCalls(rows);
-        foreach (var c in calls) await ExecLuaAsync(c);
-        // WO-206 Part C: one APPLIED record per ledger entry (key = container/class, the ledger's own word for what was done)
-        foreach (var e in hostLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "host-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        foreach (var e in ownLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "own-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        Console.WriteLine($"MP-WO134 chests: world {tag}: {rows.Count} ledger row(s) sent to the mod in {calls.Count} call(s) (host's takes put back, this joiner's own taken out)");
-    }
+    private Task Wo134ApplyIfReadyAsync(bool timeout) => Task.CompletedTask;
 }

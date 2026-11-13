@@ -16842,13 +16842,9 @@ function KCD2MP_W134HostActive()
     return w.host and w.shared and W134.fresh() and (w.peers or 0) > 0
 end
 
--- Chests are recorded on both roles in a shared world, with or without a peer
--- (the host's solo takes are what a later join must put back).
+-- M2: non-personal world chests are shared live via WO-217 and persisted in the host's .whs save (per-player chest recording retired).
 function W134.chestsRecording()
-    local w = KCD2MP.w134
-    if not (w.chests and w.shared and W134.fresh()) then return false end
-    if w.joiner then return KCD2MP_W134JoinerActive() end
-    return w.host
+    return false
 end
 
 function W134.tok()
@@ -17134,7 +17130,7 @@ function W134.bodyState(name, reason, flags, list)
         W134.log(string.format("WO134-BODY state npc=%s reason=%s items=%d -- no such body here", name, tostring(reason), #list))
         return
     end
-    if not W134.isDeadBody(e) then
+    if not (KCD2MP_W217IsChestKey and KCD2MP_W217IsChestKey(name)) and not W134.isDeadBody(e) then
         -- The host's death has not reached this copy yet: keep the list, apply at its death.
         w.stash[name] = list
         W134.log(string.format("WO134-BODY state npc=%s reason=%s items=%d -- alive here, kept for its death", name, tostring(reason), #list))
@@ -17349,8 +17345,12 @@ end
 
 -- ---- NPC bodies: the host -------------------------------------------------------
 
--- Agent -> host: a joiner asked for a body. Answer with its items (parts of 10).
+-- Agent -> host: a joiner asked for a body (or a shared world chest). Answer with its items.
 function KCD2MP_W134HostOpen(peer, tok, name)
+    if KCD2MP_W217IsChestKey and KCD2MP_W217IsChestKey(name) and KCD2MP_W217HostOpen then
+        pcall(KCD2MP_W217HostOpen, peer, name)
+        return
+    end
     W134.hostSend(tostring(peer), tostring(tok), tostring(name), "open")
     if KCD2MP_W217HostOpen then pcall(KCD2MP_W217HostOpen, peer, name) end   -- WO-217 C: and the live list, by item ids
 end
@@ -17669,84 +17669,18 @@ function W134.worldTime()
     return t
 end
 
--- Every container within reach: snapshot on arrival, then every change while in
--- reach is the player's (a take or a put), recorded for the ledgers.
+-- M2: per-player chest delta recording and join-time delta replay are retired; non-personal world chests share the host's .whs save via WO-217.
 function W134.chestPass()
-    local w = KCD2MP.w134
-    local pp = nil
-    pcall(function() pp = player:GetWorldPos() end)
-    if not pp then return end
-    local ents = {}
-    pcall(function() ents = System.GetEntitiesInSphere(pp, w.chestRadiusM) or {} end)
-    local inReach = {}
-    for _, e in ipairs(ents) do
-        local ok, name = W134.isChest(e)
-        if ok then
-            inReach[name] = true
-            local now = W134.counts(W134.items(e))
-            local s = w.chestSess[name]
-            if not s then
-                w.chestSess[name] = { snap = now, hp = {}, at = os.clock() }
-                for _, it in ipairs(W134.items(e)) do w.chestSess[name].hp[it.cls] = it.hp end
-            else
-                local t, r = W134.worldTime(), W134.restockDays(e)
-                for cls, n in pairs(s.snap) do
-                    local m = now[cls] or 0
-                    if m < n then
-                        w.stats.chestTakes = w.stats.chestTakes + 1
-                        KCD2MP_EmitEvent("w134_chest", string.format("%s %s %d %.4f %d %d", name, cls, n - m, s.hp[cls] or 1, math.floor(t), r))
-                        W134.log(string.format("WO134-CHEST take chest=%s cls=%s n=%d world_t=%d restock_d=%d", name, cls, n - m, math.floor(t), r))
-                    end
-                end
-                for _, it in ipairs(W134.items(e)) do s.hp[it.cls] = s.hp[it.cls] or it.hp end
-                for cls, m in pairs(now) do
-                    local n = s.snap[cls] or 0
-                    if m > n then
-                        w.stats.chestPuts = w.stats.chestPuts + 1
-                        KCD2MP_EmitEvent("w134_chest", string.format("%s %s %d %.4f %d %d", name, cls, -(m - n), s.hp[cls] or 1, math.floor(t), r))
-                        W134.log(string.format("WO134-CHEST put chest=%s cls=%s n=%d world_t=%d restock_d=%d", name, cls, m - n, math.floor(t), r))
-                    end
-                end
-                s.snap = now
-            end
-        end
-    end
-    for name in pairs(w.chestSess) do if not inReach[name] then w.chestSess[name] = nil end end
+    KCD2MP.w134.chestSess = {}
+    return false
 end
 
--- Agent -> joiner, after a join loaded: rows = { { container, cls, delta, hp, worldT, restockDays } ... }.
--- delta > 0: put pieces back (the host took them); delta < 0: take them out (the
--- joiner took them). A row older than its container's restock period is left to the
--- engine (it restocks on its own); restock 0 never expires.
 function KCD2MP_W134ChestApply(rows)
     local w = KCD2MP.w134
-    local now = W134.worldTime()
-    local applied, expired, skipped = 0, 0, 0
-    for _, r in ipairs(rows or {}) do
-        local name, cls, delta, hp, t, rd = tostring(r[1]), tostring(r[2]), tonumber(r[3]) or 0, tonumber(r[4]) or 1, tonumber(r[5]) or 0, tonumber(r[6]) or 0
-        local e = nil
-        pcall(function() e = System.GetEntityByName(name) end)
-        if rd > 0 and (now - t) > rd * 86400 then
-            expired = expired + 1
-        elseif not (e and W134.isChest(e)) or delta == 0 then
-            skipped = skipped + 1
-        elseif KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(name) then   -- WO-201 B5: this chest's screen is open
-            local row = r
-            KCD2MP_W201InvDefer("w134-chest", name .. ":" .. cls, "a chest row from the host's ledger", function() KCD2MP_W134ChestApply({ row }) end)
-        else
-            if delta > 0 then
-                pcall(function() e.inventory:CreateItem(cls, hp, delta) end)
-            else
-                W134.deleteClass(e, cls, -delta, hp, nil)
-            end
-            applied = applied + 1
-            w.chestSess[name] = nil   -- re-snapshot: this is not the player's doing
-        end
-    end
-    local s = w.stats
-    s.applied, s.expired, s.skipped = s.applied + applied, s.expired + expired, s.skipped + skipped
-    W134.log(string.format("WO134-CHEST apply rows=%d applied=%d expired=%d skipped=%d world_t=%d", #(rows or {}), applied, expired, skipped, math.floor(now)))
-    KCD2MP_EmitEvent("w134_applied", string.format("%d %d %d", applied, expired, skipped))
+    local n = #(rows or {})
+    w.stats.skipped = w.stats.skipped + n
+    W134.log(string.format("WO134-CHEST apply retired rows=%d -- non-personal chests share the host's save", n))
+    KCD2MP_EmitEvent("w134_applied", string.format("0 0 %d", n))
 end
 
 -- ---- the loop -------------------------------------------------------------------------
@@ -35164,9 +35098,13 @@ do
         local orig = System.GetEntityByName
         System.GetEntityByName = function(n, ...)
             local e = orig(n, ...)
-            if e == nil and type(n) == "string" and #n == 10 and string.sub(n, 1, 2) == "lh" then
-                local real = KCD2MP_W217RealName(n)
-                if real then e = orig(real) end
+            if e == nil and type(n) == "string" then
+                if #n == 10 and string.sub(n, 1, 2) == "lh" then
+                    local real = KCD2MP_W217RealName(n)
+                    if real then e = orig(real) end
+                elseif string.sub(n, 1, 3) == "wc_" and KCD2MP_W217ResolveChestKey then
+                    e = KCD2MP_W217ResolveChestKey(n)
+                end
             end
             return e
         end
@@ -35292,6 +35230,106 @@ do
         return e
     end
 
+    -- ---- M2: coordinate + class + name-hash addressing for shared world containers (wc_<clsTag>_<xCm>_<yCm>_<zCm>_<hash8>_<stem>)
+    local CHEST_TAG = { Stash = "S", CartStash = "C", Nest = "N", DestroStash = "D" }
+    local TAG_CHEST = { S = "Stash", C = "CartStash", N = "Nest", D = "DestroStash" }
+
+    function KCD2MP_W217ChestHash(n)
+        n = tostring(n or "")
+        local h1, h2 = 0, 0
+        for i = 1, #n do
+            local b = string.byte(n, i)
+            h1 = (h1 * 31 + b) % 65521
+            h2 = (h2 * 37 + b) % 65519
+        end
+        return string.format("%04x%04x", h1, h2)
+    end
+
+    local function encCm(v)
+        local cm = math.floor(math.abs(v) * 100 + 0.5)
+        if cm == 0 then return "p0" end
+        return (v < 0 and "n" or "p") .. string.format("%d", cm)
+    end
+
+    local function decCm(s)
+        local sign, digits = string.match(tostring(s or ""), "^([pn])(%d+)$")
+        if not sign or #digits > 7 then return nil end
+        local cm = tonumber(digits)
+        if not cm or cm > 9999999 then return nil end
+        return (sign == "n" and -cm or cm) / 100.0
+    end
+
+    function KCD2MP_W217EncodeChestKey(cls, name, x, y, z)
+        local tag = CHEST_TAG[tostring(cls or "")]
+        name = tostring(name or "")
+        x, y, z = tonumber(x), tonumber(y), tonumber(z)
+        if not (tag and name ~= "" and x and y and z and math.abs(x) < 100000 and math.abs(y) < 100000 and math.abs(z) < 100000) then return nil end
+        local stem = string.gsub(name, "[^A-Za-z0-9]+", "_")
+        stem = string.gsub(stem, "^_+", "")
+        stem = string.gsub(stem, "_+$", "")
+        if stem == "" then
+            stem = "c"
+        elseif #stem > 16 then
+            stem = string.gsub(string.sub(stem, 1, 16), "_+$", "")
+            if stem == "" then stem = "c" end
+        end
+        return string.format("wc_%s_%s_%s_%s_%s_%s", tag, encCm(x), encCm(y), encCm(z), KCD2MP_W217ChestHash(name), stem)
+    end
+
+    function KCD2MP_W217DecodeChestKey(key)
+        local tag, sx, sy, sz, h8 = string.match(tostring(key or ""), "^wc_([SCND])_([pn]%d+)_([pn]%d+)_([pn]%d+)_(%x%x%x%x%x%x%x%x)_[A-Za-z0-9_]+$")
+        if not tag or #(tostring(key)) > 80 then return nil end
+        local cls = TAG_CHEST[tag]
+        local x, y, z = decCm(sx), decCm(sy), decCm(sz)
+        if not (cls and x and y and z) then return nil end
+        return cls, x, y, z, string.lower(h8)
+    end
+
+    function KCD2MP_W217IsChestKey(key) return KCD2MP_W217DecodeChestKey(key) ~= nil end
+    L.isChestKey = KCD2MP_W217IsChestKey
+
+    function KCD2MP_W217ChestKey(e)
+        if not (e and CHEST_TAG[e.class]) then return nil end
+        local n, p = nil, nil
+        pcall(function() n = e:GetName() end)
+        pcall(function() p = e:GetWorldPos() end)
+        if not (n and n ~= "" and p) then return nil end
+        return KCD2MP_W217EncodeChestKey(e.class, n, p.x, p.y, p.z)
+    end
+    L.chestKey = KCD2MP_W217ChestKey
+
+    function KCD2MP_W217ResolveChestKey(key)
+        local wantCls, x, y, z, hash8 = KCD2MP_W217DecodeChestKey(key)
+        if not wantCls then return nil end
+        local radii = wantCls == "CartStash" and { 2.5, 8.0 } or { 2.5 }
+        for _, r in ipairs(radii) do
+            local best, bd2 = nil, r * r
+            local ents = {}
+            pcall(function() ents = System.GetEntitiesInSphere({ x = x, y = y, z = z }, r + 0.05) or {} end)
+            for _, e in ipairs(ents) do
+                if e and e.class == wantCls and e.inventory then
+                    local nm, p = nil, nil
+                    pcall(function() nm = e:GetName() end)
+                    pcall(function() p = e:GetWorldPos() end)
+                    if nm and nm ~= L.ESCROW and p and KCD2MP_W217ChestHash(nm) == hash8 then
+                        local d2 = (p.x - x) ^ 2 + (p.y - y) ^ 2 + (p.z - z) ^ 2
+                        if d2 <= bd2 then best, bd2 = e, d2 end
+                    end
+                end
+            end
+            if best then return best end
+        end
+        return nil
+    end
+
+    function L.resolve(name)
+        name = tostring(name or "")
+        if KCD2MP_W217IsChestKey(name) then return KCD2MP_W217ResolveChestKey(name) end
+        local e = nil
+        pcall(function() e = System.GetEntityByName(name) end)
+        return e
+    end
+
     -- an item id's text on the wire: letters, digits and _ only (the game's own text of the id, its other characters as _)
     function L.key(id) return (string.gsub(tostring(id), "[^%w]", "_")) end
     -- an inventory's items by their id's text: { [idText] = { w = id, cls, amt, hp } }
@@ -35369,8 +35407,7 @@ do
     function L.hostSend(name, force)
         local h = L.hostLive[name]
         if not h then return end
-        local e = nil
-        pcall(function() e = System.GetEntityByName(name) end)
+        local e = L.resolve(name)
         local list = e and L.hostList(e) or {}
         local sig = table.concat(list, ",")
         if not force and sig == h.sig then return end
@@ -35410,8 +35447,7 @@ do
     -- a joiner's take: the item with that host id, if the body still has it
     function KCD2MP_W217HostTakeReq(peer, tok, name, hostId, cls, amt)
         name, hostId, tok, peer = tostring(name), tostring(hostId), tostring(tok), tostring(peer)
-        local e = nil
-        pcall(function() e = System.GetEntityByName(name) end)
+        local e = L.resolve(name)
         local have = e and L.ids(e)[hostId] or nil
         ledger("host", "request", name, hostId, cls, amt, tok, "peer=" .. peer)
         if not have then
@@ -35451,8 +35487,7 @@ do
             L.stats.acks = L.stats.acks + 1
             ledger("host", "acked", t.body, t.hostId, t.cls, t.amt, tok, "escrow=deleted")
         else
-            local e = nil
-            pcall(function() e = System.GetEntityByName(t.body) end)
+            local e = L.resolve(t.body)
             local back = e and L.move(esc, t.w, e)
             L.stats.backToBody = L.stats.backToBody + 1
             ledger("host", "cancelled", t.body, t.hostId, t.cls, t.amt, tok, back and "back=body" or "back=FAILED")
@@ -35485,8 +35520,7 @@ do
     -- the copy follows the host's list by its ids
     function L.apply(name, rev, list)
         local w = KCD2MP.w134
-        local e = nil
-        pcall(function() e = System.GetEntityByName(name) end)
+        local e = L.resolve(name)
         if not e then lg("WO217-LOOT list npc=%s rev=%d -- no such body here", name, rev); return end
         local s = L.sess[name]
         local po = w.pendingOpen[name]
@@ -35567,8 +35601,7 @@ do
             for p, at in pairs(h.peers) do if now - at > L.SESSION_S then h.peers[p] = nil else any = true end end
             if not any then L.hostLive[name] = nil
             else
-                local e = nil
-                pcall(function() e = System.GetEntityByName(name) end)
+                local e = L.resolve(name)
                 if e then
                     local nowIds = L.ids(e)
                     local pl = L.ids(player)
@@ -35591,8 +35624,7 @@ do
         end
         -- the joiner: takes out of each live copy
         for name, s in pairs(L.sess) do
-            local e = nil
-            pcall(function() e = System.GetEntityByName(name) end)
+            local e = L.resolve(name)
             if not e then L.sess[name] = nil
             else
                 local nowIds = L.ids(e)

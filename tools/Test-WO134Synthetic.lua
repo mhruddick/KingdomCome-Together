@@ -424,49 +424,34 @@ mkPickable("egg000402", EGG, 1, 1, 102, 100, 10, newItem(EGG, 1, 1))
 LOG = {}; PickableItem.OnUsed(ENTS["egg000402"], player); loop()
 check("I14 nobody connected: nothing is sent", #events("w134_igone") == 0 and ENTS["egg000402"] == nil)
 
--- ================= C: chests =================
+-- ================= C: chests (M2: per-player chest delta replay retired; host .whs save is single chest truth) =================
 world(); asHost(0)
 local ch = mkChest("stash[Chest/chest3_c1d92081-d74b-4955-ade8-384e71325794]", "Stash", 101, 100, 10, 7)
 ch.inventory:CreateItem(DICE, 1, 1); ch.inventory:CreateItem(APPLE, 1, 3)
 LOG = {}; loop()
-check("C1 a chest in reach is snapshotted, nothing recorded yet", #events("w134_chest") == 0)
+check("C1 per-player chest recording is retired (host save + WO-217 live sync own world chests)", W134.chestsRecording() == false and #events("w134_chest") == 0)
 local dw = nil
 for _, w in ipairs(ch.inventory.list) do if ITEMS[w].class == DICE then dw = w end end
 ch.inventory:RemoveItem(dw); player.inventory:AddItem(dw)
 loop()
-local ce = events("w134_chest")[1]
-check("C2 the host takes the dice: recorded (+1, the world time, restock 7)", ce == "stash[Chest/chest3_c1d92081-d74b-4955-ade8-384e71325794] " .. DICE .. " 1 1.0000 1000 7", ce)
+check("C2 a host take from a world chest emits no per-player w134_chest delta", #events("w134_chest") == 0)
 ch.inventory:CreateItem(COAT, 0.5, 1)
 LOG = {}; loop()
-check("C3 a put: recorded as -1", events("w134_chest")[1] ~= nil and string.find(events("w134_chest")[1], COAT .. " -1 ", 1, true) ~= nil, events("w134_chest")[1])
+check("C3 a host put into a world chest emits no per-player w134_chest delta", #events("w134_chest") == 0)
 local grave = mkChest("kcdmp_grave_1_123", "StashCorpse", 101, 101, 10, 0)
 grave.inventory:CreateItem(COAT, 1, 1)
 LOG = {}; loop(); grave.inventory.list = {}; loop()
 check("C4 a grave is never a chest", #events("w134_chest") == 0)
-KCD2MP_W134Tick(false, true, false, 0); TIMERS = {}
-ch.inventory:CreateItem(DICE, 1, 1)
-LOG = {}; loop(); loop()
-check("C5 not a shared world: nothing recorded", #events("w134_chest") == 0)
 world(); asJoiner()
 local ca = mkChest("stash[Chest/a]", "Stash", 300, 300, 10, 7)
 local cb = mkChest("stash[Chest/b]", "Stash", 310, 300, 10, 0)
 cb.inventory:CreateItem(DICE, 1, 1)
-local cc = mkChest("stash[Chest/c]", "Stash", 320, 300, 10, 7)
-WORLD_T = 1000 + 10 * 86400
 LOG = {}
 KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, 1000 + 9 * 86400, 7 },
-                        { "stash[Chest/b]", DICE, -1, 1, 1000, 0 },
-                        { "stash[Chest/c]", APPLE, 2, 1, 1000, 7 },
-                        { "stash[Chest/nowhere]", APPLE, 1, 1, 1000, 0 } })
-check("C6 A is full again for the joiner (the host's take put back)", ca.inventory:GetCountOfClass(DICE) == 1)
-check("C6 B stays empty for him (his own take)", cb.inventory:GetCountOfClass(DICE) == 0)
-check("C6 an entry past its restock is left to the engine", cc.inventory:GetCountOfClass(APPLE) == 0)
-check("C6 the apply line counts applied / expired / skipped", events("w134_applied")[1] == "2 1 1", events("w134_applied")[1])
-player.GetWorldPos = function() return { x = 300, y = 300, z = 10 } end
-KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, WORLD_T, 7 } })
-LOG = {}; loop(); loop()
-check("C7 an apply beside a chest is never recorded as the joiner's take or put", #events("w134_chest") == 0)
-player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+                        { "stash[Chest/b]", DICE, -1, 1, 1000, 0 } })
+check("C5 retired KCD2MP_W134ChestApply never undoes host chest takes on join", ca.inventory:GetCountOfClass(DICE) == 0)
+check("C6 retired KCD2MP_W134ChestApply never strips chests from stale per-player ledgers", cb.inventory:GetCountOfClass(DICE) == 1)
+check("C7 retired KCD2MP_W134ChestApply reports rows as skipped", events("w134_applied")[1] == "0 0 2", events("w134_applied")[1])
 
 -- ================= extra: order and the engine's take =================
 world(); asJoiner()
