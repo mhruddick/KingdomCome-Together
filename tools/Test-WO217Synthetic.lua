@@ -60,6 +60,7 @@ ItemManager = mkstub()
 ItemManager.GetItem = function(w) return ITEMS[w] end
 ItemManager.GetItemOwner = function(w) return ITEMS[w] and ITEMS[w].owner or nil end
 ItemManager.SetItemOwner = function(w, o, stolen) if ITEMS[w] then ITEMS[w].owner = o; ITEMS[w].stolen = stolen end end
+MERGE_STACKS = {}   -- optional: class GUID -> true to emulate engine stack merging on AddItem
 local function mkInventory()
     local inv = { list = {} }
     INVS[#INVS + 1] = inv
@@ -70,11 +71,28 @@ local function mkInventory()
         for _, other in ipairs(INVS) do
             for i, x in ipairs(other.list) do if x == w then table.remove(other.list, i); break end end
         end
+        if MERGE_STACKS[ITEMS[w].class] then
+            for _, x in ipairs(self.list) do
+                if x ~= w and ITEMS[x] and ITEMS[x].class == ITEMS[w].class and math.abs((ITEMS[x].health or 1) - (ITEMS[w].health or 1)) <= 0.01 then
+                    ITEMS[x].amount = ITEMS[x].amount + ITEMS[w].amount
+                    ITEMS[w] = nil
+                    return
+                end
+            end
+        end
         self.list[#self.list + 1] = w
     end
     inv.HasItem = function(self, w) for _, x in ipairs(self.list) do if x == w then return true end end; return false end
     inv.DeleteItem = function(self, w, n)
-        for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); ITEMS[w] = nil; return true end end
+        for i, x in ipairs(self.list) do
+            if x == w then
+                if n and n > 0 and ITEMS[w] and ITEMS[w].amount > n then
+                    ITEMS[w].amount = ITEMS[w].amount - n
+                    return true
+                end
+                table.remove(self.list, i); ITEMS[w] = nil; return true
+            end
+        end
         return false
     end
     inv.RemoveItem = function(self, w) for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); return w end end end
@@ -431,6 +449,130 @@ KCD2MP_W217HostAck(1, "901", "applied")
 hostLazy.__w217ChestInit = nil   -- simulate reload where stash:IsOpened() is true in .whs
 KCD2MP_W134HostOpen(1, 0, hlKey)
 check("M2.2 an already-opened empty chest stays empty on re-open (never refilled)", lazyAssigned == 1 and count(hostLazy.inventory, SWORD) == 0)
+
+-- ================= M2.3: partial stack takes, stack merges, live stack updates, and escrow puts =================
+local ARROW = "11111111-2222-3333-4444-555555555555"
+MERGE_STACKS = { [ARROW] = true, [APPLE] = true }
+
+-- (a) Joiner partial stack take (5 of 20 arrows) into empty pack, then merged partial take (4 of 15) into existing 5-arrow stack
+world(); asJoiner()
+local sc = attachStash(mkWorldChest("stack_chest", "Stash45", "Stash", 101, 100, 10))
+local scKey = KCD2MP_W217ChestKey(sc)
+sc:OnUsed(player, 1)
+KCD2MP_W217BodyList(scKey, 1, 1, 1, { { id = "ha1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a chest opened with 20 arrows", count(sc.inventory, ARROW) == 20)
+
+-- Simulate UI transferring 5 of 20 arrows from sc into player.inventory
+local scArrowW = sc.inventory.list[1]
+ITEMS[scArrowW].amount = 15
+player.inventory:CreateItem(ARROW, 1, 5)
+LOG = {}
+KCD2MP_W217LootPoll()
+local prq = events("w217_treq")[1] or ""
+local ptok = string.match(prq, "^(%S+)")
+check("M2.3a partial take of 5/20 arrows requests amt=5 with hostId ha1 and escrows the 5 arrows",
+    prq:find(" " .. scKey .. " ha1 " .. ARROW .. " 5", 1, true) ~= nil
+    and count(player.inventory, ARROW) == 0 and count(esc().inventory, ARROW) == 5 and count(sc.inventory, ARROW) == 15, prq)
+-- Stale in-flight w217_blist with amt=20 before Host processes tok must NOT snap Joiner's chest back to 20
+KCD2MP_W217BodyList(scKey, 2, 1, 1, { { id = "ha1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a stale pre-take list does not revert Joiner's 15 remaining arrows to 20", count(sc.inventory, ARROW) == 15)
+-- Host grants + pushes rev 3 (amt=15)
+KCD2MP_W217TakeResult(ptok, "grant", scKey, "ha1", "-", 0)
+KCD2MP_W217BodyList(scKey, 3, 1, 1, { { id = "ha1", cls = ARROW, amt = 15, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a granted partial take gives Henry 5 arrows and keeps 15 in chest",
+    count(player.inventory, ARROW) == 5 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 15)
+
+-- Second partial take: Henry ALREADY has 5 arrows; UI merges 4 more onto Henry's existing stack (5 -> 9), chest 15 -> 11
+local pArrowW = player.inventory.list[1]
+ITEMS[sc.inventory.list[1]].amount = 11
+ITEMS[pArrowW].amount = 9
+LOG = {}
+KCD2MP_W217LootPoll()
+prq = events("w217_treq")[1] or ""
+ptok = string.match(prq, "^(%S+)")
+check("M2.3b merged partial take splits 4 into escrow while Henry keeps his prior 5",
+    prq:find(" ha1 " .. ARROW .. " 4", 1, true) ~= nil
+    and count(player.inventory, ARROW) == 5 and count(esc().inventory, ARROW) == 4 and count(sc.inventory, ARROW) == 11, prq)
+KCD2MP_W217TakeResult(ptok, "grant", scKey, "ha1", "-", 0)
+KCD2MP_W217BodyList(scKey, 4, 1, 1, { { id = "ha1", cls = ARROW, amt = 11, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3b granted merged partial take merges 4 back onto Henry's 5 -> 9 arrows",
+    count(player.inventory, ARROW) == 9 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 11)
+
+-- Refused partial take reconciles Joiner's displayed stack back to Host's count
+ITEMS[sc.inventory.list[1]].amount = 6
+ITEMS[player.inventory.list[1]].amount = 14
+LOG = {}
+KCD2MP_W217LootPoll()
+ptok = string.match(events("w217_treq")[1] or "", "^(%S+)")
+KCD2MP_W217BodyList(scKey, 5, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+KCD2MP_W217TakeResult(ptok, "refuse", scKey, "ha1", "gone", 0)
+check("M2.3c refused partial take leaves Henry at 9 and reconciles chest stack to Host's 3",
+    count(player.inventory, ARROW) == 9 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 3)
+
+-- Live Joiner -> Host put: (1) partial put of 2 apples into chest with 0 apples, (2) put of 3 more onto existing 2-apple stack
+player.inventory:CreateItem(APPLE, 1, 10)
+KCD2MP_W217LootPoll()   -- snapshot Henry's 10 apples
+ITEMS[player.inventory.list[#player.inventory.list]].amount = 8
+sc.inventory:CreateItem(APPLE, 1, 2)
+LOG = {}
+KCD2MP_W217LootPoll()
+local putEvt1 = events("w134_put")[1] or ""
+check("M2.3d splitting 2 apples from Henry's 10-apple stack into empty chest slot sends w134_put amt=2",
+    putEvt1:find(" " .. scKey .. " " .. APPLE .. " 2 ", 1, true) ~= nil, putEvt1)
+KCD2MP_W217BodyList(scKey, 6, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 2, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3d Host echo binds hap1 to Joiner's 2 apples cleanly", count(sc.inventory, APPLE) == 2)
+
+-- Now merge 3 more apples from Henry's pack onto the existing 2-apple stack in chest (2 -> 5)
+ITEMS[player.inventory.list[#player.inventory.list]].amount = 5
+for _, w in ipairs(sc.inventory.list) do if ITEMS[w] and ITEMS[w].class == APPLE then ITEMS[w].amount = 5 end end
+LOG = {}
+KCD2MP_W217LootPoll()
+local putEvt2 = events("w134_put")[1] or ""
+check("M2.3e putting 3 more apples onto existing 2-apple chest stack sends w134_put amt=3",
+    putEvt2:find(" " .. scKey .. " " .. APPLE .. " 3 ", 1, true) ~= nil, putEvt2)
+-- Stale rev before Host processed the +3 put keeps chest at 5 (never snaps back to 2)
+KCD2MP_W217BodyList(scKey, 7, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 2, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3e stale pre-put list does not revert merged 5-apple stack to 2", count(sc.inventory, APPLE) == 5)
+KCD2MP_W217BodyList(scKey, 8, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 5, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3e Host echo of 5-apple stack settles cleanly", count(sc.inventory, APPLE) == 5)
+
+-- (f) Host side: partial stack deduction via escrow AND live Joiner put while Host ALSO has UI screen open!
+world(); asHost(1)
+local hsc = attachStash(mkWorldChest("host_stack_chest", "Stash45", "Stash", 101, 100, 10))
+hsc.inventory:CreateItem(ARROW, 1, 20)
+local hscKey = KCD2MP_W217ChestKey(hsc)
+local hArrId = key(hsc.inventory.list[1])
+KCD2MP_W217HostOpen(1, hscKey)
+-- Host ALSO opens its inventory UI on this chest right now!
+KCD2MP_W201InvIntent(hscKey, "ours")
+KCD2MP_W201InvScreen("in", "element")
+LOG = {}
+KCD2MP_W217HostTakeReq(1, "501", hscKey, hArrId, ARROW, 5)
+local htres = events("w217_tres")[1] or ""
+local hblist = events("w217_blist")[1] or ""
+check("M2.3f Host deducts 5/20 arrows via escrow (15 remain in chest, 5 in escrow) and pushes updated w217_blist immediately",
+    htres:find("^1 501 grant ") ~= nil and count(hsc.inventory, ARROW) == 15 and count(esc().inventory, ARROW) == 5
+    and hblist:find(ARROW .. ":15:", 1, true) ~= nil, hblist)
+KCD2MP_W217HostAck(1, "501", "applied")
+check("M2.3f Ack deletes escrowed 5 arrows on Host", count(esc().inventory, ARROW) == 0 and count(hsc.inventory, ARROW) == 15)
+
+-- Joiner puts 1 apple into empty slot of chest WHILE Host's UI screen is STILL open!
+LOG = {}
+KCD2MP_W134HostPut(1, "502", hscKey, APPLE, 1, 1.0)
+hblist = events("w217_blist")[1] or ""
+check("M2.3g Joiner put while Host UI is open is NOT blocked by WO-201 defer: created via escrow and broadcast immediately",
+    count(hsc.inventory, APPLE) == 1 and count(esc().inventory, APPLE) == 0 and hblist:find(APPLE .. ":1:", 1, true) ~= nil, hblist)
+-- Joiner puts 3 more apples onto that 1-apple stack while Host UI is still open -> merges to 4 and broadcasts immediately!
+LOG = {}
+KCD2MP_W134HostPut(1, "503", hscKey, APPLE, 3, 1.0)
+hblist = events("w217_blist")[1] or ""
+check("M2.3g Joiner stack-merge put while Host UI is open updates Host chest to 4 apples and broadcasts w217_blist immediately",
+    count(hsc.inventory, APPLE) == 4 and hblist:find(APPLE .. ":4:", 1, true) ~= nil, hblist)
+KCD2MP_W201InvScreen("out", "element")
+MERGE_STACKS = {}
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

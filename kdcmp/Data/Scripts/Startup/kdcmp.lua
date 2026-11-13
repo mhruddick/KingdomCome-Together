@@ -17420,12 +17420,15 @@ function KCD2MP_W134HostTake(peer, tok, name, cls, amt, hp, screen)
     if e then w.bodySig[tostring(name)] = nil end   -- the next watch pass sends the new state to every joiner
 end
 
--- Agent -> host: a joiner put an item into its copy of this body: it goes into the host's too.
+-- Agent -> host: a joiner put an item into its copy of this body or shared chest: it goes into the host's too.
 function KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp)
+    if KCD2MP_W217HostPut and KCD2MP_W217LootLive and KCD2MP_W217LootLive() then
+        if KCD2MP_W217HostPut(peer, tok, name, cls, amt, hp) then return end
+    end
     local e = nil
     pcall(function() e = System.GetEntityByName(tostring(name)) end)
     if not e then return end
-    if KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(tostring(name)) then   -- WO-201 B5
+    if KCD2MP_W201InvBusy and KCD2MP_W201InvBusy(tostring(name)) then   -- WO-201 B5 (legacy twin path when loot_live is off)
         return KCD2MP_W201InvDefer("w134-put", tostring(name), "a joiner's put", function() KCD2MP_W134HostPut(peer, tok, name, cls, amt, hp) end)
     end
     pcall(function() e.inventory:CreateItem(tostring(cls), tonumber(hp) or 1, tonumber(amt) or 1) end)
@@ -35622,35 +35625,165 @@ do
         L.setActive()
         return true
     end
-    -- a joiner's take: the item with that host id, if the body still has it
+    -- M2: split takeAmt out of item w (curAmt > takeAmt) inside target via escrow moves only (remW moves back to target BEFORE takeW is
+    -- created in esc so stackable CreateItem never merges back onto remW). Returns (takeW, newRemKey).
+    function L.splitInEscrow(esc, target, w, cls, hp, curAmt, takeAmt, owner, stolen)
+        if not (esc and target and curAmt > takeAmt and takeAmt > 0) then return nil, nil end
+        local remAmt = curAmt - takeAmt
+        if not L.move(target, w, esc) then return nil, nil end
+        local origKey = L.key(w)
+        pcall(function() esc.inventory:DeleteItem(w, takeAmt) end)
+        local afterDel = L.ids(esc)
+        local remW = nil
+        if afterDel[origKey] and afterDel[origKey].amt == remAmt then
+            remW = afterDel[origKey].w
+        else
+            if afterDel[origKey] then pcall(function() esc.inventory:DeleteItem(w, -1) end) end
+            local b0 = L.ids(esc)
+            pcall(function() esc.inventory:CreateItem(cls, hp, remAmt) end)
+            for k, v in pairs(L.ids(esc)) do
+                if not b0[k] and v.cls == cls and v.amt == remAmt then remW = v.w; break end
+            end
+            if remW and (tonumber(stolen) == 1 or (owner and owner ~= "-")) then L.setFlags(remW, owner or "-", stolen or 0) end
+        end
+        local remKey = nil
+        if remW then
+            local beforeBack = L.ids(target)
+            if L.move(esc, remW, target) then
+                local afterBack = L.ids(target)
+                local rk = L.key(remW)
+                if afterBack[rk] then remKey = rk
+                else
+                    for k, v in pairs(afterBack) do
+                        if v.cls == cls and (not beforeBack[k] or v.amt > beforeBack[k].amt) then remKey = k; break end
+                    end
+                end
+            else
+                pcall(function() esc.inventory:DeleteItem(remW, -1) end)
+                return nil, nil
+            end
+        end
+        local bTake = L.ids(esc)
+        pcall(function() esc.inventory:CreateItem(cls, hp, takeAmt) end)
+        local takeW = nil
+        for k, v in pairs(L.ids(esc)) do
+            if not bTake[k] and v.cls == cls and v.amt == takeAmt then takeW = v.w; break end
+        end
+        if not takeW then
+            -- fallback if esc already held an unreferenced stack of cls that merged
+            for k, v in pairs(L.ids(esc)) do
+                if v.cls == cls and bTake[k] and v.amt == bTake[k].amt + takeAmt then takeW = v.w; break end
+            end
+        end
+        if takeW and (tonumber(stolen) == 1 or (owner and owner ~= "-")) then L.setFlags(takeW, owner or "-", stolen or 0) end
+        return takeW, remKey
+    end
+
+    -- M2: move takeAmt of cls out of player.inventory into esc (supports whole WUID moves, split WUIDs, and merged stacks).
+    function L.escrowPlayerTake(esc, pl, prevPinv, directLid, cls, hp, takeAmt)
+        if not esc or takeAmt <= 0 then return nil end
+        if directLid and pl[directLid] and pl[directLid].amt == takeAmt then
+            pcall(function() player.actor:UnequipInventoryItem(pl[directLid].w) end)
+            if L.move(player, pl[directLid].w, esc) then return pl[directLid].w end
+        end
+        for pk, pv in pairs(pl) do
+            if not prevPinv[pk] and pv.cls == cls and pv.amt == takeAmt then
+                pcall(function() player.actor:UnequipInventoryItem(pv.w) end)
+                if L.move(player, pv.w, esc) then return pv.w end
+            end
+        end
+        local cand = nil
+        for pk, pv in pairs(pl) do
+            if pv.cls == cls and pv.amt >= takeAmt then
+                local prevAmt = prevPinv[pk] and prevPinv[pk].amt or 0
+                if pv.amt > prevAmt then cand = pv; break end
+                cand = cand or pv
+            end
+        end
+        if cand then
+            pcall(function() player.actor:UnequipInventoryItem(cand.w) end)
+            if cand.amt == takeAmt then
+                if L.move(player, cand.w, esc) then return cand.w end
+            else
+                local owner, stolen = L.flagsOf(cand.w)
+                local takeW = L.splitInEscrow(esc, player, cand.w, cand.cls, cand.hp or hp or 1, cand.amt, takeAmt, owner, stolen)
+                if takeW then return takeW end
+            end
+        end
+        return nil
+    end
+
+    -- a joiner's take: whole WUID or partial stack delta, if the body/chest still has enough
     function KCD2MP_W217HostTakeReq(peer, tok, name, hostId, cls, amt)
         name, hostId, tok, peer = tostring(name), tostring(hostId), tostring(tok), tostring(peer)
+        local reqAmt = math.max(1, math.floor(tonumber(amt) or 1))
         local e = L.resolve(name)
         local have = e and L.ids(e)[hostId] or nil
-        ledger("host", "request", name, hostId, cls, amt, tok, "peer=" .. peer)
-        if not have then
-            ledger("host", "refuse", name, hostId, cls, amt, tok, "why=gone")
+        ledger("host", "request", name, hostId, cls, reqAmt, tok, "peer=" .. peer)
+        if not have or have.amt < reqAmt then
+            ledger("host", "refuse", name, hostId, cls, reqAmt, tok, "why=gone")
             L.stats.refusals = L.stats.refusals + 1
             KCD2MP_EmitEvent("w217_tres", string.format("%s %s refuse %s %s gone 0", peer, tok, name, hostId))
+            if have and have.amt < reqAmt then L.hostSend(name, true) end
             return false
         end
         local owner, stolen = L.flagsOf(have.w)
-        -- out of the body: into this machine's escrow (the joiner's ack deletes it; only his cancel puts it back), never deleted under an
-        -- open screen of the host's
         local esc = L.escrow()
-        if not (esc and L.move(e, have.w, esc)) then
-            ledger("host", "refuse", name, hostId, have.cls, have.amt, tok, "why=move-failed")
+        local escW = nil
+        local partial = have.amt > reqAmt
+        if not esc then
+            ledger("host", "refuse", name, hostId, have.cls, reqAmt, tok, "why=move-failed")
+            KCD2MP_EmitEvent("w217_tres", string.format("%s %s refuse %s %s busy 0", peer, tok, name, hostId))
+            return false
+        end
+        if partial then
+            escW = L.splitInEscrow(esc, e, have.w, have.cls, have.hp, have.amt, reqAmt, owner, stolen)
+        elseif L.move(e, have.w, esc) then
+            escW = have.w
+        end
+        if not escW then
+            ledger("host", "refuse", name, hostId, have.cls, reqAmt, tok, "why=move-failed")
             KCD2MP_EmitEvent("w217_tres", string.format("%s %s refuse %s %s busy 0", peer, tok, name, hostId))
             return false
         end
         L.markChestTouched(e)
-        L.hostEsc[peer .. ":" .. tok] = { w = have.w, body = name, hostId = hostId, cls = have.cls, amt = have.amt, peer = peer, at = os.clock() }
+        L.hostEsc[peer .. ":" .. tok] = { w = escW, body = name, hostId = hostId, cls = have.cls, amt = reqAmt, hp = have.hp,
+                                          owner = owner, stolen = stolen, partial = partial, peer = peer, at = os.clock() }
         L.stats.grants = L.stats.grants + 1
-        ledger("host", "grant", name, hostId, have.cls, have.amt, tok, string.format("stolen=%d owner=%s", stolen, owner))
-        ledger("host", "removed", name, hostId, have.cls, have.amt, tok, "into=escrow")
+        ledger("host", "grant", name, hostId, have.cls, reqAmt, tok, string.format("stolen=%d owner=%s", stolen, owner))
+        ledger("host", "removed", name, hostId, have.cls, reqAmt, tok, "into=escrow")
         KCD2MP_EmitEvent("w217_tres", string.format("%s %s grant %s %s %s %d", peer, tok, name, hostId, owner, stolen))
         if KCD2MP.w134 and KCD2MP.w134.bodySig then KCD2MP.w134.bodySig[name] = nil end   -- WO-134's watch sends the new state to the others
-        if W134 and W134.noteTake then pcall(W134.noteTake, name, have.cls, peer, have.amt) end
+        if W134 and W134.noteTake and not KCD2MP_W217IsChestKey(name) then pcall(W134.noteTake, name, have.cls, peer, reqAmt) end
+        L.hostSend(name, false)
+        return true
+    end
+    -- M2: a joiner's live put into a body or shared chest: created in escrow and moved into e (never blocked by KCD2MP_W201InvDefer),
+    -- then broadcast immediately via L.hostSend so both screens show the item at once.
+    function KCD2MP_W217HostPut(peer, tok, name, cls, amt, hp)
+        name, cls = tostring(name), tostring(cls)
+        amt = math.max(1, math.floor(tonumber(amt) or 1))
+        hp = tonumber(hp) or 1
+        local e = L.resolve(name)
+        if not e then return false end
+        local esc = L.escrow()
+        if not (esc and esc.inventory) then return false end
+        local before = L.ids(esc)
+        pcall(function() esc.inventory:CreateItem(cls, hp, amt) end)
+        local createdW = nil
+        for k, v in pairs(L.ids(esc)) do
+            if not before[k] and v.cls == cls then createdW = v.w; break end
+        end
+        if not createdW then return false end
+        if not L.move(esc, createdW, e) then
+            pcall(function() esc.inventory:DeleteItem(createdW, -1) end)
+            return false
+        end
+        L.markChestTouched(e)
+        L.stats.hostPuts = (L.stats.hostPuts or 0) + 1
+        if KCD2MP.w134 and KCD2MP.w134.bodySig then KCD2MP.w134.bodySig[name] = nil end
+        if W134 and W134.noteCounts and not KCD2MP_W217IsChestKey(name) then pcall(W134.noteCounts, name, e) end
+        lg("WO217-LOOT host-put inv=%s cls=%s amt=%d from=%s -- moved in via escrow, broadcast live", name, cls, amt, tostring(peer))
         L.hostSend(name, false)
         return true
     end
@@ -35697,7 +35830,7 @@ do
         for i = 1, acc.n do for _, it in ipairs(acc.parts[i]) do list[#list + 1] = it end end
         L.apply(name, rev, list)
     end
-    -- the copy follows the host's list by its ids
+    -- the copy follows the host's list by its ids (including live stack count/condition updates via escrow)
     function L.apply(name, rev, list)
         local w = KCD2MP.w134
         local e = L.resolve(name)
@@ -35711,7 +35844,9 @@ do
         end
         if rev < (s.rev or 0) then return end
         s.rev = rev
+        s.lastList = list
         L.stats.applied = L.stats.applied + 1
+        local now = os.clock()
         local have = L.ids(e)
         local mapped = {}
         for hid, lid in pairs(s.map) do if have[lid] then mapped[lid] = hid else s.map[hid] = nil end end
@@ -35719,36 +35854,100 @@ do
         local want = {}
         local made, out, flagsSet = 0, 0, 0
         for _, it in ipairs(list) do
-            want[it.id] = true
-            local lid = s.map[it.id]
-            if not lid then
-                -- an unmapped item of the same class, amount and condition here is that one (the open's first list)
-                for k, v in pairs(have) do
-                    if not mapped[k] and v.cls == it.cls and v.amt == it.amt and math.abs(v.hp - it.hp) <= 0.01 then lid = k; break end
-                end
-                if lid and s.puts then s.puts[lid] = nil end
-                if not lid then
-                    -- made in the escrow, then moved in (never a create into an inventory a screen may show)
-                    local before = esc and L.ids(esc) or {}
-                    pcall(function() esc.inventory:CreateItem(it.cls, it.hp, it.amt) end)
-                    for k, v in pairs(esc and L.ids(esc) or {}) do
-                        if not before[k] and v.cls == it.cls then if L.move(esc, v.w, e) then lid = k end; break end
-                    end
-                    if lid then made = made + 1 end
-                end
-                if lid then s.map[it.id] = lid; mapped[lid] = it.id end
+            local pendTake = 0
+            for _, t in pairs(s.pend) do
+                if t.hid == it.id then pendTake = pendTake + (t.amt or 0) end
             end
-            if lid then
-                local cur = L.ids(e)[lid]
-                if cur and (it.stolen == 1 or it.owner ~= "-") and L.setFlags(cur.w, it.owner, it.stolen) then flagsSet = flagsSet + 1 end
+            local lid = s.map[it.id]
+            local pendPut = 0
+            local pr = lid and s.puts and s.puts[lid] or nil
+            if type(pr) == "table" then
+                if now - pr.at >= L.ASK_S then s.puts[lid] = nil
+                elseif pr.merged then
+                    local cur0 = have[lid]
+                    if cur0 and (it.amt - pendTake) >= cur0.amt then s.puts[lid] = nil
+                    else pendPut = pr.amt or 0 end
+                end
+            end
+            local wantAmt = it.amt - pendTake + pendPut
+            if wantAmt > 0 then
+                want[it.id] = true
+                if lid then
+                    local cur = L.ids(e)[lid]
+                    if cur and (cur.amt ~= wantAmt or math.abs(cur.hp - it.hp) > 0.01) then
+                        local prevAmt = cur.amt
+                        if L.move(e, cur.w, esc) then
+                            pcall(function() esc.inventory:DeleteItem(cur.w, -1) end)
+                        end
+                        s.map[it.id] = nil; mapped[lid] = nil; lid = nil
+                        local before = esc and L.ids(esc) or {}
+                        local beforeE = L.ids(e)
+                        pcall(function() esc.inventory:CreateItem(it.cls, it.hp, wantAmt) end)
+                        for k, v in pairs(esc and L.ids(esc) or {}) do
+                            if not before[k] and v.cls == it.cls then
+                                if (it.stolen == 1 or it.owner ~= "-") and L.setFlags(v.w, it.owner, it.stolen) then flagsSet = flagsSet + 1 end
+                                if L.move(esc, v.w, e) then
+                                    local afterE = L.ids(e)
+                                    if afterE[k] then lid = k
+                                    else
+                                        for ek, ev in pairs(afterE) do
+                                            if not mapped[ek] and ev.cls == it.cls and (not beforeE[ek] or ev.amt > beforeE[ek].amt) then lid = ek; break end
+                                        end
+                                    end
+                                end
+                                break
+                            end
+                        end
+                        if lid then
+                            s.map[it.id] = lid; mapped[lid] = it.id
+                            for _, t in pairs(s.pend) do if t.hid == it.id then t.lid = lid end end
+                        end
+                        if wantAmt < prevAmt then out = out + 1 else made = made + 1 end
+                    end
+                else
+                    have = L.ids(e)
+                    -- an unmapped item of the same class, amount and condition here is that one (the open's first list or an echoed put)
+                    for k, v in pairs(have) do
+                        if not mapped[k] and v.cls == it.cls and v.amt == wantAmt and math.abs(v.hp - it.hp) <= 0.01 then lid = k; break end
+                    end
+                    if lid and s.puts then s.puts[lid] = nil end
+                    if not lid then
+                        -- made in the escrow, then moved in (never a create into an inventory a screen may show)
+                        local before = esc and L.ids(esc) or {}
+                        local beforeE = L.ids(e)
+                        pcall(function() esc.inventory:CreateItem(it.cls, it.hp, wantAmt) end)
+                        for k, v in pairs(esc and L.ids(esc) or {}) do
+                            if not before[k] and v.cls == it.cls then
+                                if L.move(esc, v.w, e) then
+                                    local afterE = L.ids(e)
+                                    if afterE[k] then lid = k
+                                    else
+                                        for ek, ev in pairs(afterE) do
+                                            if not mapped[ek] and ev.cls == it.cls and (not beforeE[ek] or ev.amt > beforeE[ek].amt) then lid = ek; break end
+                                        end
+                                    end
+                                end
+                                break
+                            end
+                        end
+                        if lid then made = made + 1 end
+                    end
+                    if lid then s.map[it.id] = lid; mapped[lid] = it.id end
+                end
+                if lid then
+                    local cur = L.ids(e)[lid]
+                    if cur and (it.stolen == 1 or it.owner ~= "-") and L.setFlags(cur.w, it.owner, it.stolen) then flagsSet = flagsSet + 1 end
+                end
             end
         end
-        -- what the host's body no longer holds leaves the copy: moved into the escrow (deleted there, out of every screen's sight)
+        -- what the host's body/chest no longer holds leaves the copy: moved into the escrow (deleted there, out of every screen's sight)
         for k, v in pairs(L.ids(e)) do
             local hid = mapped[k]
             local pend = false
-            for _, t in pairs(s.pend) do if t.lid == k then pend = true end end
-            if s.puts and s.puts[k] and os.clock() - s.puts[k] < L.ASK_S then pend = true end   -- a put still on its way to the host
+            for _, t in pairs(s.pend) do if t.lid == k and not t.partial then pend = true end end
+            local pr = s.puts and s.puts[k] or nil
+            local pAt = type(pr) == "table" and pr.at or tonumber(pr)
+            if pAt and now - pAt < L.ASK_S and not hid then pend = true end   -- an unmapped put still on its way to the host
             if not pend and ((hid and not want[hid]) or not hid) then
                 if L.move(e, v.w, esc) then out = out + 1; pcall(function() esc.inventory:DeleteItem(v.w, -1) end) end
                 if hid then s.map[hid] = nil end
@@ -35777,7 +35976,7 @@ do
     function KCD2MP_W217LootPoll()
         if not KCD2MP_W217LootLive() then return false end
         local now = os.clock()
-        -- the host: every live body's list on a change; its own takes logged; stale peers forgotten
+        -- the host: every live body/chest's list on a change; its own takes logged; stale peers forgotten
         for name, h in pairs(L.hostLive) do
             local any = false
             for p, at in pairs(h.peers) do if now - at > L.SESSION_S then h.peers[p] = nil else any = true end end
@@ -35787,61 +35986,101 @@ do
                 if e then
                     local nowIds = L.ids(e)
                     local pl = L.ids(player)
+                    local changed = false
                     for k, v in pairs(h.ids or {}) do
-                        if not nowIds[k] then
+                        local cur = nowIds[k]
+                        local lost = (not cur) and v.amt or (cur.amt < v.amt and (v.amt - cur.amt) or 0)
+                        if lost > 0 then
+                            changed = true
                             local mine = false
                             for _, t in pairs(L.hostEsc) do if t.hostId == k then mine = true end end
-                            if not mine and pl[k] then
+                            if not mine and (pl[k] or cur ~= nil) then
                                 L.stats.hostTakes = L.stats.hostTakes + 1
-                                ledger("host", "request", name, k, v.cls, v.amt, "own", "peer=host")
-                                ledger("host", "grant", name, k, v.cls, v.amt, "own", "peer=host")
-                                ledger("host", "removed", name, k, v.cls, v.amt, "own", "into=player")
-                                ledger("host", "applied", name, k, v.cls, v.amt, "own", "peer=host")
+                                ledger("host", "request", name, k, v.cls, lost, "own", "peer=host")
+                                ledger("host", "grant", name, k, v.cls, lost, "own", "peer=host")
+                                ledger("host", "removed", name, k, v.cls, lost, "own", "into=player")
+                                ledger("host", "applied", name, k, v.cls, lost, "own", "peer=host")
                             end
+                        elseif cur and cur.amt > v.amt then
+                            changed = true
                         end
                     end
+                    for k in pairs(nowIds) do if not (h.ids or {})[k] then changed = true; break end end
+                    if changed then L.markChestTouched(e) end
                     L.hostSend(name, false)
                 end
             end
         end
-        -- the joiner: takes out of each live copy
+        -- the joiner: takes (whole or partial/merged) and puts (whole or partial/merged) on each live copy
         for name, s in pairs(L.sess) do
             local e = L.resolve(name)
             if not e then L.sess[name] = nil
             else
+                local prevSnap = s.snap or {}
+                local prevPinv = s.pinv or {}
                 local nowIds = L.ids(e)
-                local pl = nil
+                local pl = L.ids(player)
+                local prevPackCnt, nowPackCnt = {}, {}
+                for _, pv in pairs(prevPinv) do prevPackCnt[pv.cls] = (prevPackCnt[pv.cls] or 0) + pv.amt end
+                for _, nv in pairs(pl) do nowPackCnt[nv.cls] = (nowPackCnt[nv.cls] or 0) + nv.amt end
+                local packGain, packLoss = {}, {}
+                for cls, nc in pairs(nowPackCnt) do
+                    local pc = prevPackCnt[cls] or 0
+                    if nc > pc then packGain[cls] = nc - pc end
+                end
+                for cls, pc in pairs(prevPackCnt) do
+                    local nc = nowPackCnt[cls] or 0
+                    if pc > nc then packLoss[cls] = pc - nc end
+                end
                 local esc = nil
-                for lid, v in pairs(s.snap or {}) do
-                    if not nowIds[lid] then
+                -- takes: whole WUID gone or stack count reduced on a mapped item
+                for lid, v in pairs(prevSnap) do
+                    local cur = nowIds[lid]
+                    local lost = (not cur) and v.amt or (cur.amt < v.amt and (v.amt - cur.amt) or 0)
+                    if lost > 0 then
                         local hid = nil
-                        for h2, l2 in pairs(s.map) do if l2 == lid then hid = h2 end end
-                        pl = pl or L.ids(player)
-                        if hid and pl[lid] then
-                            -- the screen moved it into the player's pack: into the escrow until the host's grant (unequipped first)
+                        for h2, l2 in pairs(s.map) do if l2 == lid then hid = h2; break end end
+                        local directMove = (not cur) and (pl[lid] ~= nil)
+                        local availGain = packGain[v.cls] or 0
+                        local takeAmt = directMove and pl[lid].amt or math.min(lost, availGain)
+                        if hid and takeAmt > 0 then
                             esc = esc or L.escrow()
-                            pcall(function() player.actor:UnequipInventoryItem(pl[lid].w) end)
-                            local tok = L.tok()
-                            if L.move(player, pl[lid].w, esc) then
-                                s.pend[tok] = { lid = lid, hid = hid, cls = v.cls, amt = v.amt, at = now, w = pl[lid].w }
-                                s.map[hid] = nil
+                            local escW = L.escrowPlayerTake(esc, pl, prevPinv, directMove and lid or nil, v.cls, v.hp, takeAmt)
+                            if escW then
+                                packGain[v.cls] = math.max(0, availGain - takeAmt)
+                                pl = L.ids(player)
+                                local partial = (cur ~= nil)
+                                local tok = L.tok()
+                                s.pend[tok] = { lid = lid, hid = hid, cls = v.cls, amt = takeAmt, hp = v.hp, partial = partial, at = now, w = escW }
+                                if not partial then s.map[hid] = nil end
                                 L.stats.takes = L.stats.takes + 1
                                 L.stats.escrowed = L.stats.escrowed + 1
-                                ledger("joiner", "request", name, hid, v.cls, v.amt, tok)
-                                KCD2MP_EmitEvent("w217_treq", string.format("%s %s %s %s %d", tok, name, hid, v.cls, v.amt))
+                                ledger("joiner", "request", name, hid, v.cls, takeAmt, tok)
+                                KCD2MP_EmitEvent("w217_treq", string.format("%s %s %s %s %d", tok, name, hid, v.cls, takeAmt))
                             else
-                                lg("WO217-LOOT take npc=%s item=%s -- not moved into the escrow (kept by the screen's own move; the host is still asked)", name, hid)
+                                lg("WO217-LOOT take npc=%s item=%s -- not moved into the escrow", name, hid)
                             end
                         end
                     end
                 end
-                -- puts: an item of the player's pack now in the copy (its id survives the move): the host's body gets it (WO-134's put)
+                -- puts: new item WUID or increased stack count in e that came out of player's pack
                 for lid, v in pairs(nowIds) do
-                    if not (s.snap or {})[lid] and (s.pinv or {})[lid] and not s.puts[lid] then
-                        s.puts[lid] = now
-                        local tok = L.tok()
-                        KCD2MP_EmitEvent("w134_put", string.format("%s %s %s %d %.4f", tok, name, v.cls, v.amt, v.hp))
-                        ledger("joiner", "put", name, "local:" .. lid, v.cls, v.amt, tok)
+                    local prev = prevSnap[lid]
+                    local gained = (not prev) and v.amt or (v.amt > prev.amt and (v.amt - prev.amt) or 0)
+                    if gained > 0 then
+                        local directPut = (not prev) and (prevPinv[lid] ~= nil)
+                        local availLoss = packLoss[v.cls] or 0
+                        local putAmt = directPut and gained or math.min(gained, availLoss)
+                        if putAmt > 0 then
+                            packLoss[v.cls] = math.max(0, availLoss - putAmt)
+                            local oldRec = s.puts[lid]
+                            local oldAmt = (type(oldRec) == "table" and (now - oldRec.at) < L.ASK_S) and (oldRec.amt or 0) or 0
+                            s.puts[lid] = { at = now, amt = oldAmt + putAmt, cls = v.cls, hp = v.hp, merged = (prev ~= nil) }
+                            local tok = L.tok()
+                            L.stats.puts = (L.stats.puts or 0) + 1
+                            KCD2MP_EmitEvent("w134_put", string.format("%s %s %s %d %.4f", tok, name, v.cls, putAmt, v.hp))
+                            ledger("joiner", "put", name, "local:" .. lid, v.cls, putAmt, tok)
+                        end
                     end
                 end
                 s.snap = L.ids(e)
@@ -35883,9 +36122,11 @@ do
         s.pend[tok] = nil
         local esc = L.escrow()
         if verdict == "grant" then
+            L.setFlags(t.w, owner or "-", stolen or 0)
             local ok = L.move(esc, t.w, player)
             if ok then
                 L.setFlags(t.w, owner or "-", stolen or 0)
+                s.pinv = L.ids(player)
                 ledger("joiner", "applied", name, t.hid, t.cls, t.amt, tok, string.format("stolen=%s owner=%s", tostring(stolen), tostring(owner)))
                 KCD2MP_EmitEvent("w217_tack", string.format("%s %s applied", tok, name))
             else
@@ -35898,6 +36139,7 @@ do
             L.stats.refusals = L.stats.refusals + 1
             L.stats.escDeleted = L.stats.escDeleted + 1
             ledger("joiner", "refused", name, t.hid, t.cls, t.amt, tok, "why=" .. tostring(verdict))
+            if t.partial and s.lastList then L.apply(name, s.rev, s.lastList) end
             KCD2MP_ShowNativeToast("Already taken")
         end
         return true
