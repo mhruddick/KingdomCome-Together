@@ -61,12 +61,31 @@ public sealed class HenryStore
         DateTime ClaimedUtc,
         long Seq,
         long RemovedSeq = 0,
-        DateTime? RemovedUtc = null)
+        DateTime? RemovedUtc = null,
+        long SelfPickupSeq = 0,
+        DateTime? SelfPickupUtc = null)
     {
         [JsonIgnore]
         public long EffectiveRemovedSeq => RemovedSeq > 0 ? RemovedSeq : Seq;
         [JsonIgnore]
         public DateTime EffectiveRemovedUtc => RemovedUtc ?? ClaimedUtc;
+
+        /// <summary>
+        /// True iff this peer-claimed outgoing drop was present in Henry's saved inventory at the moment
+        /// the snapshot was captured: either before the drop left Henry's inventory (<c>sq &lt; EffectiveRemovedSeq</c>),
+        /// or during an in-flight local self-pickup race before a peer won <c>ItemClaimDown</c>
+        /// (<c>SelfPickupSeq &lt;= sq &lt; Seq</c>).
+        /// </summary>
+        public bool AppliesToSnapshot(long? snapSeq, DateTime snapTakenUtc)
+        {
+            if (snapSeq is long sq && sq > 0 && EffectiveRemovedSeq > 0)
+            {
+                return sq < EffectiveRemovedSeq
+                    || (SelfPickupSeq > 0 && sq >= SelfPickupSeq && Seq > SelfPickupSeq && sq < Seq);
+            }
+            return snapTakenUtc < EffectiveRemovedUtc
+                || (SelfPickupUtc is DateTime spUtc && snapTakenUtc >= spUtc && ClaimedUtc > spUtc && snapTakenUtc < ClaimedUtc);
+        }
     }
 
     public sealed record SnapshotCapture(
@@ -78,7 +97,7 @@ public sealed class HenryStore
     private readonly Func<DateTime> _now;
     private readonly Action<string> _log;
     private readonly object _gate = new();
-    private readonly Dictionary<(string Tag, uint DropId), (long RemovedSeq, DateTime RemovedUtc)> _pendingOutDrops = new();
+    private readonly Dictionary<(string Tag, uint DropId), (long RemovedSeq, DateTime RemovedUtc, long SelfPickupSeq, DateTime? SelfPickupUtc)> _pendingOutDrops = new();
     private readonly List<(SnapshotCapture Capture, DateTime CreatedRealtimeUtc)> _activeCaptures = [];
     private long _nextCaptureTokenId;
 
@@ -216,13 +235,19 @@ public sealed class HenryStore
         if (Snapshots(tag).FirstOrDefault()?.TakenUtc is DateTime newestSnapUtc && candidate <= newestSnapUtc)
             candidate = newestSnapUtc.AddMilliseconds(1);
         foreach (var kv in _pendingOutDrops)
-            if (kv.Key.Tag == tag && candidate <= kv.Value.RemovedUtc)
-                candidate = kv.Value.RemovedUtc.AddMilliseconds(1);
+        {
+            if (kv.Key.Tag != tag) continue;
+            if (candidate <= kv.Value.RemovedUtc) candidate = kv.Value.RemovedUtc.AddMilliseconds(1);
+            if (kv.Value.SelfPickupUtc is DateTime spUtc && candidate <= spUtc) candidate = spUtc.AddMilliseconds(1);
+        }
         if (knownTransfers is not null)
         {
             foreach (var tr in knownTransfers)
-                if (candidate <= tr.EffectiveRemovedUtc)
-                    candidate = tr.EffectiveRemovedUtc.AddMilliseconds(1);
+            {
+                if (candidate <= tr.EffectiveRemovedUtc) candidate = tr.EffectiveRemovedUtc.AddMilliseconds(1);
+                if (tr.SelfPickupUtc is DateTime trSpUtc && candidate <= trSpUtc) candidate = trSpUtc.AddMilliseconds(1);
+                if (candidate <= tr.ClaimedUtc) candidate = tr.ClaimedUtc.AddMilliseconds(1);
+            }
         }
         return candidate;
     }
@@ -251,12 +276,38 @@ public sealed class HenryStore
                 seq = ++w.NextSeq;
                 if (w.LastEventUtc is null || removedUtc > w.LastEventUtc.Value) w.LastEventUtc = removedUtc;
             });
-            _pendingOutDrops[(tag, dropId)] = (seq, removedUtc);
+            _pendingOutDrops[(tag, dropId)] = (seq, removedUtc, 0, null);
             return seq;
         }
     }
 
-    /// <summary>Clear an outgoing drop's early removal boundary (e.g. when the player picks their own drop back up).</summary>
+    /// <summary>
+    /// Record when the player tentatively picks their own outgoing drop back up locally (before the relay's
+    /// ItemClaimDown settles who won), preserving the original <c>RemovedSeq</c> while opening a tentative
+    /// self-pickup window <c>[SelfPickupSeq, Seq)</c> in case a peer wins the claim race.
+    /// </summary>
+    public long NoteSelfPickupAttempt(string tag, uint dropId)
+    {
+        CheckTag(tag);
+        if (dropId == 0) return 0;
+        lock (_gate)
+        {
+            if (!_pendingOutDrops.TryGetValue((tag, dropId), out var pending)) return 0;
+            if (pending.SelfPickupSeq > 0) return pending.SelfPickupSeq;
+            Directory.CreateDirectory(WorldDir(tag));
+            var pickupUtc = NextMonotonicUtcUnlocked(tag, _now());
+            long seq = 0;
+            UpdateWorld(tag, w =>
+            {
+                seq = ++w.NextSeq;
+                if (w.LastEventUtc is null || pickupUtc > w.LastEventUtc.Value) w.LastEventUtc = pickupUtc;
+            });
+            _pendingOutDrops[(tag, dropId)] = (pending.RemovedSeq, pending.RemovedUtc, seq, pickupUtc);
+            return seq;
+        }
+    }
+
+    /// <summary>Clear an outgoing drop's early removal boundary once ItemClaimDown confirms the player won their own drop back.</summary>
     public void ClearOutgoingDrop(string tag, uint dropId)
     {
         CheckTag(tag);
@@ -321,36 +372,20 @@ public sealed class HenryStore
         if (snaps.Count == 0 && activeForTag.Count == 0) return list;
 
         var w = ReadWorld(tag);
-        long minCaptureSeq = long.MaxValue;
-        bool anySeqBound = false;
-        DateTime minLegacyUtc = DateTime.MaxValue;
-        bool anyLegacyBound = false;
-
-        foreach (var cap in activeForTag)
+        bool AppliesToAnyRetainedOrActive(TransferOutEntry t)
         {
-            anySeqBound = true;
-            if (cap.CaptureSeq < minCaptureSeq) minCaptureSeq = cap.CaptureSeq;
-        }
-        foreach (var s in snaps)
-        {
-            if (w.SnapshotSeq.TryGetValue(s.File, out long sq) && sq > 0)
+            foreach (var cap in activeForTag)
+                if (t.AppliesToSnapshot(cap.CaptureSeq, cap.CapturedUtc)) return true;
+            foreach (var s in snaps)
             {
-                anySeqBound = true;
-                if (sq < minCaptureSeq) minCaptureSeq = sq;
+                long? sq = w.SnapshotSeq.TryGetValue(s.File, out long v) && v > 0 ? v : null;
+                if (t.AppliesToSnapshot(sq, s.TakenUtc)) return true;
             }
-            else
-            {
-                anyLegacyBound = true;
-                if (s.TakenUtc < minLegacyUtc) minLegacyUtc = s.TakenUtc;
-            }
+            return false;
         }
 
-        DateTime minAnySnapUtc = snaps.Count > 0 ? snaps.Min(s => s.TakenUtc) : activeForTag.Min(c => c.CapturedUtc);
         return list
-            .Where(t =>
-                (anySeqBound && t.EffectiveRemovedSeq > 0 && t.EffectiveRemovedSeq > minCaptureSeq)
-                || (anyLegacyBound && t.EffectiveRemovedUtc > minLegacyUtc)
-                || (anySeqBound && t.EffectiveRemovedSeq <= 0 && t.EffectiveRemovedUtc > minAnySnapUtc))
+            .Where(AppliesToAnyRetainedOrActive)
             .OrderBy(t => t.EffectiveRemovedSeq)
             .ThenBy(t => t.Seq)
             .ThenBy(t => t.ClaimedUtc)
@@ -384,16 +419,22 @@ public sealed class HenryStore
             });
             long removedSeq = claimSeq;
             DateTime removedUtc = claimedUtc;
+            long selfPickupSeq = 0;
+            DateTime? selfPickupUtc = null;
             if (_pendingOutDrops.Remove((tag, dropId), out var pending))
             {
                 removedSeq = pending.RemovedSeq;
                 removedUtc = pending.RemovedUtc;
+                selfPickupSeq = pending.SelfPickupSeq;
+                selfPickupUtc = pending.SelfPickupUtc;
             }
-            var entry = new TransferOutEntry(dropId, clsGuid.ToString("D"), amount, health, claimedUtc, claimSeq, removedSeq, removedUtc);
+            var entry = new TransferOutEntry(
+                dropId, clsGuid.ToString("D"), amount, health,
+                claimedUtc, claimSeq, removedSeq, removedUtc, selfPickupSeq, selfPickupUtc);
             list.Add(entry);
             list = FilterRetainedTransfersUnlocked(tag, list);
             WriteTransfersUnlocked(tag, list);
-            _log($"MP-HENRY world {tag}: recorded peer-claimed drop {dropId} ({entry.Class[..8]} x{amount}, removed_seq={removedSeq}, claim_seq={claimSeq})");
+            _log($"MP-HENRY world {tag}: recorded peer-claimed drop {dropId} ({entry.Class[..8]} x{amount}, removed_seq={removedSeq}, self_pickup_seq={selfPickupSeq}, claim_seq={claimSeq})");
             return entry;
         }
     }
@@ -408,9 +449,7 @@ public sealed class HenryStore
             if (ReadWorld(tag).SnapshotSeq.TryGetValue(s.File, out long sq) && sq > 0) snapSeq = sq;
         }
         var applicable = transfers
-            .Where(t => snapSeq is long sq && t.EffectiveRemovedSeq > 0
-                ? t.EffectiveRemovedSeq > sq
-                : t.EffectiveRemovedUtc > s.TakenUtc)
+            .Where(t => t.AppliesToSnapshot(snapSeq, s.TakenUtc))
             .Select(t => (t.Class, t.Amount))
             .ToList();
         if (applicable.Count == 0) return new Pick(s, p, how);

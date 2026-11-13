@@ -102,7 +102,15 @@ public partial class GameBridge
     private string _henryOverride = "auto";        // mp_join_henry
     private Dictionary<string, string>? _questClasses;
 
+    private sealed class ReplyCaptureSlot
+    {
+        public HenryStore.SnapshotCapture? Capture;
+        public bool Closed;
+    }
+
     private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _wo124Replies = new();
+    private readonly ConcurrentDictionary<string, ReplyCaptureSlot> _wo124ReplyCaptures = new(StringComparer.Ordinal);
+    private string? _testSavesDirOverride = null;
 
     public sealed record HenrySource(int Playline, string File, string FullPath, long SaveTime)
     {
@@ -113,8 +121,8 @@ public partial class GameBridge
     // ---------------------------------------------------------------- lifecycle
 
     /// <summary>KCDMP_JOIN_SAVES_DIR (tests) or the engine's saves folder.</summary>
-    private static string? ResolveSavesDirForJoin() =>
-        Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR") is { Length: > 0 } d ? d : ResolveSavesDir() ?? Wo159Rules.CreateSavesDirIfGameRan();   // WO-159: a new player's first join
+    private string? ResolveSavesDirForJoin() =>
+        _testSavesDirOverride ?? (Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR") is { Length: > 0 } d ? d : ResolveSavesDir() ?? Wo159Rules.CreateSavesDirIfGameRan());   // WO-159: a new player's first join
 
     private static readonly Regex TransientName = new(@"^mpworld[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
@@ -854,14 +862,21 @@ public partial class GameBridge
     // ---------------------------------------------------------------- asking the mod
 
     /// <summary>Call a mod function with a token; its reply comes back as wo124_reply &lt;tok&gt; &lt;payload&gt;.</summary>
-    private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null);
+    private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null, null);
+
+    /// <summary>Call a mod function and capture the HenryStore boundary synchronously on the log-reader thread when ok=true arrives.</summary>
+    private Task<string> AskModAsync(string fn, int timeoutMs, ReplyCaptureSlot captureSlot) => AskModAsync(fn, timeoutMs, null, captureSlot);
 
     /// <summary>WO-183: with one more argument after the token, already a Lua literal ("..." for a string, a number).</summary>
-    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg)
+    private Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg) => AskModAsync(fn, timeoutMs, luaArg, null);
+
+    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg, ReplyCaptureSlot? captureSlot)
     {
         string tok = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         _wo124Replies[tok] = tcs;
+        if (captureSlot is not null) _wo124ReplyCaptures[tok] = captureSlot;
+        bool completedFromReply = false;
         try
         {
             long t0 = Environment.TickCount64;
@@ -869,11 +884,33 @@ public partial class GameBridge
             await ExecLuaAsync($"if {fn} then {call} else KCD2MP_EmitEvent(\"wo124_reply\", \"{tok} missing\") end");
             long sent = Environment.TickCount64 - t0;
             var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
-            if (done == tcs.Task) return tcs.Task.Result;
+            if (done == tcs.Task)
+            {
+                completedFromReply = true;
+                return await tcs.Task;
+            }
             Console.WriteLine($"MP-ASK timeout fn={fn} tok={tok} send_ms={sent} waited_ms={Environment.TickCount64 - t0}");
             return "timeout";
         }
-        finally { _wo124Replies.TryRemove(tok, out _); }
+        finally
+        {
+            _wo124Replies.TryRemove(tok, out _);
+            _wo124ReplyCaptures.TryRemove(tok, out _);
+            if (captureSlot is not null)
+            {
+                HenryStore.SnapshotCapture? orphan = null;
+                lock (captureSlot)
+                {
+                    captureSlot.Closed = true;
+                    if (!completedFromReply)
+                    {
+                        orphan = captureSlot.Capture;
+                        captureSlot.Capture = null;
+                    }
+                }
+                if (orphan is not null) _henry.ReleaseCapture(orphan);
+            }
+        }
     }
 
     private void Wo124OnEvent(string name, string? arg)
@@ -885,6 +922,17 @@ public partial class GameBridge
                 var s = arg ?? "";
                 int sp = s.IndexOf(' ');
                 string tok = sp > 0 ? s[..sp] : s, payload = sp > 0 ? s[(sp + 1)..] : "";
+                if (_wo124ReplyCaptures.TryRemove(tok, out var capSlot)
+                    && payload.StartsWith("ok=true", StringComparison.Ordinal))
+                {
+                    lock (capSlot)
+                    {
+                        if (!capSlot.Closed && _joinedTag is string snapTag)
+                        {
+                            try { capSlot.Capture = _henry.CaptureBoundary(snapTag); } catch { }
+                        }
+                    }
+                }
                 if (_wo124Replies.TryGetValue(tok, out var t)) t.TrySetResult(payload);
                 else Console.WriteLine($"MP-ASK reply tok={tok} with no ask waiting (late) -- {payload}");
                 return;

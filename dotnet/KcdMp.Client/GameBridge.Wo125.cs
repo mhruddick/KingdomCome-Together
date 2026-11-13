@@ -773,8 +773,19 @@ public partial class GameBridge
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
     }
 
-    /// <summary>Clear the early inventory-removal boundary when the joiner picks (or attempts to pick) their own drop back up.</summary>
+    /// <summary>
+    /// Record when the joiner tentatively picks their own drop back up locally (before the relay's ItemClaimDown settles who won),
+    /// preserving the original pre-drop Removal boundary so on-ground saves keep their remaining items if a peer wins the race.
+    /// </summary>
     private void Wo125OnJoinerDropSelfClaim(uint dropId)
+    {
+        if (!_joinedWorld || _joinedTag is not string tag || _resetTag == tag) return;
+        try { _henry.NoteSelfPickupAttempt(tag, dropId); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+    }
+
+    /// <summary>Clear the pending outgoing drop boundary once ItemClaimDown confirms this joiner won their own drop back.</summary>
+    private void Wo125OnJoinerDropSelfClaimWon(uint dropId)
     {
         if (!_joinedWorld || _joinedTag is not string tag) return;
         try { _henry.ClearOutgoingDrop(tag, dropId); }

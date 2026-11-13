@@ -5573,7 +5573,7 @@ public partial class GameBridge(ClientConfig config)
                         bool claimIsMine = icClaimer == _myGhostId;
                         if (wasMyDrop)
                         {
-                            if (claimIsMine) Wo125OnJoinerDropSelfClaim(icDropId);
+                            if (claimIsMine) Wo125OnJoinerDropSelfClaimWon(icDropId);
                             else if (myDropPayload is not null) Wo125OnJoinerDropClaimedByPeer(icDropId, icClaimer, myDropPayload);
                         }
                         Console.WriteLine($"[itemsync] drop {icDropId} claimed by {(claimIsMine ? "us" : $"ghost {icClaimer}")}");

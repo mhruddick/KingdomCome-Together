@@ -3,7 +3,10 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Reflection;
+using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using KcdMp.Wire;
 using Spec = KcdMp.Client.Tests.WhsSaveTests.Spec;
 using Item = KcdMp.Client.Tests.WhsSaveTests.Item;
@@ -359,5 +362,316 @@ public class M1JoinerDropDisconnectTests : IDisposable
         var pickB = st.PickFor(tag, [M(2)])!;
         var decB = WhsSave.DecodePlayerSoul(pickB.Parts.Record, new WhsSave.Node(0x115E, 0, pickB.Parts.Record.Length - 6));
         Assert.DoesNotContain(decB.Inventory, i => i.Class == Sword);
+    }
+
+    private sealed class SnapshotTestTransport(Func<string, Task>? onExecute = null) : IGameTransport
+    {
+        public readonly ConcurrentQueue<string> LuaCalls = new();
+        public string Name => "snapshot-test";
+        public int RoundTripsPerStateRead => 0;
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task<bool> IsGameReadyAsync(CancellationToken ct = default) => Task.FromResult(true);
+        public Task<PlayerState?> ReadPlayerStateAsync(CancellationToken ct = default) => Task.FromResult<PlayerState?>(null);
+        public Task ExecuteAsync(string lua, CancellationToken ct = default)
+        {
+            LuaCalls.Enqueue(lua);
+            return onExecute is not null ? onExecute(lua) : Task.CompletedTask;
+        }
+        public Task FlushAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task<Guid[]?> ReadEquippedItemClassesAsync(CancellationToken ct = default) => Task.FromResult<Guid[]?>(null);
+        public Task<Guid[]?> ReadGhostEquippedItemClassesAsync(string ghostSoulName, CancellationToken ct = default) => Task.FromResult<Guid[]?>(null);
+        public Task EquipItemOnGhostAsync(string ghostSoulName, Guid itemClass, bool createIfMissing, CancellationToken ct = default) => Task.CompletedTask;
+        public Task UnequipItemOnGhostAsync(string ghostSoulName, Guid itemClass, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<Guid?> ReadGhostSoulGuidAsync(string ghostSoulName, CancellationToken ct = default) => Task.FromResult<Guid?>(null);
+        public Task<string?> ReadSoulNameByGuidAsync(Guid soulGuid, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<(Guid? Guid, string? Name)> ReadPlayerSoulIdentityAsync(CancellationToken ct = default) => Task.FromResult<(Guid?, string?)>((null, null));
+        public Task ExecuteNowAsync(string lua, CancellationToken ct = default) => ExecuteAsync(lua, ct);
+    }
+
+    private static void WireJoinedBridge(
+        GameBridge bridge,
+        HenryStore store,
+        string tag,
+        IGameTransport transport,
+        List<byte[]> sentDrops,
+        List<uint> sentClaims,
+        string? savesDirOverride = null)
+    {
+        var bt = typeof(GameBridge);
+        bt.GetField("_henry", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, store);
+        bt.GetField("_transport", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, transport);
+        bt.GetField("_combat", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(
+            bridge, new CombatPipe("kcdmp-test-" + Guid.NewGuid().ToString("N")));
+        bt.GetField("_myGhostId", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, (byte)2);
+        bt.GetField("_joinedWorld", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, true);
+        bt.GetField("_joinedTag", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, tag);
+        var whereType = bt.GetNestedType("GameWhere", BindingFlags.NonPublic)!;
+        bt.GetField("_where", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, Enum.Parse(whereType, "World"));
+        bt.GetProperty("Interactions", BindingFlags.Public | BindingFlags.Instance)!.SetValue(
+            bridge, new InteractionClient((_, _, _) => Task.CompletedTask));
+        bt.GetField("_sendItemDrop", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(
+            bridge, (Func<byte[], Task>)(p => { sentDrops.Add(p); return Task.CompletedTask; }));
+        bt.GetField("_sendItemClaim", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(
+            bridge, (Func<uint, Task>)(id => { sentClaims.Add(id); return Task.CompletedTask; }));
+        if (savesDirOverride is not null)
+        {
+            bt.GetField("_testSavesDirOverride", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, savesDirOverride);
+            bt.GetField("_lastWorldPlayline", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, 0);
+        }
+    }
+
+    private static void InvokeOnGameEvent(GameBridge bridge, string name, string arg) =>
+        typeof(GameBridge).GetMethod("OnGameEvent", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(bridge, [name, arg]);
+
+    private static async Task DeliverItemClaimDownAsync(GameBridge bridge, byte claimerGhostId, uint dropId)
+    {
+        byte[] payload = new byte[Protocol.ItemClaimDownPayloadLen];
+        payload[0] = claimerGhostId;
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), dropId);
+
+        var inFrameType = typeof(GameBridge).GetNestedType("InFrame", BindingFlags.NonPublic)!;
+        object frame = Activator.CreateInstance(inFrameType, [(int)Protocol.ItemClaimDown, payload, Stopwatch.GetTimestamp(), 0u])!;
+        var channelMethod = typeof(Channel)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == "CreateUnbounded" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0)
+            .MakeGenericMethod(inFrameType);
+        object channel = channelMethod.Invoke(null, null)!;
+        object writer = channel.GetType().GetProperty("Writer")!.GetValue(channel)!;
+        object reader = channel.GetType().GetProperty("Reader")!.GetValue(channel)!;
+        writer.GetType().GetMethod("TryWrite")!.Invoke(writer, [frame]);
+        writer.GetType().GetMethod("Complete")!.Invoke(writer, [null]);
+        var proc = typeof(GameBridge).GetMethod("ProcessFramesAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        await (Task)proc.Invoke(bridge, [reader, CancellationToken.None])!;
+    }
+
+    private static int CountClass(WhsSave.HenryParts parts, string itemClass) =>
+        WhsSave.DecodePlayerSoul(parts.Record, new WhsSave.Node(0x115E, 0, parts.Record.Length - 6))
+               .Inventory.Count(i => i.Class == itemClass);
+
+    [Fact]
+    public async Task Failed_self_pickup_preserves_remaining_item_on_ground_save_while_deducting_from_pre_drop_and_mid_race_saves()
+    {
+        var st = CreateStore();
+        string tag = WhsSave.SeedTag(109);
+        var sentDrops = new List<byte[]>();
+        var sentClaims = new List<uint>();
+        var bridge = new GameBridge(new ClientConfig());
+        var transport = new SnapshotTestTransport();
+        WireJoinedBridge(bridge, st, tag, transport, sentDrops, sentClaims);
+
+        var (_, js) = WhsSaveTests.Pair();
+        Item sword1 = new("20000000-0000-0000-0000-000000000501", Sword, 1);
+        Item sword2 = new("20000000-0000-0000-0000-000000000502", Sword, 1);
+
+        // 1. snap0 (M(0), pre-drop): 2 Swords in Henry's inventory
+        js.Items = [sword1, sword2];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(0), HenryStore.SourceJoin, "pre-drop");
+
+        // 2. Joiner drops sword2 onto the ground via real OnGameEvent("item_drop", ...)
+        _now = _now.AddSeconds(2);
+        InvokeOnGameEvent(bridge, "item_drop", $"{Sword} 1 1.0 100.0 200.0 10.0 dropped_sword_ent");
+        Assert.Single(sentDrops);
+        uint dropId = BinaryPrimitives.ReadUInt32LittleEndian(sentDrops[0]);
+        Assert.NotEqual(0u, dropId);
+
+        // 3. snap1 (M(1), while drop is lying on the ground): 1 Sword in Henry's inventory
+        _now = _now.AddSeconds(2);
+        js.Items = [sword1];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(1), HenryStore.SourceSnapshot, "on-ground");
+
+        // 4. Joiner presses E to pick up own drop (item_claim in flight; Lua tentatively puts sword2 back into Henry's inventory)
+        _now = _now.AddSeconds(2);
+        InvokeOnGameEvent(bridge, "item_claim", $"{dropId}");
+
+        // 5. snap2 (M(2), saved during pickup race before relay echo): 2 Swords temporarily in Henry's inventory
+        _now = _now.AddSeconds(1);
+        js.Items = [sword1, sword2];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(2), HenryStore.SourceSnapshot, "mid-pickup-race");
+
+        // Duplicate item_claim tick before relay echo must NOT advance SelfPickupSeq past M(2)!
+        InvokeOnGameEvent(bridge, "item_claim", $"{dropId}");
+
+        // 6. Peer (ghost 1 != myGhostId 2) wins ItemClaimDown; Lua rolls Henry's live inventory back to 1 Sword
+        _now = _now.AddSeconds(2);
+        await DeliverItemClaimDownAsync(bridge, claimerGhostId: 1, dropId);
+
+        // 7. snap3 (M(3), saved after rollback): 1 Sword in Henry's inventory
+        _now = _now.AddSeconds(2);
+        js.Items = [sword1];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(3), HenryStore.SourceSnapshot, "post-rollback");
+
+        var entries = st.TransfersOut(tag);
+        Assert.Single(entries);
+        Assert.True(entries[0].RemovedSeq > 0);
+        Assert.True(entries[0].SelfPickupSeq > entries[0].RemovedSeq);
+        Assert.True(entries[0].Seq > entries[0].SelfPickupSeq);
+
+        // Assert ALL FOUR restores across both in-memory store and a fresh CreateStore() JSON reload:
+        foreach (var store in new[] { st, CreateStore() })
+        {
+            // M(0) (pre-drop, had 2 Swords) -> deducts 1 -> 1 Sword
+            var pick0 = store.PickFor(tag, [M(0)])!;
+            Assert.Contains("transferred-out", pick0.How);
+            Assert.Equal(1, CountClass(pick0.Parts, Sword));
+
+            // M(1) (on-ground, ALREADY had 1 Sword) -> deducts 0 -> 1 Sword (NEVER 0!)
+            var pick1 = store.PickFor(tag, [M(1)])!;
+            Assert.DoesNotContain("transferred-out", pick1.How);
+            Assert.Equal(1, CountClass(pick1.Parts, Sword));
+
+            // M(2) (mid-pickup-race, temporarily had 2 Swords) -> deducts 1 -> 1 Sword (NEVER 2!)
+            var pick2 = store.PickFor(tag, [M(2)])!;
+            Assert.Contains("transferred-out", pick2.How);
+            Assert.Equal(1, CountClass(pick2.Parts, Sword));
+
+            // M(3) (post-rollback, had 1 Sword) -> deducts 0 -> 1 Sword
+            var pick3 = store.PickFor(tag, [M(3)])!;
+            Assert.DoesNotContain("transferred-out", pick3.How);
+            Assert.Equal(1, CountClass(pick3.Parts, Sword));
+        }
+
+        // Winning self-pickup twin on a clean world: Joiner drops 1 of 2 Swords, saves on-ground M(10) (1 Sword),
+        // presses E (item_claim), and WINS ItemClaimDown (claimer == myGhostId == 2) -> zero TransferOutEntry written!
+        string winTag = WhsSave.SeedTag(110);
+        sentDrops.Clear();
+        sentClaims.Clear();
+        typeof(GameBridge).GetField("_joinedTag", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, winTag);
+
+        js.Items = [sword1, sword2];
+        st.Store(winTag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(0), HenryStore.SourceJoin, "win-pre-drop");
+        InvokeOnGameEvent(bridge, "item_drop", $"{Sword} 1 1.0 100.0 200.0 10.0 win_sword_ent");
+        uint winDropId = BinaryPrimitives.ReadUInt32LittleEndian(sentDrops.Single());
+        js.Items = [sword1];
+        st.Store(winTag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(10), HenryStore.SourceSnapshot, "win-on-ground");
+        InvokeOnGameEvent(bridge, "item_claim", $"{winDropId}");
+        await DeliverItemClaimDownAsync(bridge, claimerGhostId: 2, winDropId);
+
+        Assert.Empty(st.TransfersOut(winTag));
+        Assert.Equal(2, CountClass(st.PickFor(winTag, [M(0)])!.Parts, Sword));
+        Assert.Equal(1, CountClass(st.PickFor(winTag, [M(10)])!.Parts, Sword));
+
+        // FilterRetainedTransfersUnlocked check on `tag`: rotate out M(0) and M(1) while M(2) (mid-race save, where
+        // RemovedSeq < M(2).CaptureSeq < Seq) and M(3) remain retained (98 newer host saves + M(2) + M(3) = 100 = KeepPerWorld).
+        js.Items = [sword1];
+        var oneSwordParts = WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot);
+        for (int s = 100; s < 100 + (HenryStore.KeepPerWorld - 2); s++)
+        {
+            _now = _now.AddSeconds(1);
+            st.Store(tag, oneSwordParts, M(s), HenryStore.SourceSnapshot, $"save {s}");
+        }
+        Assert.DoesNotContain(st.Snapshots(tag), s => s.Md5 == M(0) || s.Md5 == M(1));
+        Assert.Contains(st.Snapshots(tag), s => s.Md5 == M(2));
+        Assert.Single(st.TransfersOut(tag)); // MUST still be retained for M(2)!
+        Assert.Equal(1, CountClass(st.PickFor(tag, [M(2)])!.Parts, Sword));
+
+        // Rotate M(2) and M(3) out with 2 more saves -> transfer entry is now obsolete and pruned cleanly!
+        for (int s = 100 + (HenryStore.KeepPerWorld - 2); s < 100 + HenryStore.KeepPerWorld; s++)
+        {
+            _now = _now.AddSeconds(1);
+            st.Store(tag, oneSwordParts, M(s), HenryStore.SourceSnapshot, $"save {s}");
+        }
+        Assert.DoesNotContain(st.Snapshots(tag), s => s.Md5 == M(2));
+        Assert.Empty(st.TransfersOut(tag));
+    }
+
+    [Fact]
+    public async Task Synchronous_reply_capture_prevents_duplication_when_drop_event_arrives_before_async_snapshot_task_resumes()
+    {
+        var st = CreateStore();
+        var (hs, js) = WhsSaveTests.Pair();
+        js.Seed = hs.Seed; // QuickSave written on the joiner while in the host's shared world carries the host world's seed
+        string tag = WhsSave.SeedTag(hs.Seed);
+
+        Item sword1 = new("20000000-0000-0000-0000-000000000601", Sword, 1);
+        Item sword2 = new("20000000-0000-0000-0000-000000000602", Sword, 1);
+        js.Items = [sword1, sword2];
+
+        string savesDir = Path.Combine(_root, "saves");
+        string playline0 = Path.Combine(savesDir, "playline0");
+        Directory.CreateDirectory(playline0);
+
+        var sentDrops = new List<byte[]>();
+        var sentClaims = new List<uint>();
+        var tokSeenTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseExecTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var snapCallRx = new Regex(@"KCD2MP_Wo125Snapshot\(""([0-9a-f]+)""\)", RegexOptions.CultureInvariant);
+
+        var bridge = new GameBridge(new ClientConfig());
+        var transport = new SnapshotTestTransport(lua =>
+        {
+            var m = snapCallRx.Match(lua);
+            if (!m.Success) return Task.CompletedTask;
+            tokSeenTcs.TrySetResult(m.Groups[1].Value);
+            return releaseExecTcs.Task; // hold ExecLuaAsync open so Wo184TakeAsync cannot resume before the log batch finishes
+        });
+        WireJoinedBridge(bridge, st, tag, transport, sentDrops, sentClaims, savesDir);
+
+        // Kick off real Wo184TakeAsync for host save M(20)
+        var hostSave = new WorldSaved(20u, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Protocol.SaveKindAuto, 0, 20, Convert.FromHexString(M(20)));
+        var takeMethod = typeof(GameBridge).GetMethod("Wo184TakeAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var takeTask = (Task)takeMethod.Invoke(bridge, [hostSave, null, "host save", 60_000L])!;
+
+        string tok = await tokSeenTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Game writes the pre-drop QuickSave (2 Swords) during KCD2MP_Wo125Snapshot(tok)
+        byte[] preDropQuickSave = WhsSaveTests.File(js);
+        string qsPath = Path.Combine(playline0, "quicksave001.whs");
+        File.WriteAllBytes(qsPath, preDropQuickSave);
+        string qsMd5 = WhsSave.Verify(preDropQuickSave).Md5!;
+
+        // Log-tail reader processes two consecutive kcd.log lines synchronously on the same thread (NO BeforeGameSave "is ready" line,
+        // and BEFORE AskModAsync / Wo184TakeAsync resumes on the ThreadPool!):
+        //   Line 1: [KCD2-MP-EVT] ... wo124_reply <tok> ok=true
+        //   Line 2: [KCD2-MP-EVT] ... item_drop <Sword> 1 ...
+        InvokeOnGameEvent(bridge, "wo124_reply", $"{tok} ok=true");
+        InvokeOnGameEvent(bridge, "item_drop", $"{Sword} 1 1.0 100.0 200.0 10.0 dropped_after_quicksave");
+
+        Assert.False(takeTask.IsCompleted); // Wo184TakeAsync has NOT resumed yet when item_drop was already recorded!
+        Assert.Single(sentDrops);
+        uint dropId = BinaryPrimitives.ReadUInt32LittleEndian(sentDrops[0]);
+
+        // Now let ExecLuaAsync / Wo184TakeAsync resume and observe quicksave001.whs landing
+        releaseExecTcs.TrySetResult();
+        var saveObserved = typeof(GameBridge).GetMethod("Wo125OnJoinerSaveObserved", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        bool claimedBySnapshot = false;
+        for (int i = 0; i < 50 && !claimedBySnapshot; i++)
+        {
+            claimedBySnapshot = (bool)saveObserved.Invoke(bridge, [qsPath, qsMd5])!;
+            if (!claimedBySnapshot) await Task.Delay(10);
+        }
+        Assert.True(claimedBySnapshot);
+
+        await takeTask.WaitAsync(TimeSpan.FromSeconds(5));
+        object pairOutcome = takeTask.GetType().GetProperty("Result")!.GetValue(takeTask)!;
+        Assert.Equal("Paired", pairOutcome.ToString());
+
+        // Peer (ghost 1) claims the dropped sword; Joiner disconnects before the next host save (M(21) unpaired)
+        await DeliverItemClaimDownAsync(bridge, claimerGhostId: 1, dropId);
+
+        // Active captures must not leak after pairing completes
+        var activeCapturesField = typeof(HenryStore).GetField("_activeCaptures", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var activeCaptures = (System.Collections.IEnumerable)activeCapturesField.GetValue(st)!;
+        Assert.Empty(activeCaptures);
+
+        // Reconnect picks paired M(20) when M(21) is unpaired: MUST deduct the post-quicksave drop -> 1 Sword (NEVER 2 Swords!)
+        foreach (var store in new[] { st, CreateStore() })
+        {
+            var pick = store.PickFor(tag, [M(21), M(20)])!;
+            Assert.Equal(M(20), pick.Snapshot.Md5);
+            Assert.Contains("transferred-out", pick.How);
+            Assert.Equal(1, CountClass(pick.Parts, Sword));
+        }
+
+        // Refused snapshot reply (ok=false) must also return NotNow cleanly with zero leaked active captures
+        tokSeenTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        releaseExecTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hostSave2 = new WorldSaved(22u, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), Protocol.SaveKindAuto, 0, 22, Convert.FromHexString(M(22)));
+        var refusedTask = (Task)takeMethod.Invoke(bridge, [hostSave2, null, "host save", 60_000L])!;
+        string refusedTok = await tokSeenTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        InvokeOnGameEvent(bridge, "wo124_reply", $"{refusedTok} ok=false");
+        releaseExecTcs.TrySetResult();
+        await refusedTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("NotNow", refusedTask.GetType().GetProperty("Result")!.GetValue(refusedTask)!.ToString());
+        Assert.Empty((System.Collections.IEnumerable)activeCapturesField.GetValue(st)!);
     }
 }
