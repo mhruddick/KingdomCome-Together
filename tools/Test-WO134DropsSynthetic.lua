@@ -394,6 +394,91 @@ for _, cfgName in ipairs({ "solo", "joiner", "host" }) do
     if KCD2MP_W134IsWorldItem and ent then
         check(C .. "D6 a tracked drop is not a world item", KCD2MP_W134IsWorldItem(ent) == false)
     end
+
+    -- ---- D7a: < 750 ms immediate pickup while state == "placing" (deferred PlaceItem, picked up before next tick) ----
+    freshWorld(); CONFIGS[cfgName]()
+    do
+        local gh = KCD2MP.ghosts["7"].entity
+        local deferred = nil
+        gh.human.PlaceItem = function(self, w, anchorId, _)
+            deferred = { w = w, anchorId = anchorId }
+        end
+        KCD2MP_ItemDropAdd("3000000071", ONION, 1, 0.9, 102, 100, 10, "7")
+        NOW = NOW + 0.75
+        KCD2MP_ItemSyncTick()
+        -- Keep TIMERS intact so we can inspect the 60 ms follow-up timer too
+        local has60ms = false
+        for _, tm in ipairs(TIMERS) do if tm.ms == 60 then has60ms = true end end
+        local dp = KCD2MP.itemDrops["3000000071"]
+        check(C .. "D7a deferred PlaceItem enters placing and arms 60 ms follow-up timer", dp and dp.state == "placing" and has60ms)
+        TIMERS = {}
+
+        -- Frame 1 (~16 ms later, before 60 ms timer or 750 ms tick): engine materializes the pickable and player immediately presses E!
+        local a = nil
+        for _, e in pairs(ENTS) do if e.id == deferred.anchorId then a = e end end
+        local it = ITEMS[deferred.w]
+        gh.inventory:RemoveItem(deferred.w)
+        local minted = mkPickable(engineName(it.class), it.class, it.amount, it.health, a:GetWorldPos().x, a:GetWorldPos().y, a:GetWorldPos().z, deferred.w)
+        LOG = {}
+        local u7 = PickableItem.OnUsed(minted, player)
+        check(C .. "D7a immediate < 750 ms pickup binds placing drop and sends item_claim at once",
+              u7 == true and dp.state == "claimed_local" and events("item_claim")[1] == "3000000071",
+              tostring(dp.state) .. " claims=" .. table.concat(events("item_claim"), ","))
+        check(C .. "D7a never triggers W134 world-item request or FAILED log",
+              not anyEvent("w134_") and not string.find(table.concat(LOG, "\n"), "FAILED", 1, true), anyEvent("w134_"))
+        KCD2MP_ItemDropClaimed("3000000071", "1", true)
+        check(C .. "D7a claim echo resolves cleanly with 1 item kept", dp.state == "resolved" and player.inventory:GetCountOfClass(ONION) == 1)
+    end
+
+    -- ---- D7b: 60 ms follow-up timer adopts deferred PlaceItem well before the 750 ms tick ----
+    freshWorld(); CONFIGS[cfgName]()
+    do
+        local gh = KCD2MP.ghosts["7"].entity
+        local deferred = nil
+        gh.human.PlaceItem = function(self, w, anchorId, _)
+            deferred = { w = w, anchorId = anchorId }
+        end
+        KCD2MP_ItemDropAdd("3000000072", ONION, 1, 0.9, 102, 100, 10, "7")
+        NOW = NOW + 0.75
+        KCD2MP_ItemSyncTick()
+        local fastTimers = {}
+        for _, tm in ipairs(TIMERS) do if tm.ms == 60 then fastTimers[#fastTimers + 1] = tm end end
+        TIMERS = {}
+        local a = nil
+        for _, e in pairs(ENTS) do if e.id == deferred.anchorId then a = e end end
+        local it = ITEMS[deferred.w]
+        gh.inventory:RemoveItem(deferred.w)
+        mkPickable(engineName(it.class), it.class, it.amount, it.health, a:GetWorldPos().x, a:GetWorldPos().y, a:GetWorldPos().z, deferred.w)
+        NOW = NOW + 0.06
+        for _, tm in ipairs(fastTimers) do tm.f() end
+        local dp2 = KCD2MP.itemDrops["3000000072"]
+        check(C .. "D7b 60 ms follow-up timer adopts deferred drop to ground", dp2 and dp2.state == "ground" and dp2.entName ~= nil)
+    end
+
+    -- ---- D7c: finalize fallback when ground entity vanished and player inventory count increased since spawn ----
+    freshWorld(); CONFIGS[cfgName]()
+    do
+        local gh = KCD2MP.ghosts["7"].entity
+        local deferred = nil
+        gh.human.PlaceItem = function(self, w, anchorId, _)
+            deferred = { w = w, anchorId = anchorId }
+        end
+        KCD2MP_ItemDropAdd("3000000073", BANDAGE, 2, 1.0, 102, 100, 10, "7")
+        tick() -- enters placing, spawnInvCount == 0
+        -- Simulate native pickup bypassing Lua OnUsed before finalize ever sees the ground entity
+        gh.inventory:RemoveItem(deferred.w)
+        player.inventory:AddItem(deferred.w)
+        LOG = {}
+        tick() -- mp_item_finalize sees placed == nil AND curCount (2) > spawnInvCount (0)
+        local dp3 = KCD2MP.itemDrops["3000000073"]
+        check(C .. "D7c finalize inventory-delta fallback emits item_claim instead of dropping silently",
+              dp3 and dp3.state == "claimed_local" and events("item_claim")[1] == "3000000073",
+              tostring(dp3 and dp3.state) .. " claims=" .. table.concat(events("item_claim"), ","))
+        -- And if peer won the claim race instead, rollback still removes the newly bound wuid!
+        KCD2MP_ItemDropClaimed("3000000073", "7", false)
+        check(C .. "D7c lost claim race on inventory-delta fallback rolls back cleanly",
+              dp3.state == "resolved" and player.inventory:GetCountOfClass(BANDAGE) == 0)
+    end
 end
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
