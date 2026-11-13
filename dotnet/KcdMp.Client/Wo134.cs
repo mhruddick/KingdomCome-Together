@@ -286,7 +286,7 @@ public static class Wo134Rules
                 if (it.Swept || !string.Equals(it.Cls, cls, StringComparison.OrdinalIgnoreCase)) continue;
                 float dx = it.X - x, dy = it.Y - y, dz = it.Z - z;
                 float d2 = dx * dx + dy * dy + dz * dz;
-                if (d2 <= bestD2) { best = it; bestD2 = d2; }
+                if (d2 < bestD2 || (best is null && d2 <= bestD2)) { best = it; bestD2 = d2; }
             }
             if (best is null) return false;
             best.Swept = true;
@@ -312,13 +312,14 @@ public static class Wo134Rules
     }
 
     /// <summary>KCD2MP_W134HostTombstones calls packed within the console's encoded length ceiling.</summary>
-    public static List<string> TombstoneSyncCalls(IReadOnlyList<ItemTombstone> items, int maxEncoded = 1800)
+    public static List<string> TombstoneSyncCalls(IReadOnlyList<ItemTombstone> items, bool reset = true, int maxEncoded = 1800)
     {
         const string pre = "if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({", postFirst = "}, true) end", postMore = "}, false) end";
         var o = new List<string>();
+        if (items.Count == 0 && !reset) return o;
         var sb = new StringBuilder(pre);
         int n = 0;
-        bool first = true;
+        bool first = reset;
         foreach (var t in items)
         {
             if (!ValidTombstone(t)) continue;
@@ -334,7 +335,7 @@ public static class Wo134Rules
             sb.Append(r);
             n++;
         }
-        if (n > 0 || o.Count == 0) o.Add(sb.Append(first ? postFirst : postMore).ToString());
+        if (n > 0 || (o.Count == 0 && reset)) o.Add(sb.Append(first ? postFirst : postMore).ToString());
         return o;
     }
 }

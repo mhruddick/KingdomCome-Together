@@ -434,16 +434,16 @@ LOG = {}
 KCD2MP_W134HostItem(2, 72, EGG, 101.0, 100.0, 10.0, 0)
 check("I9 race on already-taken 101.0 spot returns gone and never steals the 2.0 m shelf egg",
     events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "2 72 gone ", 1, true) == 1 and ENTS["egg_shelf"] ~= nil, events("w134_ires")[1])
--- M2 3.2: unstreamed world item (>120 m away on Host) records tombstone + emits w134_itomb add + returns ok; repeat asks return mine/gone; Host sweep removes when approaching!
+-- M2 3.2: unstreamed world item (>120 m away on Host) records tombstone + emits w134_itomb add + returns ok; tight repeat asks return mine/gone; Host sweep removes when approaching!
 LOG = {}
 KCD2MP_W134HostItem(1, 73, SWORD, 600, 600, 10, 0)
 check("I10 unstreamed world item on Host records tombstone (w134_itomb add) and grants ok",
     string.find(events("w134_ires")[1] or "", "1 73 ok ", 1, true) == 1
     and string.find(events("w134_itomb")[1] or "", "add " .. SWORD .. " 600.000 600.000 10.000 1", 1, true) == 1, events("w134_itomb")[1])
 LOG = {}
-KCD2MP_W134HostItem(1, 731, SWORD, 600.5, 600, 10, 0)
-KCD2MP_W134HostItem(2, 732, SWORD, 601.0, 600, 10, 0)
-check("I10b repeat ask for tombstoned item returns mine to taker and gone to other peer",
+KCD2MP_W134HostItem(1, 731, SWORD, 600.15, 600, 10, 0)
+KCD2MP_W134HostItem(2, 732, SWORD, 600.25, 600, 10, 0)
+check("I10b repeat ask within tight 0.35 m for tombstoned item returns mine to taker and gone to other peer",
     string.find(events("w134_ires")[1] or "", "1 731 mine ", 1, true) == 1
     and string.find(events("w134_ires")[2] or "", "2 732 gone ", 1, true) == 1)
 mkPickable("tree_bow_host", SWORD, 1, 1, 602.1, 600, 10, newItem(SWORD, 1, 1))
@@ -452,6 +452,45 @@ LOG = {}; loop()
 check("I10c when Host walks near the tombstoned tree, Host sweeps and removes its bow and marks tombstone swept",
     ENTS["tree_bow_host"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1, events("w134_itomb")[1])
 player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- Finding 2a: unstreamed Host with two distinct eggs 2.0 m apart -> BOTH return ok and record two distinct tombstones!
+world(); asHost(1)
+LOG = {}
+KCD2MP_W134HostItem(1, 751, EGG, 100.0, 100.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 752, EGG, 102.0, 100.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 753, EGG, 100.1, 100.0, 10.0, 0, 1)
+check("I10d unstreamed Host: two distinct eggs 2.0 m apart both grant ok with 2 tombstones, while 0.10 m repeat returns mine",
+    string.find(events("w134_ires")[1] or "", "1 751 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "1 752 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[3] or "", "1 753 mine ", 1, true) == 1
+    and #KCD2MP.w134.goneWorldItems == 2,
+    string.format("%s | %s | %s", tostring(events("w134_ires")[1]), tostring(events("w134_ires")[2]), tostring(events("w134_ires")[3])))
+
+-- Joiner end-to-end pickup of both 2.0 m eggs -> Joiner receives BOTH eggs!
+world(); asJoiner()
+local jEggA = mkPickable("egg_pair_a", EGG, 1, 1, 100.0, 100.0, 10.0, newItem(EGG, 1, 1))
+local jEggB = mkPickable("egg_pair_b", EGG, 1, 1, 102.0, 100.0, 10.0, newItem(EGG, 1, 1))
+LOG = {}; PickableItem.OnUsed(jEggA, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+LOG = {}; PickableItem.OnUsed(jEggB, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+check("I10e Joiner picks up both 2.0 m eggs and receives 2 eggs in inventory",
+    player.inventory:GetCountOfClass(EGG) == 2 and ENTS["egg_pair_a"] == nil and ENTS["egg_pair_b"] == nil)
+
+-- Finding 2b: streamed Joiner with two eggs 2.0 m apart -> removing Egg 1 (and even replaying ItemGone / sweep after Egg 1 is gone) NEVER deletes Egg 2, while drifted bow within 5.0 m IS matched!
+world(); asJoiner()
+mkPickable("egg_stream_1", EGG, 1, 1, 100.0, 100.0, 10.0, newItem(EGG, 1, 1))
+mkPickable("egg_stream_2", EGG, 1, 1, 102.0, 100.0, 10.0, newItem(EGG, 1, 1))
+mkPickable("bow_stream_drift", SWORD, 1, 1, 113.4, 100.0, 10.0, newItem(SWORD, 1, 1))
+KCD2MP_W134ItemGone(EGG, 100.0, 100.0, 10.0)
+KCD2MP_W134ItemGone(EGG, 100.0, 100.0, 10.0)   -- duplicate / replayed ItemGone when Egg 1 is already absent!
+KCD2MP_W134ItemGone(EGG, 98.0, 100.0, 10.0)    -- another absent egg 4.0 m from Egg 2 (unstreamed/eaten earlier) + sweep!
+loop()
+KCD2MP_W134ItemGone(SWORD, 110.0, 100.0, 10.0) -- drifted bow 3.4 m away
+check("I10f streamed Joiner: Egg 2 at 2.0 m is never falsely deleted by Egg 1 removal/replay/sweep, while 3.4 m drifted bow IS matched",
+    ENTS["egg_stream_1"] == nil and ENTS["egg_stream_2"] ~= nil and ENTS["bow_stream_drift"] == nil)
+
+world(); asHost(1)
 
 mkPickable("onion007777", ONION, 1, 1, 104, 100, 10, newItem(ONION, 1, 1))
 KCD2MP.itemDrops["3000000011"] = { state = "ground", entName = "onion007777", mine = true }
@@ -546,6 +585,27 @@ LOG = {}; loop()
 check("X4 restored unswept tombstone sweeps the 3.2 m drifted bow once Host walks near and emits w134_itomb swept",
     ENTS["reloaded_tree_bow"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1)
 player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- X5 (Finding 4): KCD2MP_W134HostTombstones({}, true) on loading an older/empty save clears goneWorldItems, hostTaken, and hostVerify
+world(); asHost(1)
+KCD2MP_W134HostItem(1, 91, EGG, 450.0, 450.0, 10.0, 0, 1)   -- future unstreamed pickup recorded in goneWorldItems + hostTaken
+mkPickable("egg_stream_future", EGG, 1, 1, 101.0, 100.0, 10.0, newItem(EGG, 1, 1))
+KCD2MP_W134HostItem(1, 92, EGG, 101.0, 100.0, 10.0, 0, 1)   -- future streamed pickup recorded in hostTaken
+KCD2MP.w134.hostVerify[1] = { name = "pending_verify", cls = EGG, x = 105.0, y = 100.0, z = 10.0, at = NOW }
+LOG = {}
+KCD2MP_W134HostItem(1, 93, EGG, 450.0, 450.0, 10.0, 0, 1)
+check("X5 before loading older save, future pickup returns mine", string.find(events("w134_ires")[1] or "", "1 93 mine ", 1, true) == 1)
+KCD2MP_W134HostTombstones({}, true)   -- Host loaded an older save with 0 tombstones
+check("X5 KCD2MP_W134HostTombstones({}, true) clears goneWorldItems, hostTaken, and hostVerify",
+    #KCD2MP.w134.goneWorldItems == 0 and #KCD2MP.w134.hostTaken == 0 and #KCD2MP.w134.hostVerify == 0)
+mkPickable("egg_stream_reloaded", EGG, 1, 1, 101.0, 100.0, 10.0, newItem(EGG, 1, 1))
+LOG = {}
+KCD2MP_W134HostItem(1, 94, EGG, 450.0, 450.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 95, EGG, 101.0, 100.0, 10.0, 0, 1)
+check("X5 after loading older save, both unstreamed and streamed items can be picked up again (ok)",
+    string.find(events("w134_ires")[1] or "", "1 94 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "1 95 ok ", 1, true) == 1
+    and ENTS["egg_stream_reloaded"] == nil)
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

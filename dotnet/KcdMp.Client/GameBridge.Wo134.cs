@@ -3,7 +3,10 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using KcdMp.Wire;
+
+[assembly: InternalsVisibleTo("KcdMp.Client.Tests")]
 
 namespace KcdMp.Client;
 
@@ -28,7 +31,7 @@ public partial class GameBridge
 {
     private volatile bool _w134Connected;
     private readonly ChestLedgerStore _chestStore = new(ChestLedgerStore.DefaultRoot());
-    private readonly WorldItemTombstoneStore _tombStore = new(WorldItemTombstoneStore.DefaultRoot());
+    private WorldItemTombstoneStore _tombStore = new(WorldItemTombstoneStore.DefaultRoot());
     private readonly object _w134Gate = new();
     private Wo134Rules.Ledger? _w134HostLedger;       // legacy field kept for stats formatting
     private Wo134Rules.ItemTombstoneLedger? _w134HostTombs;
@@ -338,17 +341,17 @@ public partial class GameBridge
         }
     }
 
-    private async Task Wo134PushHostTombstonesToLuaAsync()
+    private async Task Wo134PushHostTombstonesToLuaAsync(bool reset = true, string? explicitTag = null)
     {
         List<Wo134Rules.ItemTombstone> items;
         lock (_w134Gate)
         {
-            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+            string? tag = explicitTag ?? (_hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag);
             if (tag is null) return;
             items = Wo134HostTombsFor(tag).Clone().Items;
         }
-        if (items.Count == 0) return;
-        foreach (var call in Wo134Rules.TombstoneSyncCalls(items))
+        if (items.Count == 0 && !reset) return;
+        foreach (var call in Wo134Rules.TombstoneSyncCalls(items, reset))
             await ExecLuaAsync(call);
     }
 
@@ -368,25 +371,28 @@ public partial class GameBridge
         bool pushToLua = false;
         lock (_w134Gate)
         {
-            var cur = Wo134HostTombsFor(tag);
             try
             {
                 if (!loaded)
                 {
+                    var cur = Wo134HostTombsFor(tag);
                     _tombStore.Pair(tag, md5, cur);
                     _tombStore.SaveCurrent(tag, cur);
                     _w134HostDirty = false;
                 }
-                else if (_tombStore.Paired(tag, md5) is { } p)
-                {
-                    _w134HostTombs = p;
-                    _tombStore.SaveCurrent(tag, p);
-                    _w134HostDirty = false;
-                    pushToLua = p.Items.Count > 0;
-                }
                 else
                 {
-                    pushToLua = cur.Items.Count > 0;
+                    if (_w134HostTag is string old && old != tag && _w134HostTombs is { } ol && _w134HostDirty)
+                    {
+                        try { _tombStore.SaveCurrent(old, ol); } catch (IOException) { }
+                    }
+                    _w134TombPending.Clear();
+                    _w134HostTag = tag;
+                    var restored = _tombStore.Paired(tag, md5) ?? new Wo134Rules.ItemTombstoneLedger();
+                    _w134HostTombs = restored;
+                    _tombStore.SaveCurrent(tag, restored);
+                    _w134HostDirty = false;
+                    pushToLua = true;
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
@@ -394,7 +400,29 @@ public partial class GameBridge
                 Console.WriteLine($"MP-WO134 tombs: host tombstone pairing failed: {ex.Message}");
             }
         }
-        if (pushToLua) _ = Wo134PushHostTombstonesToLuaAsync();
+        if (pushToLua) _ = Wo134PushHostTombstonesToLuaAsync(reset: true, explicitTag: tag);
+    }
+
+    internal void Wo134ConfigureTestHost(WorldItemTombstoneStore store, IGameTransport transport, uint? seed = null)
+    {
+        _tombStore = store;
+        _transport = transport;
+        _combatRoleApplied = true;
+        _isDamageAuthority = true;
+        _sharedWorld = true;
+        _hostWorldSeed = seed;
+        _where = GameWhere.World;
+    }
+
+    internal void Wo134HostWorldForTest(string tag, string md5, bool loaded) => Wo134OnHostWorld(tag, md5, loaded);
+    internal void Wo134TombEventForTest(string arg) => Wo134OnEvent("w134_itomb", arg);
+    internal IReadOnlyList<Wo134Rules.ItemTombstone> Wo134CurrentHostTombsForTest(string tag)
+    {
+        lock (_w134Gate) return Wo134HostTombsFor(tag).Clone().Items;
+    }
+    internal void Wo134AddPendingTombForTest(Wo134Rules.ItemTombstone t)
+    {
+        lock (_w134Gate) _w134TombPending.Add(t);
     }
 
     /// <summary>Host: the joiner is in the world -- replay any unswept loose-item tombstones as LootHostItemGone.</summary>
