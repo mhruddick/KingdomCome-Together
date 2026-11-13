@@ -5499,6 +5499,7 @@ KCD2MP.w125 = { snaps = 0, snapRefused = 0 }
 -- A snapshot of this game's copy of the host's world, for the agent. The hitch
 -- is measured the WO-122 way (the longest frame gap in the next 6 s).
 function KCD2MP_Wo125Snapshot(tok)
+    if KCD2MP_ItemFlushDetect then pcall(KCD2MP_ItemFlushDetect) end
     local w = KCD2MP.w125
     local ok, r = false, nil
     if Game and Game.QuickSave then
@@ -16411,17 +16412,19 @@ local function mp_item_bind_placing_entity(e, name)
     if not e or e.class ~= "PickableItem" then return nil, nil end
     pcall(function() if not name then name = e:GetName() end end)
     if not name or name == "" then return nil, nil end
-    local cls, ep = nil, nil
+    local cls, ep, ewuid = nil, nil, nil
     pcall(function()
         cls = e.Properties and e.Properties.sItemClassId
         ep = e:GetWorldPos()
+        ewuid = e.item and e.item:GetId() or nil
     end)
     if not cls or cls == "" or not ep then return nil, nil end
     local eidStr = tostring(e.id)
     for key, d in pairs(KCD2MP.itemDrops) do
         if d.state == "placing" and not d.entName and d.cls == cls and name ~= d.anchorName
            and not mp_item_adopted_by_other(name, key)
-           and not (d.preIds and d.preIds[eidStr]) then
+           and not (d.preIds and d.preIds[eidStr])
+           and (d.createdWuid == nil or ewuid == nil or tostring(ewuid) == tostring(d.createdWuid)) then
             local dx = ep.x - (d.x or ep.x)
             local dy = ep.y - (d.y or ep.y)
             local dz = ep.z - (d.z or ep.z)
@@ -16505,6 +16508,13 @@ local function mp_item_detect(pp)
             end
         end
     end
+end
+
+function KCD2MP_ItemFlushDetect()
+    if not (KCD2MP.itemSync and KCD2MP.itemSync.enabled and player) then return end
+    local pp = nil
+    pcall(function() pp = player:GetWorldPos() end)
+    if pp then pcall(mp_item_detect, pp) end
 end
 
 -- The agent minted a dropId for the drop this world just detected; from here
@@ -16591,21 +16601,6 @@ local function mp_item_spawn(key, d)
         for _, e in ipairs(pre) do d.preIds[tostring(e.id)] = true end
     end)
 
-    d.spawnInvCount = 0
-    d.spawnPlayerWuids = {}
-    pcall(function()
-        if player and player.inventory then
-            local pt = player.inventory:GetInventoryTable()
-            for i = 1, #pt do
-                local it = ItemManager.GetItem(pt[i])
-                if it and it.class == d.cls then
-                    d.spawnInvCount = d.spawnInvCount + (it.amount or 1)
-                    d.spawnPlayerWuids[tostring(pt[i])] = true
-                end
-            end
-        end
-    end)
-
     local created = nil
     pcall(function()
         local before = {}
@@ -16623,6 +16618,8 @@ local function mp_item_spawn(key, d)
         mp_log("ITEM-SYNC drop " .. key .. " FAILED: CreateItem bound nothing for " .. d.cls)
         return
     end
+    d.createdWuid = created
+    pcall(function() d.ghostName = ge:GetName() end)
 
     local okPlace = false
     pcall(function() ge.human:PlaceItem(created, anchor.id, false); okPlace = true end)
@@ -16658,8 +16655,12 @@ mp_item_finalize = function(key, d, mode)
                and e:GetName() ~= d.anchorName
                and not mp_item_adopted_by_other(e:GetName(), key)
                and not (d.preIds and d.preIds[tostring(e.id)]) then
-                placed = e
-                break
+                local ewuid = nil
+                pcall(function() ewuid = e.item and e.item:GetId() or nil end)
+                if d.createdWuid == nil or ewuid == nil or tostring(ewuid) == tostring(d.createdWuid) then
+                    placed = e
+                    break
+                end
             end
         end
     end)
@@ -16684,30 +16685,44 @@ mp_item_finalize = function(key, d, mode)
     end
     if mode == "sync" then return end
 
-    -- If the ground entity already vanished before finalize ran AND the local
-    -- player's inventory count of d.cls increased since mp_item_spawn, the
-    -- local player picked up the newly placed drop within the placing window.
-    local curCount, newWuid = 0, nil
-    pcall(function()
-        if player and player.inventory then
-            local pt = player.inventory:GetInventoryTable()
-            for i = 1, #pt do
-                local it = ItemManager.GetItem(pt[i])
-                if it and it.class == d.cls then
-                    curCount = curCount + (it.amount or 1)
-                    if not (d.spawnPlayerWuids and d.spawnPlayerWuids[tostring(pt[i])]) then
-                        newWuid = pt[i]
-                    end
+    -- Only claim without a ground entity when the specific created item instance
+    -- (d.createdWuid) has left the placing ghost and entered player.inventory.
+    -- Never guess from a class-wide count increase: acquiring an unrelated item
+    -- of the same class during placement would falsely claim d and delete the
+    -- unrelated item if a peer won the claim race.
+    local foundCreated = nil
+    if d.createdWuid ~= nil then
+        local wantId = tostring(d.createdWuid)
+        local stillOnGhost = false
+        pcall(function()
+            local ge = d.ghostName and System.GetEntityByName(d.ghostName)
+            if ge and ge.inventory then
+                local gt = ge.inventory:GetInventoryTable()
+                for i = 1, #gt do
+                    if tostring(gt[i]) == wantId then stillOnGhost = true; break end
                 end
             end
+        end)
+        if not stillOnGhost then
+            pcall(function()
+                if player and player.inventory then
+                    local pt = player.inventory:GetInventoryTable()
+                    for i = 1, #pt do
+                        if tostring(pt[i]) == wantId then
+                            foundCreated = pt[i]
+                            break
+                        end
+                    end
+                end
+            end)
         end
-    end)
-    if d.spawnInvCount ~= nil and curCount > d.spawnInvCount then
+    end
+    if foundCreated ~= nil then
         pcall(function()
             local a = d.anchorName and System.GetEntityByName(d.anchorName)
             if a then System.RemoveEntity(a.id) end
         end)
-        d.wuid = d.wuid or newWuid
+        d.wuid = d.wuid or foundCreated
         if d.pendingRemove then
             if d.pendingClaimIsMine then
                 d.state = "resolved"

@@ -194,4 +194,170 @@ public class M1JoinerDropDisconnectTests : IDisposable
         hook.Invoke(bridge, [556u, (byte)1, dropPayload2]);
         Assert.Single(st.TransfersOut(tag));
     }
+
+    [Fact]
+    public void Drop_before_save_then_late_peer_claim_preserves_remaining_item_while_older_save_still_deducts()
+    {
+        var st = CreateStore();
+        string tag = WhsSave.SeedTag(105);
+        var (_, js) = WhsSaveTests.Pair();
+
+        // 1. snap0 (M(0)) has 2 distinct Swords
+        js.Items =
+        [
+            new("20000000-0000-0000-0000-000000000101", Sword, 1),
+            new("20000000-0000-0000-0000-000000000102", Sword, 1),
+        ];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(0), HenryStore.SourceJoin, "join");
+
+        // 2. Joiner drops 1 of the 2 Swords onto the ground (leaves Henry's inventory now, before save)
+        _now = _now.AddSeconds(5);
+        st.NoteOutgoingDrop(tag, 810);
+
+        // 3. Host saves M(1) while the dropped sword is still lying on the ground -> snap1 already has only 1 Sword
+        _now = _now.AddSeconds(5);
+        js.Items = [new("20000000-0000-0000-0000-000000000101", Sword, 1)];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(1), HenryStore.SourceSnapshot, "saved after drop");
+
+        // 4. Peer picks up drop 810 AFTER snap1 was saved
+        _now = _now.AddSeconds(5);
+        st.RecordTransferOut(tag, 810, Sword, 1, 1.0f);
+
+        // Restoring M(1) (snap1) MUST keep the remaining 1 Sword (not delete it to 0!)
+        var pickM1 = st.PickFor(tag, [M(2), M(1), M(0)])!;
+        Assert.Equal(M(1), pickM1.Snapshot.Md5);
+        Assert.DoesNotContain("transferred-out", pickM1.How);
+        var decodedM1 = WhsSave.DecodePlayerSoul(pickM1.Parts.Record, new WhsSave.Node(0x115E, 0, pickM1.Parts.Record.Length - 6));
+        Assert.Single(decodedM1.Inventory.Where(i => i.Class == Sword));
+
+        // Restoring older pre-drop M(0) (snap0) MUST still deduct the transferred Sword (2 - 1 = 1 Sword)
+        var pickM0 = st.PickFor(tag, [M(0)])!;
+        Assert.Equal(M(0), pickM0.Snapshot.Md5);
+        Assert.Contains("transferred-out", pickM0.How);
+        var decodedM0 = WhsSave.DecodePlayerSoul(pickM0.Parts.Record, new WhsSave.Node(0x115E, 0, pickM0.Parts.Record.Length - 6));
+        Assert.Single(decodedM0.Inventory.Where(i => i.Class == Sword));
+    }
+
+    [Fact]
+    public void Pre_drop_snapshot_stored_after_peer_claim_still_deducts_transferred_item()
+    {
+        var st = CreateStore();
+        string tag = WhsSave.SeedTag(106);
+        var (_, js) = WhsSaveTests.Pair();
+        js.Items =
+        [
+            new("20000000-0000-0000-0000-000000000201", Sword, 1),
+            new("20000000-0000-0000-0000-000000000202", Sword, 1),
+        ];
+
+        // 1. Game captures Henry's pre-drop state (2 Swords), e.g. QuickSave started before the drop
+        var preDropParts = WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot);
+        var preDropCapture = st.CaptureBoundary(tag);
+
+        // 2. While snapshot file verification/late-file delivery is still in flight, Joiner drops 1 Sword and Peer claims it
+        _now = _now.AddSeconds(2);
+        st.NoteOutgoingDrop(tag, 820);
+        _now = _now.AddSeconds(1);
+        st.RecordTransferOut(tag, 820, Sword, 1, 1.0f);
+
+        // 3. Pre-drop snapshot finishes storing AFTER the peer claim was recorded
+        _now = _now.AddSeconds(3);
+        st.Store(tag, preDropParts, M(1), HenryStore.SourceSnapshot, "delayed store", preDropCapture);
+
+        // 4. Reconnect restores M(1): MUST deduct the transferred sword so 1 Sword remains (never 2!)
+        var pick = st.PickFor(tag, [M(2), M(1)])!;
+        Assert.Equal(M(1), pick.Snapshot.Md5);
+        Assert.Contains("transferred-out", pick.How);
+        var decoded = WhsSave.DecodePlayerSoul(pick.Parts.Record, new WhsSave.Node(0x115E, 0, pick.Parts.Record.Length - 6));
+        Assert.Single(decoded.Inventory.Where(i => i.Class == Sword));
+    }
+
+    [Fact]
+    public void Retained_snapshot_with_513_transfers_deducts_all_513_and_prunes_only_after_snapshot_rotates_out()
+    {
+        var st = CreateStore();
+        string tag = WhsSave.SeedTag(107);
+        var (_, js) = WhsSaveTests.Pair();
+        js.Items = [new("20000000-0000-0000-0000-000000000301", Apple, 513)];
+
+        // 1. Store snap0 (M(0)) holding 513 Apples
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(0), HenryStore.SourceJoin, "join");
+
+        // 2. Record 513 outgoing 1-Apple transfers while snap0 remains retained
+        for (uint i = 1; i <= 513; i++)
+        {
+            st.NoteOutgoingDrop(tag, 10_000 + i);
+            st.RecordTransferOut(tag, 10_000 + i, Apple, 1, 1.0f);
+        }
+
+        Assert.Equal(513, st.TransfersOut(tag).Count);
+
+        // 3. Even across a fresh HenryStore instance (agent restart), restoring snap0 MUST deduct all 513 Apples -> 0 Apples left (never 1!)
+        var restartedStore = CreateStore();
+        var pick = restartedStore.PickFor(tag, [M(999), M(0)])!;
+        Assert.Equal(M(0), pick.Snapshot.Md5);
+        var decoded = WhsSave.DecodePlayerSoul(pick.Parts.Record, new WhsSave.Node(0x115E, 0, pick.Parts.Record.Length - 6));
+        Assert.DoesNotContain(decoded.Inventory, x => x.Class == Apple);
+
+        // 4. Once KeepPerWorld (100) newer host saves rotate M(0) out, all 513 obsolete transfer entries are pruned cleanly
+        js.Items = [];
+        var postParts = WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot);
+        for (int s = 1; s <= HenryStore.KeepPerWorld; s++)
+        {
+            _now = _now.AddSeconds(1);
+            st.Store(tag, postParts, M(s), HenryStore.SourceSnapshot, $"save {s}");
+        }
+
+        Assert.DoesNotContain(st.Snapshots(tag), s => s.Md5 == M(0));
+        Assert.Empty(st.TransfersOut(tag));
+    }
+
+    [Fact]
+    public void GameBridge_hooks_preserve_remaining_item_on_drop_save_claim_and_deduct_after_self_claim_race_loss()
+    {
+        var bridge = new GameBridge(new ClientConfig());
+        var st = CreateStore();
+        string tag = WhsSave.SeedTag(108);
+
+        typeof(GameBridge).GetField("_henry", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, st);
+        typeof(GameBridge).GetField("_myGhostId", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, (byte)2);
+        typeof(GameBridge).GetField("_joinedWorld", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, true);
+        typeof(GameBridge).GetField("_joinedTag", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(bridge, tag);
+
+        var buildPayload = typeof(GameBridge).GetMethod("BuildItemDropPayload", BindingFlags.NonPublic | BindingFlags.Static)!;
+        var dropStarted = typeof(GameBridge).GetMethod("Wo125OnJoinerDropStarted", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var selfClaim = typeof(GameBridge).GetMethod("Wo125OnJoinerDropSelfClaim", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var peerClaim = typeof(GameBridge).GetMethod("Wo125OnJoinerDropClaimedByPeer", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var (_, js) = WhsSaveTests.Pair();
+        js.Items =
+        [
+            new("20000000-0000-0000-0000-000000000401", Sword, 1),
+            new("20000000-0000-0000-0000-000000000402", Sword, 1),
+        ];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(0), HenryStore.SourceJoin, "join");
+
+        // Flow A: Joiner drops sword 901 -> saves M(1) (1 Sword left) -> Peer claims 901 -> M(1) keeps 1 Sword!
+        byte[] p901 = (byte[])buildPayload.Invoke(null, [901u, Guid.Parse(Sword), (ushort)1, 1.0f, 100f, 200f, 10f])!;
+        dropStarted.Invoke(bridge, [901u]);
+        js.Items = [new("20000000-0000-0000-0000-000000000401", Sword, 1)];
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(1), HenryStore.SourceSnapshot, "post-drop save");
+        peerClaim.Invoke(bridge, [901u, (byte)1, p901]);
+
+        var pickA = st.PickFor(tag, [M(1)])!;
+        var decA = WhsSave.DecodePlayerSoul(pickA.Parts.Record, new WhsSave.Node(0x115E, 0, pickA.Parts.Record.Length - 6));
+        Assert.Single(decA.Inventory.Where(i => i.Class == Sword));
+
+        // Flow B: Joiner drops remaining sword 902, tentatively picks 902 back up (self-claim in flight -> back to 1 Sword in inventory),
+        // saves M(2) while holding that 1 Sword, then loses ItemClaimDown to Peer (Lua rolls back to 0 Swords) -> M(2) deducts to 0 Swords!
+        byte[] p902 = (byte[])buildPayload.Invoke(null, [902u, Guid.Parse(Sword), (ushort)1, 1.0f, 100f, 200f, 10f])!;
+        dropStarted.Invoke(bridge, [902u]);
+        selfClaim.Invoke(bridge, [902u]);
+        st.Store(tag, WhsSave.PartsFromFile(WhsSaveTests.File(js), WhsSave.HenryParts.OriginSnapshot), M(2), HenryStore.SourceSnapshot, "mid-race save");
+        peerClaim.Invoke(bridge, [902u, (byte)1, p902]);
+
+        var pickB = st.PickFor(tag, [M(2)])!;
+        var decB = WhsSave.DecodePlayerSoul(pickB.Parts.Record, new WhsSave.Node(0x115E, 0, pickB.Parts.Record.Length - 6));
+        Assert.DoesNotContain(decB.Inventory, i => i.Class == Sword);
+    }
 }

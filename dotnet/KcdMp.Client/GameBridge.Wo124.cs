@@ -86,6 +86,7 @@ public partial class GameBridge
         public string Mode = "bring";               // WO-125: bring | fresh | restore
         public string? WorldTag;
         public WhsSave.HenryParts? SplicedParts;
+        public HenryStore.SnapshotCapture? HenryCapture;
         public byte[]? OfferMd5;
         public TaskCompletionSource<bool>? LoadStarted, GameplayStarted, LoadFailed;
     }
@@ -513,6 +514,7 @@ public partial class GameBridge
             j.Source = choice.Save;
             j.Mode = choice.Mode;
             j.WorldTag = worldTag;
+            j.HenryCapture = choice.Capture;
 
             // ---- Phase 2: splice + check + verify, in memory
             _questClasses ??= WhsSave.QuestClasses(tables);
@@ -762,7 +764,9 @@ public partial class GameBridge
         uint readySeq = _joinReceivedSeq;
         if (j.WorldTag is string wt0) Wo134AfterReady(wt0);   // WO-134: arm before Ready so a < 2 ms LAN host ledger is never wiped
         await SendJoinerReadyAsync("wo124");
-        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq);   // WO-125: the join save's matched pair
+        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq, j.HenryCapture);   // WO-125: the join save's matched pair
+        else _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         j.Phase = "in";
         SetJoinUi("in", "In your host's world.");
         await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end");
@@ -903,6 +907,8 @@ public partial class GameBridge
     /// <summary>Before the load: abort to the host (it resumes), clean up, stay at the menu.</summary>
     private async Task AbortJoinerJoinAsync(JoinerJoin j, byte reason, string why, string message, bool sendAbort = true)
     {
+        _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         if (sendAbort)
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
         if (j.PlacedPath is string p)
@@ -929,6 +935,8 @@ public partial class GameBridge
     /// <summary>After the load: abort to the host, then leave its world (back to this player's own newest save).</summary>
     private async Task LeaveAfterFailedJoinAsync(JoinerJoin j, byte reason, string why, string message)
     {
+        _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent (the host resumes)");
         _joinReceivedId = 0;

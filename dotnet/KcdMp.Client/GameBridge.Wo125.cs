@@ -576,7 +576,7 @@ public partial class GameBridge
         return (null, "no loadable save of this player's own (with a different playthrough than the host's)");
     }
 
-    public sealed record HenryChoice(string Mode, WhsSave.HenryParts Parts, HenrySource? Save, string Detail);
+    public sealed record HenryChoice(string Mode, WhsSave.HenryParts Parts, HenrySource? Save, string Detail, HenryStore.SnapshotCapture? Capture = null);
 
     /// <summary>
     /// The source for a first join. bring = the newest own save whose player is
@@ -711,7 +711,7 @@ public partial class GameBridge
             if (pick is null) { why = $"world {tag}: no snapshot could be read (all broken)"; abortReason = Protocol.JoinAbortNoHenrySource; return null; }
             Console.WriteLine($"MP-HENRY joiner: join 0x{joinId:x8}: world {tag} -- RESTORE snapshot {pick.Snapshot.Short} ({pick.Snapshot.Source}): {pick.How}");
             Wo134OnRestorePick(pick.Snapshot);   // WO-134: its chest ledger comes back with it
-            return new HenryChoice("restore", pick.Parts, null, $"snapshot {pick.Snapshot.Short}");
+            return new HenryChoice("restore", pick.Parts, null, $"snapshot {pick.Snapshot.Short}", _henry.CaptureBoundary(tag));
         }
         Wo134OnRestorePick(null);   // WO-134: a first join: an empty chest ledger
         var choice = CurrentChoice();
@@ -719,11 +719,11 @@ public partial class GameBridge
         var src = Wo125SourceFor(choice, out string swhy);
         if (src is null) { why = swhy; abortReason = choice == "bring" ? Protocol.JoinAbortNoOwnSave : Protocol.JoinAbortNoHenrySource; return null; }
         Console.WriteLine($"MP-HENRY joiner: join 0x{joinId:x8}: world {tag} -- FIRST JOIN, {(src.Mode == "fresh" ? "Start fresh" : "Bring my character")}: the Henry comes from {src.Detail}{(src.Mode == "fresh" ? " (a new game's first Henry save; never the host's)" : "")}");
-        return src;
+        return src with { Capture = _henry.CaptureBoundary(tag) };
     }
 
     /// <summary>After Ready: the join save pairs with the Henry just loaded (a matched pair: the joiner has not played in it yet).</summary>
-    private void Wo125AfterReady(string tag, string mode, WhsSave.HenryParts parts, byte[]? offerMd5, uint seq)
+    private void Wo125AfterReady(string tag, string mode, WhsSave.HenryParts parts, byte[]? offerMd5, uint seq, HenryStore.SnapshotCapture? capture = null)
     {
         if (_rejoinPending || _rewinding) _ = W164NoticeAsync(Wo164Rules.ReloadBackText);   // WO-164 RL: the rejoin after the host's reload
         _joinedTag = tag;
@@ -743,11 +743,16 @@ public partial class GameBridge
         }
         Wo184OnJoined(offerMd5, seq);   // WO-184: the join save is this world's first pair; a final snapshot pairs with it until the host saves
         Wo189OnJoined();                // WO-189 B3: the host's active quest profiles asked for (mp_profile_mirror)
-        if (offerMd5 is null) { Console.WriteLine("MP-HENRY joiner: the offer's md5 is unknown -- the join save is not paired"); return; }
+        if (offerMd5 is null)
+        {
+            _henry.ReleaseCapture(capture);
+            Console.WriteLine("MP-HENRY joiner: the offer's md5 is unknown -- the join save is not paired");
+            return;
+        }
         try
         {
             parts.Origin = WhsSave.HenryParts.OriginSnapshot;
-            var joinSnap = _henry.Store(tag, parts, Convert.ToHexString(offerMd5), mode == "restore" ? HenryStore.SourceJoin : mode, $"the join save (seq {seq})");
+            var joinSnap = _henry.Store(tag, parts, Convert.ToHexString(offerMd5), mode == "restore" ? HenryStore.SourceJoin : mode, $"the join save (seq {seq})", capture);
             Wo134OnSnapshotStored(joinSnap);   // WO-134: the chest ledger pairs with it
             _henry.MarkJoined(tag);
             Wo157ClaimJoinedWorld(tag);   // WO-157: this folder is this host's world from now on
@@ -755,8 +760,25 @@ public partial class GameBridge
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
         {
+            _henry.ReleaseCapture(capture);
             Console.WriteLine($"MP-HENRY joiner: the join save's pair was NOT stored: {ex.Message}");
         }
+    }
+
+    /// <summary>Record when a joiner's dropped item leaves Henry's inventory so snapshots captured afterwards know it is already excluded.</summary>
+    private void Wo125OnJoinerDropStarted(uint dropId)
+    {
+        if (!_joinedWorld || _joinedTag is not string tag || _resetTag == tag) return;
+        try { _henry.NoteOutgoingDrop(tag, dropId); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+    }
+
+    /// <summary>Clear the early inventory-removal boundary when the joiner picks (or attempts to pick) their own drop back up.</summary>
+    private void Wo125OnJoinerDropSelfClaim(uint dropId)
+    {
+        if (!_joinedWorld || _joinedTag is not string tag) return;
+        try { _henry.ClearOutgoingDrop(tag, dropId); }
+        catch (ArgumentException) { }
     }
 
     /// <summary>

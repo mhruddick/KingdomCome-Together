@@ -26,7 +26,9 @@ public class M1PlayerDropLuaTests
         Assert.Contains("Script.SetTimer(60, function()", text);
         Assert.Contains("mp_item_finalize(key, d, \"fast\")", text);
         Assert.Contains("function KCD2MP_ItemTryBindPlacingByName(name)", text);
-        Assert.Contains("d.spawnInvCount ~= nil and curCount > d.spawnInvCount", text);
+        Assert.Contains("d.createdWuid = created", text);
+        Assert.Contains("if foundCreated ~= nil then", text);
+        Assert.DoesNotContain("d.spawnInvCount", text);
         Assert.Contains("KCD2MP_ItemTryBindPlacingByName(name)", text);
     }
 }

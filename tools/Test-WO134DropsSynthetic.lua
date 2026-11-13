@@ -479,6 +479,48 @@ for _, cfgName in ipairs({ "solo", "joiner", "host" }) do
         check(C .. "D7c lost claim race on inventory-delta fallback rolls back cleanly",
               dp3.state == "resolved" and player.inventory:GetCountOfClass(BANDAGE) == 0)
     end
+
+    -- ---- D7d: unrelated same-class item gain during deferred placement NEVER claims the drop or deletes the unrelated item ----
+    freshWorld(); CONFIGS[cfgName]()
+    do
+        local gh = KCD2MP.ghosts["7"].entity
+        local deferred = nil
+        gh.human.PlaceItem = function(self, w, anchorId, _)
+            deferred = { w = w, anchorId = anchorId }
+        end
+        KCD2MP_ItemDropAdd("3000000074", BANDAGE, 2, 1.0, 102, 100, 10, "7")
+        tick() -- enters placing (2 bandages awaiting placement on ghost)
+        -- Player acquires 1 unrelated bandage (e.g. crafted/rewarded/looted) AND picks up 1 unrelated world bandage nearby!
+        player.inventory:CreateItem(BANDAGE, 1, 1)
+        local unrelatedWorldWuid = newItem(BANDAGE, 1.0, 1)
+        local unrelatedWorldEnt = mkPickable("world_bandage_unrelated", BANDAGE, 1, 1.0, 101.5, 100, 10, unrelatedWorldWuid)
+        if CONFIGS[cfgName] == CONFIGS.solo then
+            PickableItem.OnUsed(unrelatedWorldEnt, player)
+        else
+            ENTS["world_bandage_unrelated"] = nil
+            player.inventory:AddItem(unrelatedWorldWuid)
+        end
+        LOG = {}
+        tick() -- finalize runs while 3000000074 is still awaiting placement
+        local dp4 = KCD2MP.itemDrops["3000000074"]
+        check(C .. "D7d unrelated same-class gain while placing does NOT claim the drop",
+              dp4 and dp4.state == "placing" and #events("item_claim") == 0,
+              tostring(dp4 and dp4.state) .. " claims=" .. table.concat(events("item_claim"), ","))
+        -- Peer claims 3000000074 while it is still placing, then deferred placement finishes: player's 2 unrelated bandages MUST remain untouched!
+        KCD2MP_ItemDropClaimed("3000000074", "7", false)
+        local a = nil
+        for _, e in pairs(ENTS) do if e.id == deferred.anchorId then a = e end end
+        local it = ITEMS[deferred.w]
+        gh.inventory:RemoveItem(deferred.w)
+        if a and it then
+            local p = a:GetWorldPos()
+            mkPickable(engineName(it.class), it.class, it.amount, it.health, p.x, p.y, p.z, deferred.w)
+        end
+        tick()
+        check(C .. "D7d losing claim on deferred drop preserves player's unrelated items",
+              dp4.state == "resolved" and player.inventory:GetCountOfClass(BANDAGE) == 2,
+              "state=" .. tostring(dp4.state) .. " bandages=" .. tostring(player.inventory:GetCountOfClass(BANDAGE)))
+    end
 end
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
