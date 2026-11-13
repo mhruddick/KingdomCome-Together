@@ -1,0 +1,35 @@
+# Milestone 2: Live Shared World Chests, Corpse Stack/Put Enhancements, and Shared Loose World Pickups
+
+## Architecture Summary
+
+Milestone 2 unifies non-personal world containers, corpse stack/put operations, and loose world item pickups under a single shared-world authority model where the Host's `.whs` save (paired with a lightweight per-world loose-item tombstone sidecar for unstreamed pickups) is the single persisted source of truth:
+
+1. **Shared Non-Personal World Chests via `WO-217` Live Ledger**:
+   - **Personal Stash Isolation**: Any container whose `e.stash:GetMasterInventory()` is a valid WUID, whose `e:GetInventoryToOpen()` differs from `e.inventory:GetId()`, or whose entity name contains `"playerMasterChest"` is strictly personal (managed by `.whs` splicing in Milestone 1) and excluded from live container sync.
+   - **Retiring Per-Player Chest Delta Replay**: `WO-134`'s per-player chest recording (`W134.chestPass`) and join-time delta replay (`Wo134SendLedgerAsync` / `Wo134AfterReady` chest apply) are retired so Host chest takes and puts persisted in `.whs` are never undone on join. Pure `Wo134Rules` types remain intact for compatibility, and `KCD2MP_W134ChestApply` remains a safe no-op stub for install verification markers.
+   - **Coordinate-Tagged Container Addressing**: World containers (`Stash`, `CartStash`, `Nest`, `DestroStash`, excluding `kcd2mp_w217_escrow`, drops, graves, and mod entities) frequently share duplicate names (`Stash19`, `Stash45`) or contain punctuation (`stash[Chest/...]`). They are addressed on the wire using an ASCII `[A-Za-z0-9_]` key (`wc_<clsTag>_<xCm>_<yCm>_<zCm>_<nameHash8>_<stem>`) within the 80-char `Wo134Rules.BodyName` limit, resolving on both Host and Joiner via `System.GetEntitiesInSphere({x,y,z}, 2.5)` matching container class and name hash while keeping NPC corpse names unchanged.
+   - **Lazy Host Initialization & Save Marking**: When Joiner opens an untouched world chest (`KCD2MP_W217HostOpen`), Host ensures lazy loot generation (`StashInventoryCollector` / `AssignInventory` / `GenerateInventory` when unopened) before reading `L.hostList(e)` and calls `e.stash:ReportOpened()` on open, take, and put so EntityModule persists the chest in Host's `.whs`.
+
+2. **Partial Stack Transfers & Live Bidirectional Puts (Corpses & World Chests)**:
+   - **Per-WUID Stack & Pack Tracking**: `W217.L` tracks `{ w, cls, amt, hp }` in both `s.snap` (container/corpse) and `s.pinv` (`player.inventory`), initialized immediately on session open.
+   - **Partial & Merged Takes**: When Joiner takes either a whole WUID or a partial stack `delta` (including when the engine merges the taken items into an existing stack in `player.inventory`), the `delta` is moved/split into `kcd2mp_w217_escrow` until Host answers `TakeReq`. On Host, `KCD2MP_W217HostTakeReq` deducts `delta` via `kcd2mp_w217_escrow` (moving whole WUID when `curAmt == delta`, or splitting `curAmt - delta` back into `e` and holding `delta` in escrow when `curAmt > delta`) and immediately broadcasts `w217_blist`.
+   - **Live Stack Updates & Escrow Puts**: `L.apply` updates mapped items on Joiner via `kcd2mp_w217_escrow` moves whenever `amt` or `hp` changes while respecting in-flight takes/puts. Joiner puts (whole WUIDs, split stacks, and merges onto existing container stacks) execute on Host via `kcd2mp_w217_escrow` + `L.move(esc, w, e)` without `KCD2MP_W201InvDefer` blocking under open screens, followed by immediate `L.hostSend`.
+
+3. **Shared Loose World Items (`PickableItem`)**:
+   - **Two-Stage Drift Matching**: `W134.findItem` searches within `0.35 m` first (disambiguating dense table items) and falls back to `5.0 m` nearest same-`class` `PickableItem` for physics-settled bows, weapons, and shields, while checking tight `0.35 m` taken records first so races on dense items never spill onto nearby items.
+   - **Unstreamed Tombstones & Per-World Persistence**: If Joiner picks up a loose world item while Host is out of streaming range (`findItem == nil`), Host records an unswept tombstone in `w.goneWorldItems`, persists it per-world in C# alongside `worldTag` (paired with Host `.whs` saves in `Wo134OnHostWorld`), returns `"ok"` (or `"mine"`/`"gone"` if already recorded), and sweeps/removes the item via `W134.takeAway` once Host walks within streaming range.
+   - **Joiner Tombstone Caching & Replay**: Host replays active tombstones on `JoinerReady` via `LootHostItemGone`. When `KCD2MP_W134ItemGone` arrives on Joiner for an unstreamed area, Joiner caches the tombstone in `w.goneTombstones` and sweeps it in `W134.loop` when entering range.
+   - **Guaranteed Joiner Async Pickup**: In `KCD2MP_W134ItemResult`, if `orig(r.ent, player, r.slot)` leaves `r.ent` in the world after network RTT due to focus drift, `r.ent.item:GetId()` is added directly via `player.inventory:AddItem(...)` and any lingering world prop is cleaned up via `System.RemoveEntity(r.ent.id)`.
+
+## Branch Isolation Guardrails
+
+- Do NOT modify `WhsSave.cs`, `WhsSave.Wo125.cs`, `HenryStore.cs`, `Publish-Release.ps1`, `GameBridge.Wo124.cs` lines 760–770, `kdcmp.lua` lines 16336–16725, or `kdcmp/Data/kdcmp.pak`.
+- Preserve UTF-8 without BOM on `kdcmp/Data/Scripts/Startup/kdcmp.lua`.
+
+## Implementation Checklist
+
+- [ ] **Task 1: Retire WO-134 Per-Player Chest Replay & Add Coordinate-Tagged World Chest Addressing** — Disable per-player chest delta recording and join-time chest ledger replay in Lua and C#, implement `[A-Za-z0-9_]` coordinate + class + name-hash world chest keys (`wc_...`) with `2.5 m` sphere resolution on Host and Joiner, and add unit/synthetic tests.
+- [ ] **Task 2: Route Non-Personal World Chests Through WO-217 Live Sync with Lazy Host Initialization** — Exclude personal master chests, intercept unlocked shared world container opens (`Stash`, `CartStash`, `Nest`, `DestroStash`) into `WO-217` live sessions, initialize untouched Host chest loot lazily (`StashInventoryCollector` / `AssignInventory` / `ReportOpened`), and verify with synthetic tests.
+- [ ] **Task 3: Partial Stack Transfers, Stack Updates, and Live Escrow Puts (Corpses & World Chests)** — Track per-WUID stack amounts/health in `W217.L`, support partial and stack-merged takes/puts on Joiner and Host via `kcd2mp_w217_escrow` moves without `WO-201` UI deferral blocking, update changed stack counts live in `L.apply`, and add unit/synthetic tests.
+- [ ] **Task 4: Loose World Item Drift Matching, Unstreamed Tombstones & Persistence (Host & Joiner)** — Add `0.35 m` -> `5.0 m` two-stage matching in `W134.findItem`, close the Host unstreamed `"unknown"` dupe hole with `w.goneWorldItems` + C# per-world JSON persistence paired with Host saves, replay/cache `LootHostItemGone` tombstones on Joiner (`w.goneTombstones`), and add C# + Lua tests.
+- [ ] **Task 5: Fix Joiner Async Weapon Pickup Fallback & Full Final Verification** — Add direct `player.inventory:AddItem(r.ent.item:GetId())` + `System.RemoveEntity` fallback in `KCD2MP_W134ItemResult` when async `orig` leaves a weapon/item in the world, verify `WO-48` drops and all static/unit/relay/synthetic test gates, and audit branch isolation rules.
