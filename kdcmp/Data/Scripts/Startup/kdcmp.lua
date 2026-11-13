@@ -16801,12 +16801,15 @@ KCD2MP.w134 = {
     partial = {},         -- joiner: body name -> { parts = {}, n, reason, flags }
     stash = {},           -- joiner: body name -> the host's last list, for a copy that is not dead here yet
     itemReq = {},         -- joiner: tok -> { name, ent, hold, cls, x, y, z, at }
-    hostTaken = {},       -- host: { cls, x, y, z, at } world items gone this session
+    hostTaken = {},       -- host: { cls, x, y, z, at, by } world items gone this session
+    goneWorldItems = {},  -- host: { cls, x, y, z, by, swept, at } tombstones for unstreamed loose items
+    goneTombstones = {},  -- joiner: { cls, x, y, z, swept, at } cached unstreamed ItemGone tombstones
     hostVerify = {},      -- host: pickups to confirm on the next loop pass
     bodySig = {},         -- host: body name -> last signature sent
     chestSess = {},       -- both: container name -> { snap = counts, at }
     loopMs = 250,
-    matchM = 0.35,        -- a world item's class + position match (host and joiner copies of one save: 0.000 m observed)
+    matchM = 0.35,        -- tight resting item match first (two apples side by side stay distinct)
+    driftMatchM = 5.0,    -- M2: fallback radius for physics-settled weapons/bows/shields leaning on props or dropped by NPCs
     deadBodyMatchM = 2.5, -- an item that fell off a corpse lands where each machine's physics put it
     bodyRadiusM = 25.0,   -- host: bodies watched around the host and every avatar
     chestRadiusM = 3.0,   -- the player's reach to a container (fUseDistance 2.5)
@@ -16895,8 +16898,8 @@ function W134.belongsToBody(e)
     return r
 end
 
--- The world item of class cls nearest to (x, y, z) within tol metres, never a drop.
-function W134.findItem(cls, x, y, z, tol, amt)
+-- Exact radius search for a bound PickableItem of class cls within tol metres (never a player drop).
+function W134.findItemInRadius(cls, x, y, z, tol, amt)
     local best, bd = nil, tol * tol
     local bestA, bdA = nil, tol * tol   -- WO-177 B1: the nearest one of the SAME amount (two apples side by side are two items; a pile of two is one)
     local ents = {}
@@ -16916,10 +16919,19 @@ function W134.findItem(cls, x, y, z, tol, amt)
         end
     end
     if bestA and bestA ~= best then
-        -- the nearest is another amount, one of this amount lies within the match radius: that one is the item the joiner means
         return bestA, math.sqrt(bdA)
     end
     return best, math.sqrt(bd)
+end
+
+-- M2: tight 0.35 m match first (so dense table items pick the exact item), falling back to 5.0 m for physics-settled bows/weapons/shields.
+function W134.findItem(cls, x, y, z, tol, amt)
+    local w = KCD2MP.w134
+    local tight = math.min(tol or w.matchM, w.matchM)
+    local e, d = W134.findItemInRadius(cls, x, y, z, tight, amt)
+    if e then return e, d end
+    local fallback = math.max(tol or (w.driftMatchM or 5.0), w.driftMatchM or 5.0)
+    return W134.findItemInRadius(cls, x, y, z, fallback, amt)
 end
 
 -- Take a world item out of this world for good. A plain RemoveEntity is not a
@@ -17535,34 +17547,123 @@ function W134.hostVerifyPass()
     w.hostVerify = keep
 end
 
--- Agent -> host: a joiner wants this world item. body = 1: an item that fell off a
--- corpse (each machine's physics placed it; matched within deadBodyMatchM).
-function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt)
+function W134.findTaken(cls, x, y, z, tol)
     local w = KCD2MP.w134
-    x, y, z = tonumber(x), tonumber(y), tonumber(z)
-    amt = tonumber(amt)
-    local tol = (tonumber(body) == 1) and w.deadBodyMatchM or w.matchM
-    local e, d = W134.findItem(tostring(cls), x, y, z, tol, amt)
-    local verdict = "unknown"
-    local how = ""
-    if e then
-        verdict = "ok"
-        w.hostTaken[#w.hostTaken + 1] = { cls = cls, x = x, y = y, z = z, at = os.clock(), by = tostring(peer) }
-        how = W134.takeAway(e, peer)
-    else
-        for _, t in ipairs(w.hostTaken) do
-            if t.cls == cls and (t.x - x) ^ 2 + (t.y - y) ^ 2 + (t.z - z) ^ 2 <= tol * tol then
-                -- WO-136 Phase 7: this joiner's own earlier take is not "someone else's"
-                verdict = (t.by == tostring(peer)) and "mine" or "gone"
-                break
+    local r2 = tol * tol
+    for _, list in ipairs({ w.hostTaken or {}, w.goneWorldItems or {} }) do
+        for _, t in ipairs(list) do
+            if t.cls == cls and (t.x - x) ^ 2 + (t.y - y) ^ 2 + (t.z - z) ^ 2 <= r2 then
+                return t
             end
         end
     end
-    KCD2MP_EmitEvent("w134_ires", string.format("%s %s %s %s %.3f %.3f %.3f", tostring(peer), tostring(tok), verdict, tostring(cls), x, y, z))
+    return nil
+end
+
+-- Agent -> host: restore persisted world-item tombstones for this host save/world.
+function KCD2MP_W134HostTombstones(rows, reset)
+    local w = KCD2MP.w134
+    W134.startLoop()
+    if reset then w.goneWorldItems = {} end
+    w.goneWorldItems = w.goneWorldItems or {}
+    w.hostTaken = w.hostTaken or {}
+    local now = os.clock()
+    for _, r in ipairs(rows or {}) do
+        local cls, x, y, z, by, swept = tostring(r[1]), tonumber(r[2]), tonumber(r[3]), tonumber(r[4]), tostring(r[5] or "host"), r[6] == true
+        if cls and x and y and z then
+            local dup = false
+            for _, ex in ipairs(w.goneWorldItems) do
+                if ex.cls == cls and (ex.x - x) ^ 2 + (ex.y - y) ^ 2 + (ex.z - z) ^ 2 <= 0.15 * 0.15 then
+                    ex.swept = ex.swept or swept
+                    dup = true
+                    break
+                end
+            end
+            if not dup then
+                local rec = { cls = cls, x = x, y = y, z = z, by = by, swept = swept, at = now }
+                w.goneWorldItems[#w.goneWorldItems + 1] = rec
+                w.hostTaken[#w.hostTaken + 1] = rec
+            end
+        end
+    end
+    return true
+end
+
+function W134.sweepHostTombstones()
+    local w = KCD2MP.w134
+    if not (w.goneWorldItems and #w.goneWorldItems > 0) then return end
+    local pp = W134.pos(player)
+    if not pp then return end
+    for _, t in ipairs(w.goneWorldItems) do
+        if not t.swept then
+            local dx, dy, dz = pp.x - t.x, pp.y - t.y, pp.z - t.z
+            if dx * dx + dy * dy + dz * dz <= 120 * 120 then
+                local e, d = W134.findItem(t.cls, t.x, t.y, t.z, w.matchM)
+                if e then
+                    t.swept = true
+                    local how = W134.takeAway(e, t.by)
+                    w.stats.tombSweptHost = (w.stats.tombSweptHost or 0) + 1
+                    KCD2MP_EmitEvent("w134_itomb", string.format("swept %s %.3f %.3f %.3f", t.cls, t.x, t.y, t.z))
+                    W134.log(string.format("WO134-ITEM host-tombstone-swept cls=%s at=(%.2f,%.2f,%.2f) -- %s (matched %.3f m)",
+                        tostring(t.cls), t.x, t.y, t.z, how, d))
+                end
+            end
+        end
+    end
+end
+
+-- Agent -> host: a joiner wants this world item.
+-- M2: 0.35 m tight match first (so dense table items stay distinct), then tight taken check, then 5.0 m physics-drift fallback,
+-- then unstreamed tombstone recording (closing the >120 m 'unknown' dupe hole).
+function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt)
+    local w = KCD2MP.w134
+    cls = tostring(cls)
+    peer = tostring(peer)
+    x, y, z = tonumber(x), tonumber(y), tonumber(z)
+    amt = tonumber(amt)
+    w.hostTaken = w.hostTaken or {}
+    w.goneWorldItems = w.goneWorldItems or {}
+    local driftTol = w.driftMatchM or 5.0
+    local e, d = W134.findItemInRadius(cls, x, y, z, w.matchM, amt)
+    local verdict = nil
+    local how = ""
+    if not e then
+        local tightTaken = W134.findTaken(cls, x, y, z, w.matchM)
+        if tightTaken then
+            verdict = (tightTaken.by == peer) and "mine" or "gone"
+        else
+            e, d = W134.findItemInRadius(cls, x, y, z, driftTol, amt)
+        end
+    end
+    if e then
+        verdict = "ok"
+        local ep = W134.pos(e)
+        local now = os.clock()
+        w.hostTaken[#w.hostTaken + 1] = { cls = cls, x = x, y = y, z = z, at = now, by = peer }
+        if ep and ((ep.x - x) ^ 2 + (ep.y - y) ^ 2 + (ep.z - z) ^ 2) > 0.01 then
+            w.hostTaken[#w.hostTaken + 1] = { cls = cls, x = ep.x, y = ep.y, z = ep.z, at = now, by = peer }
+        end
+        how = W134.takeAway(e, peer)
+    elseif not verdict then
+        local driftTaken = W134.findTaken(cls, x, y, z, driftTol)
+        if driftTaken then
+            verdict = (driftTaken.by == peer) and "mine" or "gone"
+        else
+            -- M2: unstreamed world item on the host (>120 m away): record tombstone for sweep & save persistence, grant "ok" to joiner.
+            verdict = "ok"
+            how = "tombstoned"
+            local tomb = { cls = cls, x = x, y = y, z = z, by = peer, swept = false, at = os.clock() }
+            w.goneWorldItems[#w.goneWorldItems + 1] = tomb
+            w.hostTaken[#w.hostTaken + 1] = tomb
+            KCD2MP_EmitEvent("w134_itomb", string.format("add %s %.3f %.3f %.3f %s", cls, x, y, z, peer))
+            W134.startLoop()
+        end
+    end
+    KCD2MP_EmitEvent("w134_ires", string.format("%s %s %s %s %.3f %.3f %.3f", peer, tostring(tok), verdict, cls, x, y, z))
     local hostAmt = nil
     if e then pcall(function() hostAmt = math.max(1, math.floor(tonumber(e.Properties.nAmount) or 1)) end) end
-    W134.log(string.format("WO134-ITEM host-take cls=%s at=(%.2f,%.2f,%.2f) from=%s -> %s%s%s", tostring(cls), x, y, z, tostring(peer), verdict,
-        e and string.format(" (matched %.3f m, %s)", d, how) or "",
+    W134.log(string.format("WO134-ITEM host-take cls=%s at=(%.2f,%.2f,%.2f) from=%s -> %s%s%s", cls, x, y, z, peer, verdict,
+        e and string.format(" (matched %.3f m, %s)", d, how) or (how == "tombstoned" and " (unstreamed here: tombstoned)" or ""),
         (amt and hostAmt) and string.format(" amount joiner=%d host=%d%s", amt, hostAmt, amt == hostAmt and "" or " -- DIFFERENT: each machine's own pickup counts") or ""))
 end
 
@@ -17598,19 +17699,56 @@ function KCD2MP_W134ItemResult(tok, verdict)
     end
 end
 
+function W134.sweepJoinerTombstones()
+    local w = KCD2MP.w134
+    if not (w.goneTombstones and #w.goneTombstones > 0) then return end
+    local pp = W134.pos(player)
+    if not pp then return end
+    for _, t in ipairs(w.goneTombstones) do
+        if not t.swept then
+            local dx, dy, dz = pp.x - t.x, pp.y - t.y, pp.z - t.z
+            if dx * dx + dy * dy + dz * dz <= 120 * 120 then
+                local e, d = W134.findItem(t.cls, t.x, t.y, t.z, w.matchM)
+                if e then
+                    t.swept = true
+                    for tok, r in pairs(w.itemReq) do if r.ent == e then w.itemReq[tok] = nil end end
+                    local how = W134.takeAway(e)
+                    w.stats.tombSweptJoiner = (w.stats.tombSweptJoiner or 0) + 1
+                    W134.log(string.format("WO134-ITEM joiner-tombstone-swept cls=%s at=(%.2f,%.2f,%.2f) -- %s here (matched %.3f m)",
+                        tostring(t.cls), t.x, t.y, t.z, how, d))
+                end
+            end
+        end
+    end
+end
+
 -- Agent -> joiner: the host (or another joiner) took this world item.
 function KCD2MP_W134ItemGone(cls, x, y, z)
     local w = KCD2MP.w134
+    cls = tostring(cls)
     x, y, z = tonumber(x), tonumber(y), tonumber(z)
-    local e, d = W134.findItem(tostring(cls), x, y, z, w.matchM)
-    if not e then e, d = W134.findItem(tostring(cls), x, y, z, w.deadBodyMatchM); if e and not W134.belongsToBody(e) then e = nil end end
+    local e, d = W134.findItem(cls, x, y, z, w.matchM)
     if not e then
-        W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- nothing here to remove", tostring(cls), x, y, z))
+        -- M2: unstreamed here right now (joiner is far away, or replayed on JoinerReady): cache tombstone and sweep when streamed in!
+        W134.startLoop()
+        w.goneTombstones = w.goneTombstones or {}
+        local dup = false
+        for _, t in ipairs(w.goneTombstones) do
+            if not t.swept and t.cls == cls and (t.x - x) ^ 2 + (t.y - y) ^ 2 + (t.z - z) ^ 2 <= 0.15 * 0.15 then
+                dup = true
+                break
+            end
+        end
+        if not dup then
+            if #w.goneTombstones >= 1000 then table.remove(w.goneTombstones, 1) end
+            w.goneTombstones[#w.goneTombstones + 1] = { cls = cls, x = x, y = y, z = z, swept = false, at = os.clock() }
+        end
+        W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- unstreamed here: cached tombstone for sweep", cls, x, y, z))
         return false
     end
     for tok, r in pairs(w.itemReq) do if r.ent == e then w.itemReq[tok] = nil end end
     local how = W134.takeAway(e)
-    W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- %s here (matched %.3f m)", tostring(cls), x, y, z, how, d))
+    W134.log(string.format("WO134-ITEM host-gone cls=%s at=(%.2f,%.2f,%.2f) -- %s here (matched %.3f m)", cls, x, y, z, how, d))
     return true
 end
 
@@ -17735,8 +17873,11 @@ function W134.loop()
             W134.log(string.format("WO134-ITEM timeout tok=%s cls=%s", tok, tostring(r.cls)))
         end
     end
+    -- joiner: cached tombstones for unstreamed world items
+    if KCD2MP_W134JoinerActive() and w.items then W134.sweepJoinerTombstones() end
     -- host
     if #w.hostVerify > 0 then W134.hostVerifyPass() end
+    if w.host and w.shared and W134.fresh() and w.items then W134.sweepHostTombstones() end
     if KCD2MP_W134HostActive() and w.bodies then
         w.watchAt = w.watchAt or 0
         if (now - w.watchAt) >= 1.0 then w.watchAt = now; W134.hostWatch() end
@@ -17749,8 +17890,17 @@ function W134.forgetWorld(why)
     local w = KCD2MP.w134
     local n = 0
     for _ in pairs(w.chestSess) do n = n + 1 end
+    local now = os.clock()
+    local keepHost, keepJoiner = {}, {}
+    if why == "loop-start" then
+        for _, t in ipairs(w.goneWorldItems or {}) do if now - (t.at or 0) <= 5.0 then keepHost[#keepHost + 1] = t end end
+        for _, t in ipairs(w.goneTombstones or {}) do if now - (t.at or 0) <= 5.0 then keepJoiner[#keepJoiner + 1] = t end end
+    end
     w.chestSess = {}; w.sessions = {}; w.pendingOpen = {}; w.itemReq = {}; w.stash = {}; w.partial = {}; w.hostVerify = {}
+    w.hostTaken = {}; w.goneWorldItems = keepHost; w.goneTombstones = keepJoiner
+    for _, t in ipairs(keepHost) do w.hostTaken[#w.hostTaken + 1] = t end
     if KCD2MP.w166 then KCD2MP.w166.loot.openOn = nil; KCD2MP.w166.loot.deferred = {}; KCD2MP.w166.loot.takebacks = {} end   -- WO-166 L1: a new world
+    KCD2MP_EmitEvent("w134_itomb", "sync")
     if n > 0 then W134.log(string.format("WO134-CHEST reset why=%s -- %d chest snapshot(s) dropped; the next pass takes new ones", tostring(why), n)) end
 end
 

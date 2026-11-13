@@ -252,4 +252,47 @@ public class Wo134Tests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Fact]
+    public void M2_world_item_tombstones_dedupe_mark_swept_pair_with_host_saves_and_fit_console_calls()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "wo134t-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var st = new WorldItemTombstoneStore(root);
+            string tag = "0123456789", md5a = new string('a', 32), md5b = new string('b', 32);
+            var l = new Wo134Rules.ItemTombstoneLedger();
+            l.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Coat.ToUpperInvariant(), X = 2150.4f, Y = -1890.2f, Z = 112.1f, By = "1", Swept = false });
+            l.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Coat, X = 2150.45f, Y = -1890.2f, Z = 112.1f, By = "1", Swept = false });   // <0.15 m dedupe
+            Assert.Single(l.Items);
+            Assert.False(l.Items[0].Swept);
+
+            st.SaveCurrent(tag, l);
+            st.Pair(tag, md5a, l);   // Save A: before Host walked to the tree (Swept == false)
+
+            Assert.True(l.MarkSwept(Coat, 2152.1f, -1890.2f, 112.1f));   // within 5.0 m physics drift
+            Assert.True(l.Items[0].Swept);
+            st.Pair(tag, md5b, l);   // Save B: after Host walked to the tree and swept it
+
+            Assert.False(st.Paired(tag, md5a)!.Items[0].Swept);   // reloading Save A restores unswept tombstone!
+            Assert.True(st.Paired(tag, md5b)!.Items[0].Swept);
+            Assert.Throws<ArgumentException>(() => st.Current("../bad"));
+
+            // Bad JSON or unsafe strings are rejected cleanly
+            var bad = Wo134Rules.ItemTombstoneLedger.FromJson("{\"Items\":[{\"Cls\":\"" + Coat + "\",\"X\":1,\"Y\":2,\"Z\":3,\"By\":\"a\\\"b\",\"Swept\":false},{\"Cls\":\"" + Dice + "\",\"X\":10,\"Y\":20,\"Z\":30,\"By\":\"2\",\"Swept\":false}]}");
+            Assert.Single(bad.Items);
+            Assert.Equal(Dice, bad.Items[0].Cls);
+
+            // Large tombstone sync calls pack cleanly below KCD2's 2,100-char console limit
+            var many = new Wo134Rules.ItemTombstoneLedger();
+            for (int i = 0; i < 60; i++)
+                many.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Dice, X = i * 10f, Y = -500.125f, Z = 42.5f, By = "1", Swept = i % 2 == 0 });
+            var calls = Wo134Rules.TombstoneSyncCalls(many.Items);
+            Assert.True(calls.Count >= 2);
+            Assert.Contains("}, true) end", calls[0]);
+            Assert.All(calls.Skip(1), c => Assert.Contains("}, false) end", c));
+            Assert.All(calls, c => Assert.True(Uri.EscapeDataString("#" + c).Length < 2100));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

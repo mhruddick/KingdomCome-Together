@@ -230,6 +230,7 @@ local function world()
     KCD2MP.ghosts = {}; KCD2MP.npcPuppets = {}
     local w = KCD2MP.w134
     w.pendingOpen = {}; w.sessions = {}; w.partial = {}; w.stash = {}; w.itemReq = {}; w.hostTaken = {}; w.hostVerify = {}
+    w.goneWorldItems = {}; w.goneTombstones = {}
     w.bodySig = {}; w.chestSess = {}
     w.bodies, w.items, w.chests = true, true, true
     -- WO-217: this suite is WO-134's own loot -- the path with mp_loot_live and mp_item_flags off; WO-217's live loot (a take is a
@@ -390,26 +391,63 @@ local drop2 = mkPickable("onion008888", ONION, 1, 1, 104, 100, 10, newItem(ONION
 KCD2MP.itemDrops["3000000010"] = { state = "ground", entName = "onion008888", mine = false }
 KCD2MP_W134ItemGone(ONION, 104, 100, 10)
 check("I7 ... never a tracked drop at the same spot", ENTS["onion008888"] ~= nil)
-local far = mkPickable("egg000349", EGG, 1, 1, 110, 100, 10, newItem(EGG, 1, 1))
-KCD2MP_W134ItemGone(EGG, 110.5, 100, 10)
-check("I7 ... nor one 0.5 m off (no guessing)", ENTS["egg000349"] ~= nil)
+-- M2 3.1: physics-settled bow/weapon drifted 2.4 m removes cleanly, while >5.0 m is untouched
+local driftedBow = mkPickable("bow000348", SWORD, 1, 1, 112.4, 100, 10, newItem(SWORD, 1, 1))
+local beyond5m = mkPickable("egg000349", EGG, 1, 1, 120, 100, 10, newItem(EGG, 1, 1))
+KCD2MP_W134ItemGone(SWORD, 110.0, 100, 10)
+KCD2MP_W134ItemGone(EGG, 110.0, 100, 10)
+check("I7 physics-settled item within 5.0 m (2.4 m drift) is matched and removed; item >5.0 m (10 m) stays",
+    ENTS["bow000348"] == nil and ENTS["egg000349"] ~= nil)
+-- M2 3.3: unstreamed ItemGone on Joiner caches tombstone and sweeps as soon as streamed in
+KCD2MP_W134ItemGone(COAT, 500.0, 500.0, 10.0)   -- Joiner is at (100,100,10), bow at (500,500,10) not streamed yet
+mkPickable("bow_unstreamed_j", COAT, 1, 1, 501.8, 500.0, 10.0, newItem(COAT, 1, 1))
+loop()
+check("I7b unstreamed tombstone waits while Joiner is >120 m away", ENTS["bow_unstreamed_j"] ~= nil)
+player.GetWorldPos = function() return { x = 495, y = 500, z = 10 } end
+loop()
+check("I7b once Joiner walks within streaming range, cached tombstone sweeps the drifted bow", ENTS["bow_unstreamed_j"] == nil)
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
 
 world(); asHost(1)
-mkPickable("egg000400", EGG, 1, 1, 101, 100, 10, newItem(EGG, 1, 1))
+-- Dense table items (0.20 m apart): tight 0.35 m match picks exact item, and race on already-taken spot does NOT spill onto 2.0 m neighbor!
+mkPickable("egg_dense_a", EGG, 1, 1, 101.0, 100, 10, newItem(EGG, 1, 1))
+mkPickable("egg_dense_b", EGG, 1, 1, 101.2, 100, 10, newItem(EGG, 1, 1))
+mkPickable("egg_shelf", EGG, 1, 1, 103.0, 100, 10, newItem(EGG, 1, 1))
 LOG = {}
 KCD2MP_W134HostItem(1, 71, EGG, 101.0, 100.0, 10.0, 0)
-check("I8 the host matches the joiner's item by class + position and removes its copy: ok", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 71 ok ", 1, true) == 1 and ENTS["egg000400"] == nil, events("w134_ires")[1])
+check("I8 tight 0.35 m priority picks the exact table item at 0.00 m, leaving the 0.20 m neighbor",
+    events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 71 ok ", 1, true) == 1
+    and ENTS["egg_dense_a"] == nil and ENTS["egg_dense_b"] ~= nil, events("w134_ires")[1])
+ENTS["egg_dense_b"] = nil   -- remove neighbor so only 2.0 m shelf egg remains
 LOG = {}
 KCD2MP_W134HostItem(2, 72, EGG, 101.0, 100.0, 10.0, 0)
-check("I9 the same item asked again: gone", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "2 72 gone ", 1, true) == 1, events("w134_ires")[1])
+check("I9 race on already-taken 101.0 spot returns gone and never steals the 2.0 m shelf egg",
+    events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "2 72 gone ", 1, true) == 1 and ENTS["egg_shelf"] ~= nil, events("w134_ires")[1])
+-- M2 3.2: unstreamed world item (>120 m away on Host) records tombstone + emits w134_itomb add + returns ok; repeat asks return mine/gone; Host sweep removes when approaching!
 LOG = {}
-KCD2MP_W134HostItem(1, 73, SWORD, 50, 50, 10, 0)
-check("I10 nothing there: unknown", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 73 unknown ", 1, true) == 1)
+KCD2MP_W134HostItem(1, 73, SWORD, 600, 600, 10, 0)
+check("I10 unstreamed world item on Host records tombstone (w134_itomb add) and grants ok",
+    string.find(events("w134_ires")[1] or "", "1 73 ok ", 1, true) == 1
+    and string.find(events("w134_itomb")[1] or "", "add " .. SWORD .. " 600.000 600.000 10.000 1", 1, true) == 1, events("w134_itomb")[1])
+LOG = {}
+KCD2MP_W134HostItem(1, 731, SWORD, 600.5, 600, 10, 0)
+KCD2MP_W134HostItem(2, 732, SWORD, 601.0, 600, 10, 0)
+check("I10b repeat ask for tombstoned item returns mine to taker and gone to other peer",
+    string.find(events("w134_ires")[1] or "", "1 731 mine ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "2 732 gone ", 1, true) == 1)
+mkPickable("tree_bow_host", SWORD, 1, 1, 602.1, 600, 10, newItem(SWORD, 1, 1))
+player.GetWorldPos = function() return { x = 590, y = 600, z = 10 } end
+LOG = {}; loop()
+check("I10c when Host walks near the tombstoned tree, Host sweeps and removes its bow and marks tombstone swept",
+    ENTS["tree_bow_host"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1, events("w134_itomb")[1])
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
 mkPickable("onion007777", ONION, 1, 1, 104, 100, 10, newItem(ONION, 1, 1))
 KCD2MP.itemDrops["3000000011"] = { state = "ground", entName = "onion007777", mine = true }
 LOG = {}
 KCD2MP_W134HostItem(1, 74, ONION, 104, 100, 10, 0)
-check("I11 a host's tracked drop is never handed out as a world item", ENTS["onion007777"] ~= nil and string.find(events("w134_ires")[1] or "", " unknown ", 1, true) ~= nil)
+loop()
+check("I11 a host's tracked drop is never removed as a world item (even by tombstone sweep)", ENTS["onion007777"] ~= nil)
 local hegg2 = mkPickable("egg000401", EGG, 1, 1, 102, 100, 10, newItem(EGG, 1, 1))
 LOG = {}
 PickableItem.OnUsed(hegg2, player)

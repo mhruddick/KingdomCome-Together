@@ -28,10 +28,13 @@ public partial class GameBridge
 {
     private volatile bool _w134Connected;
     private readonly ChestLedgerStore _chestStore = new(ChestLedgerStore.DefaultRoot());
+    private readonly WorldItemTombstoneStore _tombStore = new(WorldItemTombstoneStore.DefaultRoot());
     private readonly object _w134Gate = new();
-    private Wo134Rules.Ledger? _w134HostLedger;       // the host's running ledger for _w134HostTag
+    private Wo134Rules.Ledger? _w134HostLedger;       // legacy field kept for stats formatting
+    private Wo134Rules.ItemTombstoneLedger? _w134HostTombs;
+    private readonly List<Wo134Rules.ItemTombstone> _w134TombPending = [];
     private string? _w134HostTag;
-    private readonly List<Wo134Rules.Entry> _w134HostPending = [];   // host takes before the world is identified
+    private readonly List<Wo134Rules.Entry> _w134HostPending = [];
     private bool _w134HostDirty;
     private Wo134Rules.Ledger _w134JoinerLedger = new(); // the joiner's, for _joinedTag
     private HenryStore.Snapshot? _w134RestoreSnap;       // the snapshot a join restored (its ledger comes with it)
@@ -154,6 +157,9 @@ public partial class GameBridge
                     foreach (byte g in Wo134Peers())
                         _ = Wo134SendAsync(Protocol.LootHostUp, g, Protocol.LootHostItemGone, 0, string.Join(' ', f));
                 return;
+            case "w134_itomb":     // M2: sync | add <cls> <x> <y> <z> <by> | swept <cls> <x> <y> <z>
+                Wo134OnItemTombEvent(f);
+                return;
             // ---- both: chests
             case "w134_chest":     // <container> <cls> <n> <hp> <worldT> <restockDays>
                 Wo134OnChestEvent(arg ?? "");
@@ -265,29 +271,149 @@ public partial class GameBridge
         Console.WriteLine($"MP-WO134 joiner: malformed {Protocol.LootHostName(m.Kind)} from the host -- dropped ({Q(m.Text.Length > 60 ? m.Text[..60] : m.Text)})");
     }
 
-    // ---------------------------------------------------------------- chests (retired per-player replay; M2 shared world chests)
+    // ---------------------------------------------------------------- M2: loose-item tombstones & retired chest replay
 
     private void Wo134OnChestEvent(string arg)
     {
         // M2: non-personal world chests are shared live via WO-217 and persisted in the host's .whs save.
     }
 
-    private void Wo134FlushHost()
+    private Wo134Rules.ItemTombstoneLedger Wo134HostTombsFor(string tag)
     {
+        if (_w134HostTag != tag || _w134HostTombs is null)
+        {
+            if (_w134HostTag is string old && _w134HostTombs is { } ol && _w134HostDirty)
+            {
+                try { _tombStore.SaveCurrent(old, ol); } catch (IOException) { }
+            }
+            _w134HostTag = tag;
+            _w134HostTombs = _tombStore.Current(tag);
+            _w134HostDirty = false;
+        }
+        if (_w134TombPending.Count > 0)
+        {
+            foreach (var p in _w134TombPending) _w134HostTombs.AddOrUpdate(p);
+            _w134TombPending.Clear();
+            _w134HostDirty = true;
+        }
+        return _w134HostTombs;
     }
 
-    /// <summary>WO-125's host identify hook (M2: per-player chest ledger pairing retired; used for world-scoped loot sidecars).</summary>
-    private void Wo134OnHostWorld(string tag, string md5, bool loaded)
+    private void Wo134OnItemTombEvent(string[] f)
     {
-        lock (_w134Gate)
+        if (f.Length == 0 || !Wo134HostRole) return;
+        if (f[0] == "sync" && f.Length == 1)
         {
-            _w134HostTag = tag;
-            _w134HostDirty = false;
+            _ = Wo134PushHostTombstonesToLuaAsync();
+            return;
+        }
+        if (f[0] == "add" && f.Length == 6 && Wo134Rules.TryClass(f[1], out var cls)
+            && Wo134Rules.TryCoord(f[2], out float x) && Wo134Rules.TryCoord(f[3], out float y) && Wo134Rules.TryCoord(f[4], out float z))
+        {
+            var entry = new Wo134Rules.ItemTombstone { Cls = cls.ToString("D"), X = x, Y = y, Z = z, By = f[5], Swept = false };
+            if (!Wo134Rules.ValidTombstone(entry)) return;
+            lock (_w134Gate)
+            {
+                string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+                if (tag is null)
+                {
+                    if (_w134TombPending.Count < Wo134Rules.ItemTombstoneLedger.MaxEntries) _w134TombPending.Add(entry);
+                    return;
+                }
+                Wo134HostTombsFor(tag).AddOrUpdate(entry);
+                _w134HostDirty = true;
+            }
+            Wo134FlushHost();
+            return;
+        }
+        if (f[0] == "swept" && f.Length == 5 && Wo134Rules.TryClass(f[1], out var scls)
+            && Wo134Rules.TryCoord(f[2], out float sx) && Wo134Rules.TryCoord(f[3], out float sy) && Wo134Rules.TryCoord(f[4], out float sz))
+        {
+            lock (_w134Gate)
+            {
+                string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+                if (tag is not null && Wo134HostTombsFor(tag).MarkSwept(scls.ToString("D"), sx, sy, sz)) _w134HostDirty = true;
+            }
+            Wo134FlushHost();
         }
     }
 
-    /// <summary>Host: the joiner is in the world (M2: chest ledger replay retired; loose-item tombstones replay here).</summary>
-    private Task Wo134OnJoinerReadyAsync(byte joiner) => Task.CompletedTask;
+    private async Task Wo134PushHostTombstonesToLuaAsync()
+    {
+        List<Wo134Rules.ItemTombstone> items;
+        lock (_w134Gate)
+        {
+            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+            if (tag is null) return;
+            items = Wo134HostTombsFor(tag).Clone().Items;
+        }
+        if (items.Count == 0) return;
+        foreach (var call in Wo134Rules.TombstoneSyncCalls(items))
+            await ExecLuaAsync(call);
+    }
+
+    private void Wo134FlushHost()
+    {
+        lock (_w134Gate)
+        {
+            if (!_w134HostDirty || _w134HostTag is not string tag || _w134HostTombs is not { } l) return;
+            try { _tombStore.SaveCurrent(tag, l); _w134HostDirty = false; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Console.WriteLine($"MP-WO134 tombs: host tombstones not written: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>WO-125's host identify hook: pairs/restores per-world loose-item tombstones alongside each host save.</summary>
+    private void Wo134OnHostWorld(string tag, string md5, bool loaded)
+    {
+        bool pushToLua = false;
+        lock (_w134Gate)
+        {
+            var cur = Wo134HostTombsFor(tag);
+            try
+            {
+                if (!loaded)
+                {
+                    _tombStore.Pair(tag, md5, cur);
+                    _tombStore.SaveCurrent(tag, cur);
+                    _w134HostDirty = false;
+                }
+                else if (_tombStore.Paired(tag, md5) is { } p)
+                {
+                    _w134HostTombs = p;
+                    _tombStore.SaveCurrent(tag, p);
+                    _w134HostDirty = false;
+                    pushToLua = p.Items.Count > 0;
+                }
+                else
+                {
+                    pushToLua = cur.Items.Count > 0;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                Console.WriteLine($"MP-WO134 tombs: host tombstone pairing failed: {ex.Message}");
+            }
+        }
+        if (pushToLua) _ = Wo134PushHostTombstonesToLuaAsync();
+    }
+
+    /// <summary>Host: the joiner is in the world -- replay any unswept loose-item tombstones as LootHostItemGone.</summary>
+    private async Task Wo134OnJoinerReadyAsync(byte joiner)
+    {
+        List<Wo134Rules.ItemTombstone> unswept;
+        lock (_w134Gate)
+        {
+            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+            unswept = tag is null ? [] : Wo134HostTombsFor(tag).Items.Where(t => !t.Swept).Select(t => new Wo134Rules.ItemTombstone
+            {
+                Cls = t.Cls, X = t.X, Y = t.Y, Z = t.Z, By = t.By, Swept = false,
+            }).ToList();
+        }
+        foreach (var t in unswept)
+            await Wo134SendAsync(Protocol.LootHostUp, joiner, Protocol.LootHostItemGone, 0, $"{t.Cls} {Wo134Rules.F3(t.X)} {Wo134Rules.F3(t.Y)} {Wo134Rules.F3(t.Z)}");
+        if (unswept.Count > 0)
+            Console.WriteLine($"MP-WO134 tombs: replayed {unswept.Count} unswept loose-item tombstone(s) to ghost {joiner}");
+    }
 
     /// <summary>WO-125 restore hook (M2: per-player chest ledger sidecar retired).</summary>
     private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = null;

@@ -6124,6 +6124,7 @@ public partial class GameBridge(ClientConfig config)
             case "w134_tres":
             case "w134_ires":
             case "w134_igone":
+            case "w134_itomb":
             case "w134_chest":
             case "w134_applied":
                 Wo134OnEvent(name, arg);
