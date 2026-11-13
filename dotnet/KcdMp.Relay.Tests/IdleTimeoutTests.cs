@@ -34,6 +34,7 @@ public class IdleTimeoutTests
         int httpPort = FreePort();
         await using var app = Program.CreateApp(new[]
         {
+            "--bind", "127.0.0.1",
             "--port", tcpPort.ToString(),
             "--Urls", $"http://127.0.0.1:{httpPort}",
             "--Serilog:WriteTo:1:Name", "Console",

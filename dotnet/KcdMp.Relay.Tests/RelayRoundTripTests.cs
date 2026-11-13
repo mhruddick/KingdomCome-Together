@@ -3,11 +3,14 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using KcdMp.Client;
 using KcdMp.Server;
+using KcdMp.Server.Features.Tcp;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
 namespace KcdMp.Relay.Tests;
@@ -52,6 +55,7 @@ public sealed class RelayFixture : IAsyncLifetime
         int httpPort = FreePort();
         _app = Program.CreateApp(new[]
         {
+            "--bind", "127.0.0.1",
             "--port", TcpPort.ToString(),
             "--Urls", $"http://127.0.0.1:{httpPort}",
             // Keep the relay's rolling file sink out of the test tree.
@@ -1471,5 +1475,25 @@ public class RelayRoundTripTests : IClassFixture<RelayFixture>
             Assert.Equal(a.Id, d[0]);
             Assert.Equal(state, d[1]);
         }
+    }
+
+    [Fact]
+    public async Task Test_relay_binds_loopback_only_while_production_defaults_to_any()
+    {
+        var liveTcp = _relay.Services.GetServices<IHostedService>().OfType<TcpSocketService>().Single();
+        Assert.Equal(IPAddress.Loopback, liveTcp.BindAddress);
+
+        var listeners = IPGlobalProperties.GetIPGlobalProperties()
+            .GetActiveTcpListeners()
+            .Where(ep => ep.Port == _relay.TcpPort)
+            .Select(ep => ep.Address)
+            .ToList();
+        Assert.Contains(IPAddress.Loopback, listeners);
+        Assert.DoesNotContain(IPAddress.Any, listeners);
+
+        // Verify production default without calling StartAsync (never opens a 0.0.0.0 socket in testhost).
+        await using var prod = Program.CreateApp(new[] { "--Serilog:WriteTo:1:Name", "Console" });
+        var prodTcp = prod.Services.GetServices<IHostedService>().OfType<TcpSocketService>().Single();
+        Assert.Equal(IPAddress.Any, prodTcp.BindAddress);
     }
 }

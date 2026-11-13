@@ -286,8 +286,8 @@ function Connect-Peer([string]$name) {
 $serverExe = Join-Path $PSScriptRoot '..\dotnet\KcdMp.Server\bin\Debug\net8.0\KcdMpServer.exe'
 if (-not (Test-Path $serverExe)) { throw "relay not built: $serverExe (run dotnet build first)" }
 Write-Host "starting relay: $serverExe (tcp $TcpPort, http $HttpPort)"
-$env:ASPNETCORE_URLS = "http://localhost:$HttpPort"
-$relay = Start-Process -FilePath $serverExe -ArgumentList "--port", "$TcpPort" -PassThru -WindowStyle Hidden
+$env:ASPNETCORE_URLS = "http://127.0.0.1:$HttpPort"
+$relay = Start-Process -FilePath $serverExe -ArgumentList "--bind", "127.0.0.1", "--port", "$TcpPort", "--Urls", "http://127.0.0.1:$HttpPort" -PassThru -WindowStyle Hidden
 # Wait for the TCP listener rather than sleeping a guessed amount.
 $deadline = (Get-Date).AddSeconds(15)
 $up = $false
