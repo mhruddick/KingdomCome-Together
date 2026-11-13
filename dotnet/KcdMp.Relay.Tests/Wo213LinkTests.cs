@@ -534,6 +534,7 @@ public class Wo213SchedulerTests
         var w = new LinkWriter(new LinkScheduler(new LinkSchedOptions { Unreliable = true }), lane);
         for (int i = 0; i < 5; i++) w.Enqueue(Event(i));
         w.Enqueue(NpcDown(0, "a", 1));
+        await Task.Delay(5);                                  // let token bucket accrue >= 1 state frame on fast CPUs
         await w.PumpOnceAsync(CancellationToken.None);
         Assert.Equal([(Protocol.NpcStateDown, true)], lane.Sent);
         lane.EventPending = 0;                                // the lane drained: the events, in order

@@ -368,6 +368,17 @@ PickableItem.OnUsed(egg, player)
 check("I1 pressing again while asking sends nothing more", #events("w134_item") == 1)
 KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
 check("I2 host ok: picked up here by the game's own pickup", ENTS["egg000352"] == nil and player.inventory:GetCountOfClass(EGG) == 1)
+-- M2 3.4: bow leaning against a tree where async OnUsed fails after network RTT (focus moved slightly)
+local bowW = newItem(COAT, 0.82, 1)
+local bowEnt = mkPickable("bow_tree001", COAT, 1, 0.82, 101.5, 100, 10, bowW)
+bowEnt.item.OnUsed = function() return false end   -- interactor focus lost during RTT: native OnUsed does nothing!
+bowEnt.item.GetId = function() return bowW end
+-- Also test a lingering empty prop even if AddItem didn't clear ENTS (by temporarily shielding ENTS["bow_tree001"] until RemoveEntity)
+LOG = {}; PickableItem.OnUsed(bowEnt, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+check("I2b async weapon pickup fallback: bow transferred directly into player.inventory and world prop cleaned up",
+    ENTS["bow_tree001"] == nil and player.inventory:GetCountOfClass(COAT) == 1 and ITEMS[bowW].health == 0.82)
+player.inventory:DeleteItem(bowW, -1)
 local egg2 = mkPickable("egg000351", EGG, 1, 1, 101, 100.06, 10, newItem(EGG, 1, 1))
 LOG = {}; PickableItem.OnUsed(egg2, player)
 KCD2MP_W134ItemResult(firstTok("w134_item"), "gone")
@@ -523,6 +534,18 @@ KCD2MP.w134LoopRunning = false                                     -- the load k
 KCD2MP.w134.startLoop(); TIMERS = {}
 LOG = {}; loop()
 check("X3 a chest that changed across a load is not recorded as a take or a put", #events("w134_chest") == 0, events("w134_chest")[1])
+
+-- X4: persisted Host tombstones restored after reload via KCD2MP_W134HostTombstones still sweep when Host walks up to the tree
+world(); asHost(0)
+KCD2MP_W134HostTombstones({ { SWORD, 800.0, 800.0, 10.0, "1", false } }, true)
+mkPickable("reloaded_tree_bow", SWORD, 1, 1, 803.2, 800.0, 10.0, newItem(SWORD, 1, 1))
+loop()
+check("X4 restored unswept tombstone leaves far (>120 m) item alone until Host approaches", ENTS["reloaded_tree_bow"] ~= nil)
+player.GetWorldPos = function() return { x = 795, y = 800, z = 10 } end
+LOG = {}; loop()
+check("X4 restored unswept tombstone sweeps the 3.2 m drifted bow once Host walks near and emits w134_itomb swept",
+    ENTS["reloaded_tree_bow"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1)
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

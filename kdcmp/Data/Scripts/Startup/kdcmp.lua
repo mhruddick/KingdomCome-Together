@@ -17667,6 +17667,31 @@ function KCD2MP_W134HostItem(peer, tok, cls, x, y, z, body, amt)
         (amt and hostAmt) and string.format(" amount joiner=%d host=%d%s", amt, hostAmt, amt == hostAmt and "" or " -- DIFFERENT: each machine's own pickup counts") or ""))
 end
 
+function W134.stillInWorld(ent, name)
+    if not ent then return false end
+    local byId, byName = nil, nil
+    if ent.id ~= nil then pcall(function() byId = System.GetEntity(ent.id) end) end
+    if byId ~= nil then return true end
+    local nm = name or W134.name(ent)
+    if nm and nm ~= "" then pcall(function() byName = System.GetEntityByName(nm) end) end
+    return byName == ent
+end
+
+function W134.playerCount(cls)
+    local c = nil
+    pcall(function()
+        if player and player.inventory and type(player.inventory.GetCountOfClass) == "function" then
+            c = player.inventory:GetCountOfClass(cls)
+        end
+    end)
+    if type(c) == "number" then return c end
+    local sum = 0
+    for _, it in ipairs(W134.items(player)) do
+        if it.cls == cls then sum = sum + (it.amt or 1) end
+    end
+    return sum
+end
+
 -- Agent -> joiner: the host's answer. ok = the host's copy is gone, pick mine up;
 -- gone = someone took it first; unknown = the host has no such item (a spawned or
 -- moved one): left per machine, picked up here as before.
@@ -17678,14 +17703,35 @@ function KCD2MP_W134ItemResult(tok, verdict)
     w.itemReq[tok] = nil
     if verdict == "ok" or verdict == "unknown" then
         if verdict == "ok" then w.stats.itemOk = w.stats.itemOk + 1 else w.stats.itemUnmatched = w.stats.itemUnmatched + 1 end
+        local beforeCnt = W134.playerCount(r.cls)
+        local itemWuid = nil
+        pcall(function() itemWuid = r.ent and r.ent.item and r.ent.item:GetId() end)
+        local steal = nil
+        pcall(function() steal = r.ent.__w139steal end)
         W134.bypass = true
         local ok, res = pcall(function() return r.orig(r.ent, player, r.slot) end)
         W134.bypass = false
-        local steal = nil
-        pcall(function() steal = r.ent.__w139steal end)
-        if ok and steal and KCD2MP_W139Stole then pcall(KCD2MP_W139Stole, steal) end   -- WO-139
-        W134.log(string.format("WO134-ITEM %s tok=%s cls=%s -- picked up here ok=%s res=%s%s", verdict == "ok" and "ok" or "unmatched", tok, tostring(r.cls),
-            tostring(ok), tostring(res), verdict == "ok" and " (the host's copy is gone)" or " (the host has no such item: per machine, as before)"))
+        local fallbackUsed = false
+        if W134.stillInWorld(r.ent, r.name) and W134.playerCount(r.cls) <= beforeCnt and (not r.hold or not ok or res == false) then
+            -- M2 3.4: async OnUsed after network RTT often fails on bows/weapons if interactor focus moved slightly; transfer directly!
+            if itemWuid ~= nil then
+                pcall(function() player.inventory:AddItem(itemWuid) end)
+            end
+            if W134.playerCount(r.cls) <= beforeCnt then
+                local hp = 1
+                pcall(function() hp = tonumber(r.ent.Properties and r.ent.Properties.fHealth) or 1 end)
+                pcall(function() player.inventory:CreateItem(r.cls, hp, r.amt or 1) end)
+            end
+            if W134.stillInWorld(r.ent, r.name) and r.ent.id ~= nil then
+                pcall(function() System.RemoveEntity(r.ent.id) end)
+            end
+            fallbackUsed = W134.playerCount(r.cls) > beforeCnt
+            if fallbackUsed then w.stats.itemFallback = (w.stats.itemFallback or 0) + 1 end
+        end
+        if (ok or fallbackUsed) and steal and KCD2MP_W139Stole then pcall(KCD2MP_W139Stole, steal) end   -- WO-139
+        W134.log(string.format("WO134-ITEM %s tok=%s cls=%s -- picked up here ok=%s res=%s%s%s", verdict == "ok" and "ok" or "unmatched", tok, tostring(r.cls),
+            tostring(ok), tostring(res), fallbackUsed and " fallback=direct-add" or "",
+            verdict == "ok" and " (the host's copy is gone)" or " (the host has no such item: per machine, as before)"))
     elseif verdict == "mine" then
         -- WO-136 Phase 7: my own earlier take of it (a retry): removed here, no notice.
         w.stats.itemDup = (w.stats.itemDup or 0) + 1
