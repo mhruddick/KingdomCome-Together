@@ -17775,6 +17775,8 @@ function KCD2MP_W134Tick(joiner, host, shared, peers)
     w.peers = tonumber(peers) or 0
     w.aliveAt = os.clock()
     pcall(W134.installPickup)
+    if KCD2MP_W139Install then pcall(KCD2MP_W139Install) end
+    if KCD2MP_W217ChestInstall then pcall(KCD2MP_W217ChestInstall) end
     if w.shared and (w.joiner or w.host) then W134.startLoop() end
 end
 
@@ -19446,6 +19448,11 @@ function KCD2MP_W139Install()
         w.stashWrap = function(self, user, slot)
             local opening = false
             pcall(function() opening = self.bOpened ~= 1 and self.bLocked ~= true end)
+            if opening and (user == player or (user and player and user.id ~= nil and user.id == player.id))
+                    and type(self.Open) ~= "function" and KCD2MP_W217ChestOpenRequest
+                    and KCD2MP_W217ChestOpenRequest(self, orig, user, slot, true) then
+                return true
+            end
             -- WO-195B 2a: a key's unlock inside this use is the joiner's claim on the host's chest; the host's Henry at it is read too
             if KCD2MP_W195BStashUseBegin then pcall(KCD2MP_W195BStashUseBegin, self, user) end
             local r = orig(self, user, slot)
@@ -19456,6 +19463,7 @@ function KCD2MP_W139Install()
         Stash.OnUsed = w.stashWrap
         mp_log("WO139-CRIME wrapped Stash.OnUsed")
     end
+    if KCD2MP_W217ChestInstall then pcall(KCD2MP_W217ChestInstall) end
     if type(Minigame) == "table" and type(Minigame.StartLockPicking) == "function" and Minigame.StartLockPicking ~= w.lpWrap then
         local orig = Minigame.StartLockPicking
         w.lpOrig = orig
@@ -21995,7 +22003,8 @@ function KCD2MP_W166LootOpenOn(name)
     if name ~= nil and L.openOn ~= name then return false end
     local e = nil
     pcall(function() e = System.GetEntityByName(L.openOn) end)
-    if not e or (os.clock() - (L.openAt or 0)) > 600 or (W134 and W134.near and not W134.near(e, 5.0)) then
+    local reach = (KCD2MP_W217IsChestKey and KCD2MP_W217IsChestKey(L.openOn)) and 7.0 or 5.0
+    if not e or (os.clock() - (L.openAt or 0)) > 600 or (W134 and W134.near and not W134.near(e, reach)) then
         KCD2MP_W166LootClosed(not e and "body-gone" or "player-away")
         return false
     end
@@ -35211,7 +35220,8 @@ do
     L.SESSION_S = 600.0    -- a live session is over after 10 minutes, or when the player is 6 m from the body with no screen open
     L.ESCROW = "kcd2mp_w217_escrow"
 
-    function KCD2MP_W217LootLive() return KCD2MP_W217On("loot_live") and KCD2MP.w134 ~= nil and KCD2MP.w134.bodies end
+    function KCD2MP_W217LootLive() return KCD2MP_W217On("loot_live") and KCD2MP.w134 ~= nil and (KCD2MP.w134.bodies or KCD2MP.w134.chests) end
+    function KCD2MP_W217ChestLive() return KCD2MP_W217On("loot_live") and KCD2MP.w134 ~= nil and KCD2MP.w134.chests ~= false end
 
     local function lg(fmt, ...) mp_log(string.format(fmt, ...)) end
     local function ledger(side, ev, body, item, cls, amt, tok, extra)
@@ -35230,9 +35240,56 @@ do
         return e
     end
 
-    -- ---- M2: coordinate + class + name-hash addressing for shared world containers (wc_<clsTag>_<xCm>_<yCm>_<zCm>_<hash8>_<stem>)
+    -- ---- M2: coordinate + class + name-hash addressing & personal-stash exclusion for shared world containers
     local CHEST_TAG = { Stash = "S", CartStash = "C", Nest = "N", DestroStash = "D" }
     local TAG_CHEST = { S = "Stash", C = "CartStash", N = "Nest", D = "DestroStash" }
+
+    local function isValidWuid(w)
+        if w == nil or w == false or w == 0 or w == "" then return false end
+        local nullVal = rawget(_G, "__null")
+        if nullVal ~= nil and w == nullVal then return false end
+        if type(Framework) == "table" and type(Framework.IsValidWUID) == "function" then
+            local ok, res = pcall(Framework.IsValidWUID, w)
+            if ok and type(res) == "boolean" then return res end
+        end
+        local s = tostring(w)
+        local hex = string.match(s, "^userdata:%s*(%x+)%s*$") or string.match(s, "^0x(%x+)$") or (string.match(s, "^%x+$") and s or nil)
+        if hex and not string.find(hex, "[1-9a-fA-F]") then return false end
+        return true
+    end
+
+    function KCD2MP_W217IsPersonalStash(e)
+        if not e or not CHEST_TAG[e.class] then return false end
+        local n = nil
+        pcall(function() n = e:GetName() end)
+        if n and string.find(string.lower(n), "playermasterchest", 1, true) ~= nil then return true end
+        local masterInv = nil
+        pcall(function()
+            if e.stash and type(e.stash.GetMasterInventory) == "function" then masterInv = e.stash:GetMasterInventory() end
+        end)
+        if isValidWuid(masterInv) then return true end
+        if type(e.GetInventoryToOpen) == "function" and e.inventory and type(e.inventory.GetId) == "function" then
+            local okO, openId = pcall(function() return e:GetInventoryToOpen() end)
+            local okI, invId = pcall(function() return e.inventory:GetId() end)
+            if okO and okI and openId ~= nil and invId ~= nil and openId ~= invId and tostring(openId) ~= tostring(invId) then
+                return true
+            end
+        end
+        return false
+    end
+    L.isPersonalStash = KCD2MP_W217IsPersonalStash
+
+    function KCD2MP_W217IsSharedChest(e)
+        if not e or not CHEST_TAG[e.class] or not e.inventory then return false end
+        local n = nil
+        pcall(function() n = e:GetName() end)
+        if not n or n == "" or n == L.ESCROW then return false end
+        if W134 and W134.isDrop and W134.isDrop(n) then return false end
+        if mp_is_mod_entity and mp_is_mod_entity(e) then return false end
+        if KCD2MP_W217IsPersonalStash(e) then return false end
+        return true, n
+    end
+    L.isSharedChest = KCD2MP_W217IsSharedChest
 
     function KCD2MP_W217ChestHash(n)
         n = tostring(n or "")
@@ -35289,7 +35346,7 @@ do
     L.isChestKey = KCD2MP_W217IsChestKey
 
     function KCD2MP_W217ChestKey(e)
-        if not (e and CHEST_TAG[e.class]) then return nil end
+        if not KCD2MP_W217IsSharedChest(e) then return nil end
         local n, p = nil, nil
         pcall(function() n = e:GetName() end)
         pcall(function() p = e:GetWorldPos() end)
@@ -35307,11 +35364,11 @@ do
             local ents = {}
             pcall(function() ents = System.GetEntitiesInSphere({ x = x, y = y, z = z }, r + 0.05) or {} end)
             for _, e in ipairs(ents) do
-                if e and e.class == wantCls and e.inventory then
+                if e and e.class == wantCls and KCD2MP_W217IsSharedChest(e) then
                     local nm, p = nil, nil
                     pcall(function() nm = e:GetName() end)
                     pcall(function() p = e:GetWorldPos() end)
-                    if nm and nm ~= L.ESCROW and p and KCD2MP_W217ChestHash(nm) == hash8 then
+                    if nm and p and KCD2MP_W217ChestHash(nm) == hash8 then
                         local d2 = (p.x - x) ^ 2 + (p.y - y) ^ 2 + (p.z - z) ^ 2
                         if d2 <= bd2 then best, bd2 = e, d2 end
                     end
@@ -35328,6 +35385,121 @@ do
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
         return e
+    end
+
+    function L.markChestTouched(e)
+        if not (e and KCD2MP_W217IsSharedChest(e)) then return end
+        pcall(function()
+            if e.stash and type(e.stash.ReportOpened) == "function" then e.stash:ReportOpened() end
+        end)
+    end
+
+    function L.ensureHostChestInit(e)
+        if not (e and KCD2MP_W217IsSharedChest(e)) then return false end
+        if not e.__w217ChestInit then
+            e.__w217ChestInit = true
+            local opened = false
+            pcall(function()
+                if e.bOpened == 1 or e.bWasOpened == true or e.bInventoryAssigned == true or e.inventoryAssigned == true then opened = true end
+                if e.stash and type(e.stash.IsOpened) == "function" and e.stash:IsOpened() == true then opened = true end
+            end)
+            local count = 0
+            pcall(function() count = #(e.inventory:GetInventoryTable() or {}) end)
+            if not opened and count == 0 then
+                pcall(function()
+                    if type(StashInventoryCollector) == "table" then
+                        if type(StashInventoryCollector.AssignInventory) == "function" then StashInventoryCollector:AssignInventory(e)
+                        elseif type(StashInventoryCollector.EnsureInventory) == "function" then StashInventoryCollector:EnsureInventory(e) end
+                    end
+                end)
+                pcall(function() count = #(e.inventory:GetInventoryTable() or {}) end)
+                if count == 0 and type(e.AssignInventory) == "function" then
+                    pcall(function() e:AssignInventory() end)
+                end
+                pcall(function() count = #(e.inventory:GetInventoryTable() or {}) end)
+                if count == 0 and e.stash and type(e.stash.GenerateInventory) == "function" then
+                    pcall(function() e.stash:GenerateInventory() end)
+                end
+                local after = 0
+                pcall(function() after = #(e.inventory:GetInventoryTable() or {}) end)
+                if after > 0 then
+                    L.stats.chestInits = (L.stats.chestInits or 0) + 1
+                    lg("WO217-CHEST host-init chest=%s generated=%d -- initialized untouched chest inventory before live sync", tostring(W134 and W134.name(e) or "?"), after)
+                end
+            end
+        end
+        L.markChestTouched(e)
+        return true
+    end
+
+    function KCD2MP_W217ChestOpenRequest(ent, origFn, user, slot, runCrimeHook)
+        if L.bypassChestOpen or not KCD2MP_W217ChestLive() or not (KCD2MP_W134JoinerActive and KCD2MP_W134JoinerActive()) then return false end
+        local okChest, rawName = KCD2MP_W217IsSharedChest(ent)
+        if not okChest then return false end
+        local locked = false
+        pcall(function() locked = ent.bLocked == true end)
+        if locked then return false end
+        local key = KCD2MP_W217ChestKey(ent)
+        if not key then return false end
+        if L.sess[key] and KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(key) then return false end
+        local w = KCD2MP.w134
+        w.pendingOpen[key] = {
+            at = os.clock(),
+            ent = ent,
+            user = user or player,
+            slot = slot,
+            orig = function(e2, u2, sl2)
+                L.bypassChestOpen = true
+                local ok, err = pcall(origFn, e2, u2, sl2)
+                L.bypassChestOpen = false
+                if not ok then error(err, 0) end
+                if runCrimeHook and KCD2MP_W139StashOpened then pcall(KCD2MP_W139StashOpened, e2) end
+            end,
+        }
+        w.stats.opens = w.stats.opens + 1
+        L.stats.chestOpens = (L.stats.chestOpens or 0) + 1
+        KCD2MP_EmitEvent("w134_open", key)
+        lg("WO217-CHEST open key=%s name=%s -- asked the host for this shared chest's items", key, tostring(rawName))
+        if W134 and W134.startLoop then W134.startLoop() end
+        return true
+    end
+
+    L.wrappedOpenFns = L.wrappedOpenFns or {}
+    L.wrappedUsedFns = L.wrappedUsedFns or {}
+    function KCD2MP_W217ChestInstall()
+        for _, clsName in ipairs({ "Stash", "CartStash", "Nest", "DestroStash" }) do
+            local tbl = rawget(_G, clsName)
+            if type(tbl) == "table" then
+                if type(tbl.Open) == "function" and not L.wrappedOpenFns[tbl.Open] then
+                    local origOpen = tbl.Open
+                    local wrapOpen = function(self, user, ...)
+                        local u = user or player
+                        if (u == player or (u and player and u.id ~= nil and u.id == player.id))
+                                and KCD2MP_W217ChestOpenRequest(self, origOpen, u, ...) then
+                            return true
+                        end
+                        return origOpen(self, user, ...)
+                    end
+                    L.wrappedOpenFns[wrapOpen] = true
+                    tbl.Open = wrapOpen
+                end
+                if clsName ~= "Stash" and type(tbl.OnUsed) == "function" and not L.wrappedUsedFns[tbl.OnUsed] then
+                    local origUsed = tbl.OnUsed
+                    local wrapUsed = function(self, user, slot, ...)
+                        local opening = false
+                        pcall(function() opening = self.bOpened ~= 1 and self.bLocked ~= true end)
+                        if opening and type(self.Open) ~= "function"
+                                and (user == player or (user and player and user.id ~= nil and user.id == player.id))
+                                and KCD2MP_W217ChestOpenRequest(self, origUsed, user, slot) then
+                            return true
+                        end
+                        return origUsed(self, user, slot, ...)
+                    end
+                    L.wrappedUsedFns[wrapUsed] = true
+                    tbl.OnUsed = wrapUsed
+                end
+            end
+        end
     end
 
     -- an item id's text on the wire: letters, digits and _ only (the game's own text of the id, its other characters as _)
@@ -35425,10 +35597,16 @@ do
         L.stats.lists = L.stats.lists + 1
         h.ids = L.ids(e or {})
     end
-    -- a joiner opened this body (WO-134's open, answered by the live list too) / closed it
+    -- a joiner opened this body or shared world chest (WO-134's open, answered by the live list) / closed it
     function KCD2MP_W217HostOpen(peer, name)
-        if not KCD2MP_W217LootLive() then return false end
         name = tostring(name)
+        if KCD2MP_W217IsChestKey(name) then
+            if not KCD2MP_W217ChestLive() then return false end
+            local ce = L.resolve(name)
+            if ce then L.ensureHostChestInit(ce) end
+        elseif not (KCD2MP_W217On("loot_live") and KCD2MP.w134 ~= nil and KCD2MP.w134.bodies) then
+            return false
+        end
         local h = L.hostLive[name] or { peers = {}, rev = 0, sig = nil, ids = {} }
         L.hostLive[name] = h
         h.peers[tostring(peer)] = os.clock()
@@ -35465,6 +35643,7 @@ do
             KCD2MP_EmitEvent("w217_tres", string.format("%s %s refuse %s %s busy 0", peer, tok, name, hostId))
             return false
         end
+        L.markChestTouched(e)
         L.hostEsc[peer .. ":" .. tok] = { w = have.w, body = name, hostId = hostId, cls = have.cls, amt = have.amt, peer = peer, at = os.clock() }
         L.stats.grants = L.stats.grants + 1
         ledger("host", "grant", name, hostId, have.cls, have.amt, tok, string.format("stolen=%d owner=%s", stolen, owner))
@@ -35489,6 +35668,7 @@ do
         else
             local e = L.resolve(t.body)
             local back = e and L.move(esc, t.w, e)
+            if back and e then L.markChestTouched(e) end
             L.stats.backToBody = L.stats.backToBody + 1
             ledger("host", "cancelled", t.body, t.hostId, t.cls, t.amt, tok, back and "back=body" or "back=FAILED")
             L.hostSend(t.body, false)
@@ -35582,7 +35762,9 @@ do
             w.pendingOpen[name] = nil
             s.opened = true
             s.at = os.clock()
-            if W134.near(e, 5.0) then
+            s.pinv = L.ids(player)
+            local openReach = KCD2MP_W217IsChestKey(name) and 7.0 or 5.0
+            if W134.near(e, openReach) then
                 if KCD2MP_W201InvIntent then pcall(KCD2MP_W201InvIntent, name, "ours") end
                 local ok, err = pcall(function() po.orig(po.ent, po.user or player, po.slot) end)
                 if ok and KCD2MP_W166LootOpened then KCD2MP_W166LootOpened(name, "ours") end
@@ -35675,8 +35857,9 @@ do
                         KCD2MP_EmitEvent("w217_tack", string.format("%s %s cancel", tok, name))
                     end
                 end
-                -- the session's end: 10 minutes, or the player away from the body with no screen open on it
-                local away = not W134.near(e, 6.0) and not (KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(name))
+                -- the session's end: 10 minutes, or the player away from the body/chest with no screen open on it
+                local awayReach = KCD2MP_W217IsChestKey(name) and 8.0 or 6.0
+                local away = not W134.near(e, awayReach) and not (KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(name))
                 if now - s.at > L.SESSION_S or (away and next(s.pend) == nil) then
                     L.sess[name] = nil
                     KCD2MP_EmitEvent("w217_lootend", name)
