@@ -16,12 +16,15 @@ namespace KcdMp.Server.Features.Tcp;
 public class TcpSocketService : BackgroundService
 {
 	private readonly ILogger _logger;
+	private readonly IPAddress _bindAddress;
 	private readonly int _port;
 	private readonly TimeSpan _idleTimeout;
 	private readonly ClientHandler _clientHandler;
 	private readonly TcpBroadcastService _broadcastService;
 	private readonly SessionManager _sessions;
 	private readonly ClientSessionRunner _runner;
+
+	public IPAddress BindAddress => _bindAddress;
 
 	public TcpSocketService(ILogger logger, IConfiguration configuration,
 		ClientHandler clientHandler, TcpBroadcastService broadcastService,
@@ -31,6 +34,8 @@ public class TcpSocketService : BackgroundService
 		_logger = logger;
 
 		var configSection = configuration.GetSection("Tcp");
+		var rawBind = configSection["BindAddress"];
+		_bindAddress = string.IsNullOrWhiteSpace(rawBind) ? IPAddress.Any : IPAddress.Parse(rawBind);
 		_port = int.Parse(configSection["Port"] ?? "7778");
 		// WO-102.5 Phase 4: configurable so the relay round-trip tests can use
 		// a short timeout instead of ClientSession's 30 s field default.
@@ -49,7 +54,7 @@ public class TcpSocketService : BackgroundService
 	/// <param name="cancellationToken"></param>
 	protected override async Task ExecuteAsync(CancellationToken cancellationToken)
 	{
-		var listener = new TcpListener(IPAddress.Any, _port);
+		var listener = new TcpListener(_bindAddress, _port);
 		listener.Start();
 		_logger.Information("Listening on port {Port}...", _port);
 		_logger.Information("Waiting for clients to connect.");

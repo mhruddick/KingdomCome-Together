@@ -22,6 +22,7 @@ public class Program
 	{
 		["--port"] = "Tcp:Port",
 		["-p"]     = "Tcp:Port",
+		["--bind"] = "Tcp:BindAddress",
 		["--echo"] = "Echo",
 		// WO-127: the launcher's "Also allow Steam" (Host window).
 		["--steam"]      = "Steam:Enabled",

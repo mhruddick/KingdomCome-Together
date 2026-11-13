@@ -139,7 +139,7 @@ try {
     $relayOut = Join-Path $work 'relay-stdout.txt'
     $relayErr = Join-Path $work 'relay-stderr.txt'
     $relay = Start-Process -FilePath (Join-Path $work 'KcdMpServer.exe') `
-        -ArgumentList @('--port', "$port", '--Urls', 'http://127.0.0.1:0') `
+        -ArgumentList @('--bind', '127.0.0.1', '--port', "$port", '--Urls', 'http://127.0.0.1:0') `
         -WorkingDirectory $work -PassThru -NoNewWindow `
         -RedirectStandardOutput $relayOut -RedirectStandardError $relayErr
     $null = $relay.Handle   # cache the handle so ExitCode is readable later (PS 5.1 quirk)

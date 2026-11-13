@@ -35,7 +35,7 @@ def listening(port):
 
 if not listening(7778):
     if not relay: sys.exit('nothing listens on 7778: pass KcdMpServer.dll as the second argument')
-    subprocess.Popen(launch(relay) + ['--port', '7778'], cwd=os.path.dirname(relay),
+    subprocess.Popen(launch(relay) + ['--bind', '127.0.0.1', '--port', '7778', '--urls', 'http://127.0.0.1:5273'], cwd=os.path.dirname(relay),
                      stdout=open(os.path.join(live.LOGS, 'relay.log'), 'w'), stderr=subprocess.STDOUT, creationflags=DETACHED)
     for _ in range(40):
         if listening(7778): break

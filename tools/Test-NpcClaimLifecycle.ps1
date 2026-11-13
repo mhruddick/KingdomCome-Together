@@ -159,7 +159,7 @@ function Connect-Peer([string]$name, [int]$port) {
 }
 
 function Start-TestRelay([string]$exe, [string]$workDir, [int]$tcpPort, [int]$httpPort, [string[]]$extraArgs = @()) {
-    $args = @("--port", "$tcpPort", "--Urls", "http://localhost:$httpPort") + $extraArgs
+    $args = @("--bind", "127.0.0.1", "--port", "$tcpPort", "--Urls", "http://127.0.0.1:$httpPort") + $extraArgs
     $proc = Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $workDir -PassThru -WindowStyle Hidden
     $deadline = (Get-Date).AddSeconds(15)
     $up = $false
