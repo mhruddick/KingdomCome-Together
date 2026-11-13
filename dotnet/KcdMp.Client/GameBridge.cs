@@ -5567,8 +5567,10 @@ public partial class GameBridge(ClientConfig config)
                         // drop from our own heartbeat set, whoever won it.
                         byte icClaimer = payload[0];
                         uint icDropId  = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(1));
-                        _myOpenDrops.TryRemove(icDropId, out _);
+                        bool wasMyDrop = _myOpenDrops.TryRemove(icDropId, out var myDropPayload);
                         bool claimIsMine = icClaimer == _myGhostId;
+                        if (wasMyDrop && !claimIsMine && myDropPayload is not null)
+                            Wo125OnJoinerDropClaimedByPeer(icDropId, icClaimer, myDropPayload);
                         Console.WriteLine($"[itemsync] drop {icDropId} claimed by {(claimIsMine ? "us" : $"ghost {icClaimer}")}");
                         await ExecLuaAsync($"if KCD2MP_ItemDropClaimed then KCD2MP_ItemDropClaimed(\"{icDropId}\",\"{icClaimer}\",{(claimIsMine ? "true" : "false")}) end");
                     }

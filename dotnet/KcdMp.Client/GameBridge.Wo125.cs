@@ -759,6 +759,30 @@ public partial class GameBridge
         }
     }
 
+    /// <summary>
+    /// A peer claimed an item this joiner dropped while in the host's shared world:
+    /// persist it to HenryStore immediately (zero engine hitch) so an unpaired disconnect/crash
+    /// before the next host save never restores the transferred item from an older snapshot.
+    /// </summary>
+    private void Wo125OnJoinerDropClaimedByPeer(uint dropId, byte claimerGhostId, byte[] dropPayload)
+    {
+        if (!_joinedWorld || _joinedTag is not string tag || _resetTag == tag) return;
+        if (dropPayload.Length < Protocol.ItemDropUpPayloadLen) return;
+        var itemClass = new Guid(dropPayload.AsSpan(4, Protocol.ItemClassLen));
+        ushort amount = BinaryPrimitives.ReadUInt16LittleEndian(dropPayload.AsSpan(20, 2));
+        float health = BinaryPrimitives.ReadSingleLittleEndian(dropPayload.AsSpan(22, 4));
+        if (amount == 0) return;
+        try
+        {
+            _henry.RecordTransferOut(tag, dropId, itemClass.ToString("D"), amount, health);
+            Console.WriteLine($"MP-HENRY joiner: drop {dropId} ({itemClass} x{amount}) claimed by ghost {claimerGhostId} -- recorded in world {tag} transfer ledger");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            Console.WriteLine($"MP-HENRY joiner: drop {dropId} transfer ledger write failed: {ex.Message}");
+        }
+    }
+
     // ---------------------------------------------------------------- joiner: snapshots paired with host saves
 
     private int _snapBusy;

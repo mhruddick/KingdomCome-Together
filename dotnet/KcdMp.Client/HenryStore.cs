@@ -50,7 +50,12 @@ public sealed class HenryStore
     /// <summary>A world not joined for this many days is deleted at agent start (logged). The maintainer may change it.</summary>
     public const int StaleDays = 90;
 
+    /// <summary>Maximum peer-claimed outgoing drop records retained per world for fallback snapshot deduplication.</summary>
+    public const int MaxTransfersPerWorld = 512;
+
     public const string SourceBring = "bring", SourceFresh = "fresh", SourceSnapshot = "snapshot", SourceJoin = "join", SourceRestore = "restore";
+
+    public sealed record TransferOutEntry(uint DropId, string Class, int Amount, float Health, DateTime ClaimedUtc, long Seq);
 
     private readonly Func<DateTime> _now;
     private readonly Action<string> _log;
@@ -142,6 +147,8 @@ public sealed class HenryStore
     /// WO-125 Phase 5: the snapshot paired with the newest save of the host's
     /// current branch that has one (<paramref name="branchNewestFirst"/>: md5s),
     /// else the newest snapshot of the world. A broken snapshot is skipped.
+    /// Any peer-claimed drops recorded after the chosen snapshot was taken are
+    /// deducted automatically so an unpaired disconnect never duplicates items.
     /// </summary>
     public Pick? PickFor(string tag, IReadOnlyList<string> branchNewestFirst)
     {
@@ -150,12 +157,85 @@ public sealed class HenryStore
         foreach (var md5 in branchNewestFirst)
         {
             foreach (var s in all.Where(x => x.Md5 == md5))
-                if (Load(s) is { } p) return new Pick(s, p, pos == 0 ? "paired with the host's newest save" : $"paired with the host's branch save #{pos} (newest = 0)");
+                if (Load(s) is { } p) return ApplyPendingTransfers(tag, s, p, pos == 0 ? "paired with the host's newest save" : $"paired with the host's branch save #{pos} (newest = 0)");
             pos++;
         }
         foreach (var s in all)
-            if (Load(s) is { } p) return new Pick(s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
+            if (Load(s) is { } p) return ApplyPendingTransfers(tag, s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
         return null;
+    }
+
+    private string TransfersPath(string tag) => Path.Combine(WorldDir(tag), "transfers.json");
+
+    /// <summary>Peer-claimed outgoing drops recorded for world <paramref name="tag"/>, oldest first.</summary>
+    public List<TransferOutEntry> TransfersOut(string tag)
+    {
+        CheckTag(tag);
+        lock (_gate)
+        {
+            var p = TransfersPath(tag);
+            try
+            {
+                if (!File.Exists(p)) return [];
+                var raw = JsonSerializer.Deserialize<List<TransferOutEntry>>(File.ReadAllText(p));
+                return raw?.Where(e => e.DropId != 0 && e.Amount > 0 && Guid.TryParse(e.Class, out _)).ToList() ?? [];
+            }
+            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+            {
+                _log($"MP-HENRY world {tag}: transfers.json unreadable ({ex.Message}) -- ignored");
+                return [];
+            }
+        }
+    }
+
+    /// <summary>Record an outgoing item drop claimed by a peer in world <paramref name="tag"/> (atomic .part + rename, zero game hitch).</summary>
+    public TransferOutEntry? RecordTransferOut(string tag, uint dropId, string itemClass, int amount, float health)
+    {
+        CheckTag(tag);
+        if (dropId == 0 || amount <= 0 || !Guid.TryParse(itemClass, out var clsGuid)) return null;
+        lock (_gate)
+        {
+            Directory.CreateDirectory(WorldDir(tag));
+            var claimedUtc = _now();
+            if (Snapshots(tag).FirstOrDefault()?.TakenUtc is DateTime newestSnapUtc && claimedUtc <= newestSnapUtc)
+                claimedUtc = newestSnapUtc.AddTicks(1);
+            long seq = 0;
+            UpdateWorld(tag, w => seq = ++w.NextSeq);
+            var entry = new TransferOutEntry(dropId, clsGuid.ToString("D"), amount, health, claimedUtc, seq);
+            var list = TransfersOut(tag);
+            list.Add(entry);
+            if (list.Count > MaxTransfersPerWorld)
+                list = list.OrderByDescending(x => x.Seq).ThenByDescending(x => x.ClaimedUtc).Take(MaxTransfersPerWorld)
+                           .OrderBy(x => x.Seq).ThenBy(x => x.ClaimedUtc).ToList();
+            var p = TransfersPath(tag);
+            File.WriteAllText(p + ".part", JsonSerializer.Serialize(list));
+            File.Move(p + ".part", p, overwrite: true);
+            _log($"MP-HENRY world {tag}: recorded peer-claimed drop {dropId} ({entry.Class[..8]} x{amount}, seq={seq})");
+            return entry;
+        }
+    }
+
+    private Pick ApplyPendingTransfers(string tag, Snapshot s, WhsSave.HenryParts p, string how)
+    {
+        var transfers = TransfersOut(tag);
+        if (transfers.Count == 0) return new Pick(s, p, how);
+        long? snapSeq = null;
+        lock (_gate)
+        {
+            if (ReadWorld(tag).SnapshotSeq.TryGetValue(s.File, out long sq)) snapSeq = sq;
+        }
+        var applicable = transfers
+            .Where(t => snapSeq is long sq && t.Seq > 0 ? t.Seq > sq : t.ClaimedUtc > s.TakenUtc)
+            .Select(t => (t.Class, t.Amount))
+            .ToList();
+        if (applicable.Count == 0) return new Pick(s, p, how);
+        int deducted = WhsSave.ApplyTransferredOut(p, applicable);
+        if (deducted > 0)
+        {
+            _log($"MP-HENRY world {tag}: applied {applicable.Count} peer-claimed transfer(s) (-{deducted} item(s)) onto snapshot {s.Short}");
+            how += $" (-{deducted} transferred-out item(s))";
+        }
+        return new Pick(s, p, how);
     }
 
     // ------------------------------------------------------------------ write
@@ -201,6 +281,7 @@ public sealed class HenryStore
             {
                 w.FirstSource ??= source;
                 w.Pairs[name] = detail;
+                w.SnapshotSeq[name] = ++w.NextSeq;
             });
             _log($"MP-HENRY world {tag}: stored {source} snapshot {snap.Short} ({data.Length} B, read back: hash + parse ok){(detail != "" ? " -- " + detail : "")}");
             Prune(tag);
@@ -254,7 +335,11 @@ public sealed class HenryStore
             else { kept[s.Md5] = n + 1; continue; }
             TryDelete(Path.Combine(WorldDir(tag), s.File));
             TryDelete(ChestLedgerPath(s));
-            UpdateWorld(tag, w => w.Pairs.Remove(s.File));
+            UpdateWorld(tag, w =>
+            {
+                w.Pairs.Remove(s.File);
+                w.SnapshotSeq.Remove(s.File);
+            });
             _log($"MP-HENRY world {tag}: pruned snapshot {s.Short} ({why})");
         }
     }
@@ -348,6 +433,8 @@ public sealed class HenryStore
         public DateTime LastJoinedUtc { get; set; }
         public string? FirstSource { get; set; }
         public Dictionary<string, string> Pairs { get; set; } = new(StringComparer.Ordinal);
+        public long NextSeq { get; set; }
+        public Dictionary<string, long> SnapshotSeq { get; set; } = new(StringComparer.Ordinal);
         /// <summary>WO-157: the host whose world this is (null before WO-157).</summary>
         public uint? HostKey { get; set; }
         /// <summary>WO-157: the plain seed tag of a host-qualified folder.</summary>
