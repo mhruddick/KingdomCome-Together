@@ -19,14 +19,15 @@ public static partial class Protocol
     //   ask (joiner -> host)  6 TakeReq "<body> <item> <cls> <amt>"   7 TakeAck "<body> <applied|cancel>"   8 LiveEnd "<body>"
     //   host (host -> joiner) 8 BodyList "<body> <rev> <part> <nparts> <items|->"  items = item:cls:amt:hp:worn:stolen:owner,...
     //                         9 TakeVerdict "<grant|refuse> <body> <item> <owner|-|gone|busy> <stolen>"
-    public const byte LootAskTakeReq = 6, LootAskTakeAck = 7, LootAskLiveEnd = 8;
+    public const byte LootAskTakeReq = 6, LootAskTakeAck = 7, LootAskLiveEnd = 8, LootAskNestShot = 9;
     public const byte LootHostBodyList = 8, LootHostTakeVerdict = 9;
     //                         10 Corpses "<name:x:y:z:yaw,...|->"   E.1: the dead bodies near the players (the host's census; latest wins)
     public const byte LootHostCorpses = 10;
     //                         12 Carts "<host_ms> <name|x|y|z|ax|ay|az|riders;...|->"   F: the host's carts near the players (latest wins)
     public const byte LootHostCarts = 12;
     //                         11 Prop "<name|class|arch|model|x|y|z|ax|ay|az>"   13 PropGone "<name>"   E.2: what an encounter adds
-    public const byte LootHostProp = 11, LootHostPropGone = 13;
+    //                         14 Nest "<wc_key> <x> <y> <z> <ax> <ay> <az> <settled:0|1>"   shootable Nest / DestroStash knockdown + resting pose
+    public const byte LootHostProp = 11, LootHostPropGone = 13, LootHostNest = 14;
 }
 
 /// <summary>
