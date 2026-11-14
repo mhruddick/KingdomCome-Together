@@ -4986,6 +4986,7 @@ public partial class GameBridge(ClientConfig config)
                         Wo144OnPeerDisconnected(ghostId);   // WO-144: out of every partner loop at once
                         Wo148OnPeerGone(ghostId);           // WO-148: its avatar sets down what it carried
                         Wo154ForgetPeer(ghostId);           // WO-154 2: a rejoin starts from up
+                        M3OnPeerDisconnected(ghostId);      // M3: release any parked peer horse / temp tack / proxy on the host
                         _w206.ForgetPeer(ghostId); _w206.ForgetJoiner(ghostId);   // WO-206 E: its acknowledged epoch and the host's view of it go
                         _peerLastSeenUtc.TryRemove(ghostId, out _);
                         _peerCutscene.TryRemove(ghostId, out _);   // WO-98 Phase 5
@@ -5446,8 +5447,8 @@ public partial class GameBridge(ClientConfig config)
                         if (payloadLen == 2 + hiNameLen)
                         {
                             string horseName = hiNameLen == 0 ? "" : Encoding.UTF8.GetString(payload, 2, hiNameLen);
-                            if (hiNameLen == 0 || NpcNamePattern.IsMatch(horseName))
-                                await ExecLuaAsync($"if KCD2MP_SetGhostHorse then KCD2MP_SetGhostHorse(\"{hiSource}\",\"{horseName}\") end");
+                            if (hiNameLen == 0 || NpcNamePattern.IsMatch(horseName) || M3HorseRules.IsHorseEntityName(horseName))
+                                await ExecLuaAsync($"if KCD2MP_SetGhostHorse then KCD2MP_SetGhostHorse(\"{hiSource}\",\"{EscapeLua(horseName)}\") end");
                         }
                     }
                     else if (type == Protocol.WeatherDown
@@ -6097,7 +6098,11 @@ public partial class GameBridge(ClientConfig config)
                 _ = Wo151OnDoorLocalAsync(arg);
                 return;
             case "w151_emote":       // WO-151 3.5: this player whistled
+                M3OnLocalEmote(arg);
                 _ = Wo151OnEmoteLocalAsync(arg);
+                return;
+            case "m3_peerhorse_ctx": // M3: host sets/clears crime_ignoredHorseTheft_Horse on a partner's owned world horse
+                M3OnPeerHorseContextEvent(arg);
                 return;
             case "w148_carry":       // WO-148: this player picked something up / set it down
                 _ = Wo148OnLocalAsync(arg);
@@ -6543,7 +6548,7 @@ public partial class GameBridge(ClientConfig config)
                 // authored entity name and crosses the same trust boundary.
                 string horseName = arg.Trim();
                 if (horseName == "-") horseName = "";
-                if (horseName.Length > 0 && (!NpcNamePattern.IsMatch(horseName) || horseName.Length > Protocol.MaxHorseNameLen))
+                if (horseName.Length > 0 && ((!NpcNamePattern.IsMatch(horseName) && !M3HorseRules.IsHorseEntityName(horseName)) || horseName.Length > Protocol.MaxHorseNameLen))
                 {
                     Console.WriteLine($"[horse] rejected mount name '{arg}' (not an authored entity name)");
                     break;
@@ -7210,7 +7215,7 @@ public partial class GameBridge(ClientConfig config)
             }
             case "npc_native":
             {
-                if (p.Length < 2 || !NpcNamePattern.IsMatch(p[0]) || p[0].Length > NativeNpcCodec.MaxNameLen)
+                if (p.Length < 2 || (!NpcNamePattern.IsMatch(p[0]) && !M3HorseRules.IsHorseEntityName(p[0])) || p[0].Length > NativeNpcCodec.MaxNameLen)
                 {
                     Console.WriteLine($"[npcwrite] malformed npc_native '{arg}'");
                     return;

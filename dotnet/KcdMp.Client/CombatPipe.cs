@@ -1064,7 +1064,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
     public async Task<byte?> Wo139ContextAsync(bool on, string context, string entity, CancellationToken ct = default)
     {
         var c = Encoding.ASCII.GetBytes(context); var n = Encoding.ASCII.GetBytes(entity);
-        if (c.Length is < 1 or > 63 || n.Length is < 1 or > 63) return null;
+        if (c.Length is < 1 or > 63 || n.Length is < 1 or > 120) return null;
         var a = new byte[1 + 1 + c.Length + 1 + n.Length];
         a[0] = (byte)(on ? 1 : 0);
         a[1] = (byte)c.Length; c.CopyTo(a, 2);

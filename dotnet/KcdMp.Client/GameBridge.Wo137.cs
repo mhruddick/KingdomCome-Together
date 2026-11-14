@@ -76,6 +76,7 @@ public partial class GameBridge
         _w137CfgKey = -1;
         _w137HostModeKnown = false;
         _w137HostModeOn = true;
+        M3OnConnect();
         var ch = Channel.CreateUnbounded<Func<Task>>(new UnboundedChannelOptions { SingleReader = true });
         _w137Work = ch;
         _combat.OnQuestChange = c => { Interlocked.Increment(ref _w137In); ch.Writer.TryWrite(() => Wo137OnLocalChangeAsync(c)); };
@@ -97,6 +98,7 @@ public partial class GameBridge
         _w154Coalescer.TakeReady(0, all: true);
         foreach (var (npc, h) in _w137TalkHolds.ToArray())
             if (_w137TalkHolds.TryRemove(npc, out _)) _ = ExecLuaAsync($"if KCD2MP_W137HostHold then KCD2MP_W137HostHold(false, \"{npc}\", {h.Peer}, \"disconnect\") end");
+        await M3OnDisconnectAsync();
         try { await _combat.Wo137ConfigAsync(false, 0, 0); } catch { }
         _w137CfgKey = -1;
         try { await ExecLuaAsync("if KCD2MP_W137Session then KCD2MP_W137Session(false, false, false) end"); } catch { }
@@ -147,6 +149,7 @@ public partial class GameBridge
                 }
                 _w137JoinerWasActive = joinerActive;
                 _ = ExecLuaAsync($"if KCD2MP_W137Session then KCD2MP_W137Session({B(host)}, {B(joiner)}, {B(Wo137Active(holding))}) end");
+                await M3TickAsync(host && Wo137Active(holding), joinerActive);
                 if (wasHolding && !holding && host) Wo137ReleaseHeldRequests();
                 if (host) Wo154FlushCoalesced(false);   // WO-154 1
                 wasHolding = holding;
@@ -409,11 +412,9 @@ public partial class GameBridge
                     Interlocked.Increment(ref _w137TalksIn);
                     Wo137Post(() => Wo137HostTalkAsync(src, m.Tok, on, npc));
                     return;
-                case Protocol.QuestAskOwnHorse when Wo137Text.IsNpc(m.Text):
-                    // WO-160 6: the joiner's own horse (bought, bonded): this world marks it his, and fetches it when he whistles
-                    Console.WriteLine($"MP-WO160 host: ghost {src}'s own horse is {m.Text} -- marked in this world (fetched to his avatar when he whistles)");
-                    string horse = m.Text;
-                    _ = ExecLuaAsync($"if KCD2MP_W160PeerHorse then KCD2MP_W160PeerHorse({src}, \"{horse}\") end");
+                case Protocol.QuestAskOwnHorse when M3HorseRules.TryParseOwnHorseAsk(m.Text, out string? horse, out var tackClasses):
+                    // WO-160 6 + M3: the joiner's own horse (including bracketed names, "-" when cleared, and optional tack classes)
+                    M3OnHostOwnHorseAsk(src, horse, tackClasses);
                     return;
                 case Protocol.QuestAskResync when Wo137Rules.TryParseResyncText(m.Text, out string rwhy):
                     if (!_w137SyncOn || Wo136Holding) { Console.WriteLine($"MP-W137 host: ghost {src} asked for a checkpoint ({rwhy}) -- not now ({(!_w137SyncOn ? "mp_quest_sync off" : "this world is loading")}; the periodic one follows)"); return; }
@@ -834,13 +835,8 @@ public partial class GameBridge
             case "w157_talkfree":  // WO-157 3b.4: on|off <npc> -- the copy's NPC-state placement waits while this player talks to it
                 if (f.Length >= 2 && f[0] is "on" or "off" && Wo137Text.IsNpc(f[1])) Wo141OnTalk(f[0] == "on", f[1]);
                 return;
-            case "w160_ownhorse":  // WO-160 6: <horse> -- this joiner's own horse (bought, bonded): the host is told
-                if (f.Length >= 1 && Wo137Text.IsNpc(f[0]) && W137Joiner)
-                {
-                    uint htok = Interlocked.Increment(ref _w137Tok);
-                    Console.WriteLine($"MP-WO160 joiner: its own horse is {f[0]} -- told to the host");
-                    _ = Wo137SendAsync(Protocol.QuestAskUp, Protocol.JoinTargetHost, Protocol.QuestAskOwnHorse, htok, f[0]);
-                }
+            case "w160_ownhorse":  // WO-160 6 + M3: <horse> [tackCsv] | "-" -- this joiner's own horse (bought, bonded, or cleared)
+                M3OnLocalOwnHorseEvent(arg);
                 return;
             case "w160_loopstop":  // WO-160 5: <id> <why> -- a loop on an avatar was stopped by the mod: the T-pose pulse again
                 if (f.Length >= 1) _ = W160LoopStoppedAsync(f[0], string.Join(' ', f.Skip(1)));

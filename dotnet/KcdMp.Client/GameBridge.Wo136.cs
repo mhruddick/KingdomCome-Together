@@ -177,7 +177,8 @@ public partial class GameBridge
             case "w136_ride":
             {
                 var f = arg.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (f.Length == 2 && NpcNamePattern.IsMatch(f[0])) _ = Task.Run(() => Wo136OnRideAsync(f[0], f[1] == "1"));
+                if (f.Length == 2 && (NpcNamePattern.IsMatch(f[0]) || M3HorseRules.IsHorseEntityName(f[0])))
+                    _ = Task.Run(() => Wo136OnRideAsync(f[0], f[1] == "1"));
                 return;
             }
             case "w136_torch":
