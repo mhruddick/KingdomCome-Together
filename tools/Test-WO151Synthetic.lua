@@ -119,12 +119,12 @@ end
 do
     local b = lastLog("WO151-BUILD") or ""
     check("a: WO151-BUILD logged once", logCount("WO151-BUILD") == 1, logCount("WO151-BUILD"))
-    for _, kv in ipairs({ "copy_fight=on", "npc_reactions=on", "hold_freeze=off", "ride_owner=on", "crime_mode=joint", "fault_switchoff=on", "main_cost=off", "door_sync=on", "scene_guard=on", "whistle=on", "carry_living=on", "minigame_align=off", "quest_catchup=on" }) do
+    for _, kv in ipairs({ "copy_fight=on", "npc_reactions=on", "hold_freeze=off", "ride_owner=on", "crime_mode=individual", "fault_switchoff=on", "main_cost=off", "door_sync=on", "scene_guard=on", "whistle=on", "carry_living=on", "minigame_align=off", "quest_catchup=on" }) do
         check("a: the build line says " .. kv, b:find(kv, 1, true) ~= nil, b)
     end
     local cfg = evts("w151_cfg")[1] or ""
     check("a: w151_cfg mirrors the defaults to the agent", cfg:find("copy_fight=on", 1, true) and cfg:find("npc_reactions=on", 1, true)
-        and cfg:find("crime_mode=joint", 1, true) and cfg:find("scene_guard=on", 1, true) and cfg:find("minigame_align=off", 1, true) ~= nil, cfg)
+        and cfg:find("crime_mode=individual", 1, true) and cfg:find("scene_guard=on", 1, true) and cfg:find("minigame_align=off", 1, true) ~= nil, cfg)
     for _, c in ipairs({ "mp_copy_fight", "mp_npc_reactions", "mp_ride_owner", "mp_crime_mode", "mp_hold_freeze", "mp_fault_switchoff",
                          "mp_main_cost", "mp_fault_status", "mp_fault_test", "mp_test_takedamage", "mp_test_row", "mp_test_copyfight", "mp_door_sync",
                          "mp_scene_guard", "mp_whistle", "mp_carry_living", "mp_minigame_align" }) do

@@ -169,7 +169,11 @@ public partial class GameBridge
         catch (Exception ex) { Console.WriteLine($"MP-W140 {Protocol.SleepVoteName(kind)} not sent: {ex.Message}"); }
     }
 
-    private string W140Name(byte id) => id == _myGhostId ? "you" : _ghostNames.TryGetValue(id, out var n) ? n : $"player {id}";
+    private string W140Name(byte id) =>
+        id == _myGhostId ? "you"
+        : _ghostNames.TryGetValue(id, out var n) ? n
+        : _peers.NameOf(id) is { Length: > 0 } pn ? pn
+        : $"player {id}";
 
     // ---------------------------------------------------------------- the asker
 
@@ -406,11 +410,33 @@ public partial class GameBridge
     /// <summary>The asker confirmed the length (the DLL's "began"): everyone who said yes starts theirs.</summary>
     private async Task Wo140OnLocalBeganAsync(Wo140Frame f)
     {
+        bool wasSkipping = _w140LocalSkipping;
         _w140LocalSkipping = true;
         Wo140Rules.Vote? v; bool approved;
         lock (_w140Lock) { v = _w140Mine; approved = _w140MineApproved; }
         if (v is null || !approved)
         {
+            bool duplicateOwnBath = W140SharedSkip && wasSkipping && _w140SharedKind == "bath" && _w140SharedAsker == _myGhostId;
+            if (v is null && f.Id == 7 && !duplicateOwnBath && W140VoteRequired && Wo140Rules.HoursOk(f.Hours) is float bathHours)
+            {
+                uint bathId = Wo140Rules.VoteId(_myGhostId, Interlocked.Increment(ref _w140Tok));
+                bool save = !_isDamageAuthority;
+                Wo140MarkShared("bath", _myGhostId, bathHours);
+                _w140SaveAfter = false;   // host's own bathhouse_controller/save_hry.xml already saves
+                Interlocked.Increment(ref _w140Begins);
+                string bathText = Wo140Text.Begin("bath", _myGhostId, bathHours, save);
+                if (_isDamageAuthority)
+                {
+                    foreach (byte g in VotingPartners())
+                        await Wo140SendAsync(g, Protocol.SleepBegin, bathId, bathText);
+                }
+                else
+                {
+                    await Wo140SendAsync(Protocol.JoinTargetHost, Protocol.SleepBegin, bathId, bathText);
+                }
+                Console.WriteLine(FormattableString.Invariant($"MP-W140 bath 0x{bathId:X8}: this player began a {bathHours:0.##} h bathhouse service -- everyone's skip starts now"));
+                return;
+            }
             if (W140SharedSkip) Console.WriteLine(FormattableString.Invariant($"MP-W140 this game's own sleep screen runs ({Wo140Rules.KindOfSkipId(f.Id)}, {f.Hours:0.##} h) -- the shared sleep"));
             return;
         }
@@ -442,6 +468,38 @@ public partial class GameBridge
     {
         Interlocked.Increment(ref _w140BeginsIn);
         bool host = _isDamageAuthority;
+        if (kind == "bath")
+        {
+            if ((host && asker != src) || Wo140Rules.HoursOk(hours) is not float bathHours)
+            {
+                Console.WriteLine(FormattableString.Invariant($"MP-W140 bath Begin 0x{id:X8} from ghost {src} (asker {asker}, {hours} h) refused"));
+                return;
+            }
+            if (!W140VoteRequired || Wo136Holding)
+            {
+                _w140SaveAfter = false;
+                Console.WriteLine(FormattableString.Invariant($"MP-W140 {W140Name(asker)} began a {bathHours:0.##} h bath (0x{id:X8}) -- this game cannot join now ({(Wo136Holding ? "loading" : "not in the shared world")})"));
+                if (host) await Wo140SendAsync(src, Protocol.SleepCancel, 0, Wo140Text.Cancel("woke", asker));
+                return;
+            }
+            string who = W140Name(asker);
+            await Wo140SayAsync(Wo140Rules.BathToastText(who, bathHours));
+            bool started = await Wo140StartOwnAsync("bath", bathHours, $"{who} is using the bathhouse ({bathHours:0.##} h)");
+            if (!started)
+            {
+                _w140SaveAfter = false;
+                if (host) await Wo140SendAsync(src, Protocol.SleepCancel, 0, Wo140Text.Cancel("woke", asker));
+                return;
+            }
+            Wo140MarkShared("bath", asker, bathHours);
+            _w140SaveAfter = host && save;   // a joiner's bathhouse service: the host runs KCD2MP_W140RestSave afterwards
+            if (host)
+            {
+                foreach (byte j in VotingPartners())
+                    if (j != src) await Wo140SendAsync(j, Protocol.SleepBegin, id, Wo140Text.Begin(kind, asker, bathHours, save));
+            }
+            return;
+        }
         if (host)
         {
             // a joiner asker's Begin: every other joiner who said yes starts too
@@ -461,23 +519,67 @@ public partial class GameBridge
         await Wo140StartOwnAsync(kind, hours, $"{W140Name(asker)} chose {hours:0.##} h");
     }
 
+    private Func<byte, float, byte?>? _w140StartForTest;
+
+    internal void Wo140ConfigureTestPeer(bool isHost, byte myId, Stream relayOut, IGameTransport transport)
+    {
+        _myGhostId = myId;
+        _wo122Stream = relayOut;
+        _transport = transport;
+        _combatRoleApplied = true;
+        _isDamageAuthority = isHost;
+        _sharedWorld = isHost;
+        _hostAuthority = !isHost;
+        _hostModeKnown = !isHost;
+        _hostSharedWorld = !isHost;
+        _joinedWorld = !isHost;
+        _where = GameWhere.World;
+        _w140StartForTest = static (_, _) => (byte)1;
+    }
+
+    internal void Wo140SetStartForTest(Func<byte, float, byte?>? fn) => _w140StartForTest = fn;
+    internal void Wo140SetLoadingForTest(bool loading) => _where = loading ? GameWhere.Loading : GameWhere.World;
+    internal bool Wo140HostWokeNotedForTest => Volatile.Read(ref _w192HostWokeMs) != 0;
+    internal Task Wo140DllFrameForTestAsync(Wo140Frame f) => Wo140OnFrameFromDllAsync(f);
+    internal Task Wo140InboundFrameForTestAsync(byte src, byte[] body) => Wo140OnFrameAsync(src, body);
+    internal bool Wo140SharedSkipForTest => W140SharedSkip;
+    internal bool Wo140SaveAfterForTest => _w140SaveAfter;
+    internal bool Wo140CheckClockForTest(uint worldTime) => Wo140CheckClock(worldTime);
+    internal void Wo140NoteHostClockForTest(byte source, byte phase, uint worldTime) => Wo140NoteHostClock(source, phase, worldTime);
+
+    private Task<byte?> Wo140StartNativeOrTestAsync(byte id, float hours) =>
+        _w140StartForTest is { } fn ? Task.FromResult(fn(id, hours)) : _combat.Wo140StartAsync(id, hours);
+
     /// <summary>This game's own sleep screen for the vote's hours, wherever the player stands.</summary>
-    private async Task Wo140StartOwnAsync(string kind, float hours, string why)
+    private async Task<bool> Wo140StartOwnAsync(string kind, float hours, string why)
     {
         byte id = Wo140Rules.AccepterSkipId(kind);
-        byte? r = await _combat.Wo140StartAsync(id, hours);
+        byte? r = await Wo140StartNativeOrTestAsync(id, hours);
         string how;
-        if (r == 1) { how = kind == "wait" ? "the game's own wait" : "the game's own sleep (its screen, its rest)"; Interlocked.Increment(ref _w140Starts); }
+        bool started = false;
+        if (r == 1)
+        {
+            started = true;
+            how = kind is "wait" or "bath" ? "the game's own wait" : "the game's own sleep (its screen, its rest)";
+            Interlocked.Increment(ref _w140Starts);
+        }
         else if (r == 0)
         {
             // the game said no (trespass, combat, ...): its forced sleep screen still runs, so the clock and the screen match
-            byte? r2 = await _combat.Wo140StartAsync(14, hours);
+            byte? r2 = await Wo140StartNativeOrTestAsync(14, hours);
+            started = r2 is 1 or 2;
             how = r2 == 1 ? "the game refused a real sleep here (trespass, a fight...): its forced sleep screen runs instead, without the rest"
-                          : $"the game refused (sleep {r}, forced screen {r2?.ToString(CultureInfo.InvariantCulture) ?? "no answer"}) -- the clock follows the host's anyway";
+                : r2 == 2 ? "this game's own skip is already running"
+                : $"the game refused (sleep {r}, forced screen {r2?.ToString(CultureInfo.InvariantCulture) ?? "no answer"}) -- the clock follows the host's anyway";
             if (r2 == 1) Interlocked.Increment(ref _w140StartFallbacks);
         }
-        else how = r == 2 ? "this game's own skip is already running" : r is null ? "the DLL did not answer -- the clock follows the host's anyway" : $"refused ({r})";
+        else
+        {
+            started = r == 2;
+            how = r == 2 ? "this game's own skip is already running" : r is null ? "the DLL did not answer -- the clock follows the host's anyway" : $"refused ({r})";
+        }
         Console.WriteLine(FormattableString.Invariant($"MP-W140 {why}: this player's {kind} for {hours:0.##} h -- {how}"));
+        return started;
     }
 
     private async Task Wo140OnCancelAsync(byte src, uint id, string why, byte asker)

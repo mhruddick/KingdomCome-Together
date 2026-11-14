@@ -28,6 +28,7 @@ inline const char* id_name(int id) {
         case 4: return "read";
         case 5: return "jail";
         case 6: return "unconscious";
+        case 7: return "bath";
         case 14: return "fake-sleep";
     }
     return "other";

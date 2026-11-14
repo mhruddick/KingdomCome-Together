@@ -54,6 +54,8 @@ public partial class GameBridge
     private string _hostWorldPlayer = "?";
     private DateTime _identifyAskedUtc = DateTime.MinValue;
     private volatile bool _hostLoadAnnounced;
+    private string? _w125PreloadedHandled;
+    private bool _w125PreloadIdentifying;
     private string? _branchHead;
     private readonly object _branchGate = new();
 
@@ -111,12 +113,37 @@ public partial class GameBridge
         }
     }
 
+    private bool Wo125EnsurePreloadedIdentified()
+    {
+        if (_w125PreloadIdentifying || !(_combatRoleApplied && _isDamageAuthority && _sharedWorld) || _where == GameWhere.Menu)
+            return false;
+        string? rel = _w175LastLoaded ?? (_transport is LogTailGameTransport tail ? LogTailGameTransport.ScanLastLoadedSave(tail.LogPath) : null);
+        if (string.IsNullOrEmpty(rel) || string.Equals(_w125PreloadedHandled, rel, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (ResolveSavesDirForJoin() is not string saves)
+            return false;
+        var m = Regex.Match(rel, @"^playline([0-4])/([A-Za-z0-9_]+\.whs)$", RegexOptions.IgnoreCase);
+        if (!m.Success) return false;
+        string fullPath = Path.Combine(saves, $"playline{m.Groups[1].Value}", m.Groups[2].Value);
+        if (!File.Exists(fullPath)) return false;
+        _w125PreloadedHandled = rel;
+        _w125PreloadIdentifying = true;
+        try
+        {
+            Wo125HostIdentify(fullPath, loaded: true, "preloaded");
+            return _hostWorldSeed is not null;
+        }
+        finally { _w125PreloadIdentifying = false; }
+    }
+
     /// <summary>
     /// Read the host world's identity from a save it loaded (<paramref name="loaded"/>) or wrote.
     /// A write becomes the new head with the old head as its parent; a load makes the loaded save the head.
     /// </summary>
     private void Wo125HostIdentify(string path, bool loaded, string why)
     {
+        if (!loaded && _hostWorldSeed is null)
+            Wo125EnsurePreloadedIdentified();
         try
         {
             var bytes = WhsSave.ReadShared(path);
@@ -147,7 +174,11 @@ public partial class GameBridge
                 _branchHead = md5;
                 SaveBranchMap();
             }
-            if (seed is uint) Wo134OnHostWorld(tag, md5, loaded);   // WO-134: the host's chest ledger pairs with this save
+            if (seed is uint)
+            {
+                Wo134OnHostWorld(tag, md5, loaded);         // WO-134: the host's chest ledger pairs with this save
+                Wo139OnHostWorld(tag, md5, loaded, path);   // M4: the host's per-player crime store pairs with this save
+            }
             if (seed is uint && _sharedWorld && config.IsHosting) _henry.MarkHosted(tag);   // WO-157: this install's own playthrough (the launcher's host flow only)
             Console.WriteLine($"MP-HENRY host: world {tag} ({why}: {SaveDisplay(path)}, md5 {md5[..8]} = the save's footer MD5) player={who.Player} henry={On(who.IsHenry)} branch_depth={BranchNewestFirst().Count}");
             if (changed)
@@ -178,6 +209,7 @@ public partial class GameBridge
     private void Wo125HostTick()
     {
         if (!_sharedWorld || _hostWorldSeed is not null || _where == GameWhere.Menu) return;
+        if (Wo125EnsurePreloadedIdentified()) return;
         if (LivePartners().Count == 0) return;   // WO-144
         if ((DateTime.UtcNow - _identifyAskedUtc).TotalSeconds < 60 || Volatile.Read(ref _worldSaveBusy) != 0 || Wo123HostJoinActive) return;
         _identifyAskedUtc = DateTime.UtcNow;
@@ -189,6 +221,7 @@ public partial class GameBridge
     private void Wo125HostOnLoadAccepted(string display)
     {
         if (!(_combatRoleApplied && _isDamageAuthority && _sharedWorld && _modeEverShared)) return;
+        _w125PreloadedHandled = display;
         if (ResolveSavesDirForJoin() is string saves)
         {
             var m = Regex.Match(display, @"^playline([0-4])/([A-Za-z0-9_]+\.whs)$", RegexOptions.IgnoreCase);
@@ -206,6 +239,7 @@ public partial class GameBridge
     {
         if (!_hostLoadAnnounced) return;
         _hostLoadAnnounced = false;
+        Wo139OnHostGameplayStarted();
         Wo201HostLoadDone();   // WO-201 B15
         _modeTold.Clear();   // announce the (possibly new) world at the next tick: a joiner in it rejoins
     }

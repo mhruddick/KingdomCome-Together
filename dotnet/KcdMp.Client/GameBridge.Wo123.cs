@@ -619,6 +619,7 @@ public partial class GameBridge
                     uint seq = msg.Body.Length == 4 ? BinaryPrimitives.ReadUInt32LittleEndian(msg.Body) : 0;
                     Console.WriteLine($"MP-JOIN host: join 0x{j.JoinId:x8}: {j.Partner} is ready (loaded worldsaved_seq={seq}, sent {sender.Offer.WorldSavedSeq}{(seq == sender.Offer.WorldSavedSeq ? "" : " -- MISMATCH")})");
                     _ = Wo134OnJoinerReadyAsync(j.Joiner);   // M2: chests share the host's save; replay active loose-item tombstones
+                    _ = Wo139OnJoinerReadyAsync(j.Joiner);   // M4: restore/announce persisted open crime record on join
                     resumeReason = "ready";
                     return;
                 }

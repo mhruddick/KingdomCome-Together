@@ -27888,13 +27888,13 @@ KCD2MP.w151.fight = KCD2MP.w151.fight or {}
 --   avatar rides here leave every NPC path at once: no puppet, no native writer, no park or hide, no
 --   join freeze; the host's stream for it is ignored while it is ridden and 3 s after (WO-136's settle).
 KCD2MP.w151.rideOwner = (KCD2MP.w151.rideOwner == nil) and true or KCD2MP.w151.rideOwner
--- Phase 5 (both): mp_crime_mode joint|individual (default joint, the maintainer's call) -- a crime by
+-- Phase 5 (both): mp_crime_mode joint|individual (default individual, M4) -- when joint, a crime by
 --   either player counts for both: the joiner's witnessed crime is raised natively in the host's world
 --   too (planted in the host's witnesses: the host's Henry is wanted for it), the host's own crime goes
 --   into the joiner's record, and a fine or punishment by either clears both. individual = WO-139.
 --   5.3: when a record clears, this machine's NPCs forget it (the game's crime:forgetCrimesData; a
 --   paused guard copy gets its brain back for the moment it takes) -- the wanted icon goes with it.
-KCD2MP.w151.crimeJoint = (KCD2MP.w151.crimeJoint == nil) and true or KCD2MP.w151.crimeJoint
+KCD2MP.w151.crimeJoint = KCD2MP.w151.crimeJoint == true
 -- Phase 3.8 (host): mp_join_engine_hold on|off (default on) -- the world is truly held for a whole join: the
 --   engine's own pause (the DLL, at most the join's timeout + 60 s, released when the agent goes away),
 --   from the verified join save to the join's end. The mod's ratio 0, NPC pauses and no_input stay too.
@@ -30523,7 +30523,7 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_chest_sync",          'KCD2MP_W195BSetChestSync(%line)',       "WO-195B: a chest the joiner unlocks (his lockpick or his key) is unlocked in the host's world too -- the game's own Stash:Unlock on the host's chest at that pivot, so a save keeps it; the host only ever unlocks, and only on that claim (default on): mp_chest_sync on|off; bare = report")
     System.AddCCommand("mp_unstuck",             'KCD2MP_W151Unstuck(%line)',             "WO-151: a way out of any stuck player state through the game's own exits (the picker's Back, the mod's holds let go, the actor's StandUp; a fight you are in ends -- WO-154: the game's StopFight, and a joiner's host ends every fight against his figure; hard = also the game's own hit reaction, no damage): mp_unstuck [hard] [fight]")
     System.AddCCommand("mp_join_engine_hold",    'KCD2MP_W151SetJoinHold(%line)',         "WO-151 (host): the world is truly held for a whole join -- the engine's own pause from the join save to its end (at most the join's timeout + 60 s) (default on): mp_join_hold on|off; bare = report")
-    System.AddCCommand("mp_crime_mode",          'KCD2MP_W151SetCrimeMode(%line)',        "WO-151: joint = a crime by either player counts for both (raised in the host's world too, a fine or punishment by either clears both); individual = each answers for his own (WO-139) (default joint): mp_crime_mode joint|individual; bare = report")
+    System.AddCCommand("mp_crime_mode",          'KCD2MP_W151SetCrimeMode(%line)',        "WO-151: joint = a crime by either player counts for both (raised in the host's world too, a fine or punishment by either clears both); individual = each answers for his own (WO-139) (default individual): mp_crime_mode joint|individual; bare = report")
     System.AddCCommand("mp_ride_owner",          'KCD2MP_W151SetRideOwner(%line)',        "WO-151: one owner for a ridden horse, the rider's mount path -- the horse you sit on (and one a partner's figure rides) is never a puppet, bound, parked, hidden or frozen by the mod, and the host's stream for it waits (default on): mp_ride_owner on|off; bare = report")
     System.AddCCommand("mp_npc_reactions",       'KCD2MP_W151SetNpcReactions(%line)',     "WO-151: a host NPC's hit reaction shows on the joiner's copy (the host sends it; the copy plays it, and runs none of its own reactions while it fights) (default on): mp_npc_reactions on|off; bare = report")
     System.AddCCommand("mp_test_copyfight",      'KCD2MP_W151TestCopyFight(%line)',       "WO-151 test: a copy's 'no own hit reaction' contexts on any body: mp_test_copyfight <npc> on|off")

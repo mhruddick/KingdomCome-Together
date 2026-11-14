@@ -68,7 +68,7 @@ public static partial class Protocol
 /// <summary>WO-140: the field checks both ends run on every SleepVote text.</summary>
 public static class Wo140Text
 {
-    public static readonly string[] Kinds = { "sleep", "wait" };
+    public static readonly string[] Kinds = { "sleep", "wait", "bath" };
     public static readonly string[] Answers = { "yes", "no", "timeout", "busy" };
     public static readonly string[] CancelWhys = { "backed-out", "refused", "timeout", "left", "busy", "not-shown", "lost", "woke" };
 

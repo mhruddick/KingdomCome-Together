@@ -546,6 +546,35 @@ public sealed class LogTailGameTransport : IGameTransport
     }
 
     /// <summary>
+    /// M4: the most recent save accepted in this game run ("Loading saved game '%USER%/saves/playlineN/x.whs'"),
+    /// or null if none was accepted or the main menu came back up after it.
+    /// </summary>
+    public static string? ScanLastLoadedSave(string logPath, int tailBytes = 16 * 1024 * 1024)
+    {
+        try
+        {
+            using var fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            long start = Math.Max(0, fs.Length - tailBytes);
+            fs.Seek(start, SeekOrigin.Begin);
+            var buf = new byte[fs.Length - start];
+            int got = 0;
+            while (got < buf.Length) { int n = fs.Read(buf, got, buf.Length - got); if (n <= 0) break; got += n; }
+            string text = Encoding.UTF8.GetString(buf, 0, got);
+            const string marker = "Loading saved game '";
+            int load = text.LastIndexOf(marker, StringComparison.Ordinal);
+            int menu = text.LastIndexOf("PlayVideoOnly 'main_menu", StringComparison.Ordinal);
+            if (load < 0 || menu > load) return null;
+            int pathStart = load + marker.Length;
+            int q = text.IndexOf('\'', pathStart);
+            if (q <= pathStart) return null;
+            string path = text[pathStart..q].Replace('\\', '/');
+            int pl = path.LastIndexOf("/playline", StringComparison.Ordinal);
+            return pl >= 0 ? path[(pl + 1)..] : path;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
     /// WO-122: "AutoSave is disabled under a script lock 'Script:&lt;name&gt;'" --
     /// the engine refused an autosave (sleep, a quest save, the mod's own
     /// request) because of a named script lock. The argument is the lock name.

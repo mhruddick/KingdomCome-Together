@@ -452,7 +452,7 @@ do
     check("f: status: the levers locked, the own items own", st:find("friendly_fire=off(host,locked)", 1, true) ~= nil and st:find("name_badges=on(own)", 1, true) ~= nil
         and st:find("role=joiner", 1, true) ~= nil, st)
     session("host", true)
-    check("f: the host: its own values, unlocked", row("crime_mode") == "  Crime: Shared" and row("friendly_fire") == "> Friendly fire: On", row("friendly_fire"))
+    check("f: the host: its own values, unlocked", row("crime_mode") == "  Crime: Individual" and row("friendly_fire") == "> Friendly fire: On", row("friendly_fire"))
     KCD2MP_FriendlyFireSession(true, "test")
     check("f: no Lua errors", #ERRS == 0, ERRS[1])
 end
@@ -620,12 +620,12 @@ do
     check("i: the host applies it", KCD2MP_W154MenuRestore("FriendlyFire", "off") == true and ff == 1 and KCD2MP.w121.friendlyFire == false)
     KCD2MP_W154MenuRestore("FriendlyFire", "on")
     _G.KCD2MP_Wo121SetFriendlyFire = realFF
+    check("i: CrimeMode joint through mp_crime_mode's function", KCD2MP_W154MenuRestore("CrimeMode", "joint") == true and KCD2MP.w151.crimeJoint == true)
     check("i: CrimeMode individual through mp_crime_mode's function", KCD2MP_W154MenuRestore("CrimeMode", "individual") == true and KCD2MP.w151.crimeJoint == false)
-    KCD2MP_W154MenuRestore("CrimeMode", "joint")
     check("i: FastTravel on through mp_fast_travel's", KCD2MP_W154MenuRestore("FastTravel", "on") == true and M.fastTravel == true)
     KCD2MP_W154MenuRestore("FastTravel", "off")
     check("i: bad values refused", KCD2MP_W154MenuRestore("NameBadges", "maybe") == false and KCD2MP_W154MenuRestore("CrimeMode", "on") == false
-        and KCD2MP_W154MenuRestore("Nope", "on") == false and M.nameBadges == true and KCD2MP.w151.crimeJoint == true)
+        and KCD2MP_W154MenuRestore("Nope", "on") == false and M.nameBadges == true and KCD2MP.w151.crimeJoint == false)
     -- every key the agent remembers (Wo154MenuRules.Settings) has its item
     local missing = {}
     for _, k in ipairs({ "NameBadges", "PingLine", "CleanScreen", "FriendlyFire", "CrimeMode", "FastTravel", "Leash", "SleepVote", "Whistle", "PartnerHerbs" }) do

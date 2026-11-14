@@ -140,6 +140,7 @@ public partial class GameBridge
         _w200QPushed = false;   // I.3: the classes again at the next connection (a new game's script)
         if (_w200Slewing) { _w200Ratio = 15.0; _w200Slewing = false; _ = ExecLuaAsync("pcall(function() Calendar.SetWorldTimeRatio(15.0) end)"); }   // II.7: the game's own pace back
         _w200Talks.Clear();
+        _w200ListenedTalkEndMs.Clear();
         _w200Caps.Clear();
         lock (_w200DlgLock) { _w200DudeConv.Clear(); _w200DudeMono.Clear(); _w200DlgSent = (-1, -1); }
         lock (_w200Lock) { _w200Parked.Clear(); _w200Quiet.Clear(); }
@@ -222,6 +223,55 @@ public partial class GameBridge
         return false;
     }
 
+    private readonly ConcurrentDictionary<int, long> _w200ListenedTalkEndMs = new();
+    private long _w200IsolatedLocal;
+
+    private void Wo200NoteTalkEndedWithListeners(int cid)
+    {
+        long now = W200Now();
+        _w200ListenedTalkEndMs[cid] = now;
+        if (_w200ListenedTalkEndMs.Count > 64)
+            foreach (var k in _w200ListenedTalkEndMs.Where(kv => now - kv.Value > 60_000).Select(kv => kv.Key).ToList())
+                _w200ListenedTalkEndMs.TryRemove(k, out _);
+    }
+
+    /// <summary>True when a partner currently listens to this player's conversation, or was listening when it ended within 3 s.</summary>
+    private bool Wo200HasTalkListeners(string path)
+    {
+        int? activeCid = null;
+        string activeForcedPath = "";
+        lock (_w3cLock)
+        {
+            if (_w3cTalk is { Listeners.Count: > 0 } cur)
+            {
+                activeCid = cur.Cid;
+                activeForcedPath = cur.ForcedPath;
+            }
+        }
+        if (activeCid is int lcid)
+        {
+            if (_w200Talks.TryGetValue(lcid, out var activeTalk))
+            {
+                foreach (var n in activeTalk.Names)
+                    if (Wo200Rules.PathMatchesTalk(path, n)) return true;
+            }
+            else if (activeForcedPath.Length > 0 && Wo200Rules.PathMatchesTalk(path, activeForcedPath))
+            {
+                return true;
+            }
+        }
+        long now = W200Now();
+        foreach (var (cid, t) in _w200Talks)
+        {
+            if (t.EndMs != 0 && now - t.EndMs > 3000) continue;
+            if (now - t.StartMs > 900_000) continue;
+            if (!_w200ListenedTalkEndMs.TryGetValue(cid, out long endedMs) || now - endedMs > 3000) continue;
+            foreach (var n in t.Names)
+                if (Wo200Rules.PathMatchesTalk(path, n)) return true;
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------- the DLL's events (op 72)
 
     private async Task Wo200PollAsync()
@@ -291,7 +341,8 @@ public partial class GameBridge
         if (_w200Caps.TryGetValue(closure, out var first))
         {
             // a continuation of a conversation already captured (its waiter finished: the departure, 48 s on): the same replay goes on
-            if (first.Fate != "replayed" || (first.Ack.Length > 0 && Wo200Rules.FallsBack(first.Ack)) || !W137Joiner || !Wo137Text.IsPath(path) || !Wo137Text.IsPort(port)) return;
+            if (first.Fate != "replayed" || (first.Ack.Length > 0 && Wo200Rules.FallsBack(first.Ack)) || !W137Joiner
+                || !Wo137Text.IsPath(path) || !Wo137Text.IsPort(port) || Wo200Rules.IsAlwaysLocalDialogue(path, port)) return;
             uint seq = ++first.Seq;
             Interlocked.Increment(ref _w200ReplaysSent);
             Interlocked.Exchange(ref _w200LastOwnReplayMs, W200Now());   // I.3: his own quest-item changes stand meanwhile
@@ -301,20 +352,29 @@ public partial class GameBridge
         }
         var cap = new W200Capture { Closure = closure, Seq = closure & 0x7FFFFFFF, Path = path, Port = port, AtMs = W200Now() };
         bool own = Wo200IsOwnTalk(path);
-        bool send = W137Joiner && W200("s1_replay") && own && Wo137Text.IsPath(path) && Wo137Text.IsPort(port);
+        bool hasListeners = own && Wo200HasTalkListeners(path);
+        bool candidate = W137Joiner && W200("s1_replay") && own && Wo137Text.IsPath(path) && Wo137Text.IsPort(port);
+        string m4Reason = "";
+        bool allowReplay = !candidate || Wo200Rules.ShouldReplayDialogueOutPort(path, port, hasListeners, out m4Reason);
+        bool send = candidate && allowReplay;
         var g = Wo200Graph();
         if (g is not null)
         {
             try { cap.StaticStates = g.Of(path, port).States; } catch (Exception ex) { Console.WriteLine($"MP-W200 closure of {path} {port} not read: {ex.GetType().Name}"); }
         }
-        cap.Fate = send ? "replayed" : "local";
+        cap.Fate = send ? "replayed" : (candidate && !allowReplay ? "isolated" : "local");
         _w200Caps[closure] = cap;
         if (_w200Caps.Count > 400)
             foreach (var k in _w200Caps.Where(kv => W200Now() - kv.Value.AtMs > (long)Wo200Rules.SuppressTtl.TotalMilliseconds).Select(kv => kv.Key).ToList())
                 _w200Caps.TryRemove(k, out _);
         if (!send)
         {
-            if (W137Joiner && own) Console.WriteLine($"MP-W200 joiner: his conversation's out-port {path} :: {port} ran here only (s1_replay off or not sendable)");
+            if (candidate && !allowReplay)
+            {
+                Interlocked.Increment(ref _w200IsolatedLocal);
+                Console.WriteLine($"MP-W200 joiner: his conversation's out-port {path} :: {port} stayed local ({m4Reason})");
+            }
+            else if (W137Joiner && own) Console.WriteLine($"MP-W200 joiner: his conversation's out-port {path} :: {port} ran here only (s1_replay off or not sendable)");
             return;
         }
         Interlocked.Increment(ref _w200CapturedOwn);
@@ -326,6 +386,39 @@ public partial class GameBridge
         await Wo137SendAsync(Protocol.QuestAskUp, Protocol.JoinTargetHost, Protocol.QuestAskOutPortReplay, closure, Wo200Rules.ReplayText(closure, cap.Seq, port, path));
     }
 
+    internal void Wo200ConfigureTestJoiner(Stream relayOut, IGameTransport transport)
+    {
+        _wo122Stream = relayOut;
+        _transport = transport;
+        _combatRoleApplied = true;
+        _isDamageAuthority = false;
+        _hostAuthority = true;
+        _hostModeKnown = true;
+        _hostSharedWorld = true;
+        _joinedWorld = true;
+        _w200GraphTried = true;
+    }
+
+    internal void Wo200EngineLineForTest(string line)
+    {
+        Wo203CamOnEngineLine(line);
+        Wo200OnEngineLine(line);
+    }
+
+    internal void Wo200SetActiveListenersForTest(int cid, params byte[] listeners)
+    {
+        lock (_w3cLock)
+        {
+            _w3cTalk ??= new W203Talk { Cid = cid };
+            _w3cTalk.Cid = cid;
+            _w3cTalk.Listeners.Clear();
+            foreach (byte l in listeners) _w3cTalk.Listeners.Add(l);
+        }
+    }
+
+    internal Task Wo200CaptureForTestAsync(uint closure, string path, string port) => Wo200OnCaptureAsync(closure, path, port);
+    internal bool Wo200HoldLocalForTest(QuestChange c) => Wo200HoldLocal(c);
+
     /// <summary>
     /// The joiner's own State step made inside a closure (flag 128): suppressed when its conversation's replay went to the host, asked as
     /// today when it did not; parked a moment when the capture's fate is not known yet. True = not asked now.
@@ -335,12 +428,12 @@ public partial class GameBridge
         if (!c.InClosure || !W137Joiner) return false;
         if (_w200Caps.TryGetValue(c.Closure, out var cap))
         {
-            if (cap.Fate == "replayed" && !(cap.Ack.Length > 0 && Wo200Rules.FallsBack(cap.Ack)))
+            if ((cap.Fate == "replayed" || cap.Fate == "isolated") && !(cap.Ack.Length > 0 && Wo200Rules.FallsBack(cap.Ack)))
             {
                 lock (_w200Lock) cap.Held.Add(c);
                 Interlocked.Increment(ref _w200Suppressed);
                 Console.WriteLine(FormattableString.Invariant(
-                    $"WO200-SUPPRESS joiner: {c.Path} {c.Port} {c.Old}->{c.New} not asked -- inside replay {c.Closure:X8} (the host runs {cap.Path} :: {cap.Port} itself){(cap.Ack.Length > 0 ? ", host: " + cap.Ack : "")}"));
+                    $"WO200-SUPPRESS joiner: {c.Path} {c.Port} {c.Old}->{c.New} not asked -- inside {(cap.Fate == "isolated" ? "local-only" : "replay")} {c.Closure:X8} ({cap.Path} :: {cap.Port}){(cap.Ack.Length > 0 ? ", host: " + cap.Ack : "")}"));
                 return true;
             }
             return false;
@@ -363,8 +456,8 @@ public partial class GameBridge
                 bool known = _w200Caps.ContainsKey(c.Closure);
                 if (!known && now - at < (long)Wo200Rules.ParkMax.TotalMilliseconds) continue;
                 _w200Parked.RemoveAt(i);
-                if (known && _w200Caps[c.Closure].Fate == "replayed") { _w200Caps[c.Closure].Held.Add(c); Interlocked.Increment(ref _w200Suppressed);
-                    Console.WriteLine(FormattableString.Invariant($"WO200-SUPPRESS joiner: {c.Path} {c.Port} {c.Old}->{c.New} not asked -- inside replay {c.Closure:X8}")); }
+                if (known && _w200Caps[c.Closure].Fate is "replayed" or "isolated") { _w200Caps[c.Closure].Held.Add(c); Interlocked.Increment(ref _w200Suppressed);
+                    Console.WriteLine(FormattableString.Invariant($"WO200-SUPPRESS joiner: {c.Path} {c.Port} {c.Old}->{c.New} not asked -- inside {_w200Caps[c.Closure].Fate} {c.Closure:X8}")); }
                 else ask.Insert(0, c);
             }
         }

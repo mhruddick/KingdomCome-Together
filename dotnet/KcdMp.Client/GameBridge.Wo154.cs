@@ -164,7 +164,11 @@ public partial class GameBridge
         Interlocked.Increment(ref _w154EndFightsIn);
         var r = W154Respite(src);
         lock (r) r.Unstuck(Environment.TickCount64);
-        if (_w139Records.TryGetValue(src, out var rec)) rec.Calm(null);   // the record stands; nothing fresh or escalated
+        if (_w139Records.TryGetValue(src, out var rec))
+        {
+            rec.Calm(null);   // the record stands; nothing fresh or escalated
+            Wo139PersistPeerRecord(src);
+        }
         int pursuits = 0;
         foreach (var (g, p) in _w139Pursuits.ToArray())
             if (p.Peer == src) { pursuits++; await Wo139EndPursuitAsync(g, $"the joiner ended his fights ({why})"); }

@@ -51,6 +51,17 @@ public class Wo151Tests
         Assert.True(RowEvent.TryFromBytes(ev.ToBytes(), out var back));
         Assert.Equal((4242u, row, "w151_g1"), (back.SenderMs, back.Row, back.Name));
     }
+
+    [Fact]
+    public void Crime_mode_defaults_to_individual_and_toggles_cleanly()
+    {
+        var gb = new GameBridge(new ClientConfig());
+        Assert.False(gb.Wo151CrimeJointForTest);
+        gb.Wo151CfgForTest("crime_mode=joint");
+        Assert.True(gb.Wo151CrimeJointForTest);
+        gb.Wo151CfgForTest("crime_mode=individual");
+        Assert.False(gb.Wo151CrimeJointForTest);
+    }
 }
 
 /// <summary>WO-151 3.9: a door on the wire -- its kinds, its payload, the Lua event's parse.</summary>

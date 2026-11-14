@@ -44,11 +44,13 @@ public partial class GameBridge
     // (what its own battles, hostages and tied NPCs use) and the two hit-reaction switches, DLL op 5.
     private volatile bool _w151Reactions = true;
 
-    // ---- Phase 5: joint responsibility (mp_crime_mode joint|individual, default joint) ------------
-    // Host: the host's own crime seen by someone (w151_crime own ...) goes into every joiner's record;
-    // the host's own crime dialogue ending in a fine or a punishment (w151_crime resolved ...) clears every
-    // joiner's record; a joiner's stop that clears his record makes this world forget the host's too.
-    private volatile bool _w151CrimeJoint = true;
+    // ---- Phase 5: crime responsibility (mp_crime_mode joint|individual, default individual) --------
+    // Host (when joint): the host's own crime seen by someone (w151_crime own ...) goes into every joiner's
+    // record; the host's own crime dialogue ending in a fine or a punishment (w151_crime resolved ...) clears
+    // every joiner's record; a joiner's stop that clears his record makes this world forget the host's too.
+    private volatile bool _w151CrimeJoint;
+    internal bool Wo151CrimeJointForTest => _w151CrimeJoint;
+    internal void Wo151CfgForTest(string arg) => Wo151OnCfg(arg);
 
     // ---- Phase 3.7: the host's live weather ---------------------------------------------------------
     // Host: the DLL records every blend the game runs (EnvironmentModule BlendToProfile); a new one
@@ -195,8 +197,9 @@ public partial class GameBridge
             Interlocked.Increment(ref _w151CrimeOwn);
             foreach (byte peer in Wo134Peers())
             {
-                var c = new JoinerCrimeRecord.Crime { Id = 0, Kind = f[1], Settlement = settlement, Witnesses = wit, Guards = guards, AtMs = Environment.TickCount64 };
+                var c = new JoinerCrimeRecord.Crime { Id = 0, Kind = f[1], Settlement = settlement, Witnesses = wit, Guards = guards, AtWorldS = _lastPolledWorldTime ?? 0, AtMs = Environment.TickCount64 };
                 bool kept = Wo139Record(peer).Add(c);
+                Wo139PersistPeerRecord(peer);
                 Console.WriteLine($"MP-W151 crime joint: the host's own {f[1]} ({wit} witness(es), {guards} guard(s) in {(settlement.Length > 0 ? settlement : "the wilds")}) -- ghost {peer} answers for it too{(kept ? "" : " (merged)")}");
             }
         }
@@ -207,6 +210,7 @@ public partial class GameBridge
             {
                 if (!_w139Records.TryGetValue(peer, out var rec)) continue;
                 int n = rec.Clear(null);
+                Wo139PersistPeerRecord(peer);
                 foreach (var (g, p) in _w139Pursuits.ToArray()) if (p.Peer == peer) await Wo139EndPursuitAsync(g, "the host's record is cleared (joint)");
                 await Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostCleared, 0, Wo139Rules.ClearedText("partner-" + f[1], null));
                 Console.WriteLine($"MP-W151 crime joint: the host {f[1]} -- ghost {peer}'s record cleared too ({n} crime(s))");

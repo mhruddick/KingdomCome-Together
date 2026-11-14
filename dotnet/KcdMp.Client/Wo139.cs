@@ -290,8 +290,9 @@ public sealed class JoinerCrimeRecord
         public bool Calmed;              // a fight over it ended (the joiner went down, or died): no longer fresh
     }
 
+    private readonly object _sync = new();
     private readonly List<Crime> _open = new();
-    public IReadOnlyList<Crime> Open => _open;
+    public IReadOnlyList<Crime> Open { get { lock (_sync) return _open.ToArray(); } }
 
     /// <summary>A civilian's report reaches the settlement's guards after this long.</summary>
     public const long ReportDelayMs = 20_000;
@@ -302,7 +303,7 @@ public sealed class JoinerCrimeRecord
     /// <summary>A resist keeps the guards attacking this long (the game's crime_arrestEscalationPeriod, 300000 ms).</summary>
     public const long EscalationMs = 300_000;
 
-    public int Count => _open.Count;
+    public int Count { get { lock (_sync) return _open.Count; } }
 
     /// <summary>
     /// A witnessed crime joins the record; an unwitnessed one is not a crime. True = kept.
@@ -313,17 +314,34 @@ public sealed class JoinerCrimeRecord
     public bool Add(Crime c)
     {
         if (c.Witnesses <= 0) return false;
-        if (c.Guards > 0) { c.Known = true; c.KnownAtMs = c.AtMs; }
-        if (c.Kind == "trespass" && _open.FirstOrDefault(o => o.Kind == "trespass" && o.Settlement == c.Settlement) is { } open)
+        lock (_sync)
         {
-            open.Witnesses = Math.Max(open.Witnesses, c.Witnesses);
-            open.Guards = Math.Max(open.Guards, c.Guards);
-            if (c.Known && !open.Known) { open.Known = true; open.KnownAtMs = c.AtMs; }
+            if (c.Guards > 0) { c.Known = true; c.KnownAtMs = c.AtMs; }
+            if (c.Kind == "trespass" && _open.FirstOrDefault(o => o.Kind == "trespass" && o.Settlement == c.Settlement) is { } open)
+            {
+                open.Witnesses = Math.Max(open.Witnesses, c.Witnesses);
+                open.Guards = Math.Max(open.Guards, c.Guards);
+                if (c.Known && !open.Known) { open.Known = true; open.KnownAtMs = c.AtMs; }
+                return true;
+            }
+            _open.Add(c);
+            if (_open.Count > 200) _open.RemoveAt(0);
             return true;
         }
-        _open.Add(c);
-        if (_open.Count > 200) _open.RemoveAt(0);
-        return true;
+    }
+
+    internal void Restore(IEnumerable<Crime> crimes)
+    {
+        lock (_sync)
+        {
+            _open.Clear();
+            foreach (var c in crimes)
+            {
+                if (c.Witnesses <= 0) continue;
+                _open.Add(c);
+                if (_open.Count > 200) _open.RemoveAt(0);
+            }
+        }
     }
 
     /// <summary>
@@ -332,53 +350,67 @@ public sealed class JoinerCrimeRecord
     /// the record kept for a returning player carried them into his next session (a guard stopped him 42 s after he
     /// joined). The host's world decides a trespass from WO-157 on; what it judged before is not trusted. Returns the count.
     /// </summary>
-    public int DropReportedTrespasses() => _open.RemoveAll(c => c.Kind == "trespass" && c.Id != 0);
+    public int DropReportedTrespasses() { lock (_sync) return _open.RemoveAll(c => c.Kind == "trespass" && c.Id != 0); }
 
     /// <summary>Civilian reports reach the guards (after the delay). Returns the crimes that became known now.</summary>
     public List<Crime> Tick(long nowMs, double worldS)
     {
-        var became = new List<Crime>();
-        _open.RemoveAll(c => worldS > 0 && c.AtWorldS > 0 && worldS - c.AtWorldS > Wo139Rules.RowOf(c.Kind).ExpirationDays * 86400.0);
-        foreach (var c in _open)
-            if (!c.Known && nowMs - c.AtMs >= ReportDelayMs) { c.Known = true; c.KnownAtMs = nowMs; became.Add(c); }
-        return became;
+        lock (_sync)
+        {
+            var became = new List<Crime>();
+            _open.RemoveAll(c => worldS > 0 && c.AtWorldS > 0 && worldS - c.AtWorldS > Wo139Rules.RowOf(c.Kind).ExpirationDays * 86400.0);
+            foreach (var c in _open)
+                if (!c.Known && nowMs - c.AtMs >= ReportDelayMs) { c.Known = true; c.KnownAtMs = nowMs; became.Add(c); }
+            return became;
+        }
     }
 
     /// <summary>Open crimes a guard of this settlement knows about.</summary>
-    public List<Crime> KnownIn(string settlement) => _open.Where(c => c.Known && c.Settlement == settlement).ToList();
+    public List<Crime> KnownIn(string settlement) { lock (_sync) return _open.Where(c => c.Known && c.Settlement == settlement).ToList(); }
 
     /// <summary>The guards attack for it now: a fresh violent crime, or an escalation (a resist) under 5 min old.</summary>
     public static bool IsHostile(Crime c, long nowMs) =>
         c.Known && ((Wo139Rules.IsViolent(c.Kind) && !c.Calmed && nowMs - c.KnownAtMs < FreshMs)
                     || (c.Resisted && nowMs - c.ResistedAtMs < EscalationMs));
 
-    public bool AnyHostileKnownIn(string settlement, long nowMs) => _open.Any(c => c.Settlement == settlement && IsHostile(c, nowMs));
+    public bool AnyHostileKnownIn(string settlement, long nowMs) { lock (_sync) return _open.Any(c => c.Settlement == settlement && IsHostile(c, nowMs)); }
 
     /// <summary>Known crimes a guard of this settlement arrests for (a stop): every one that is not hostile now.</summary>
-    public List<Crime> ArrestableIn(string settlement, long nowMs) =>
-        _open.Where(c => c.Known && c.Settlement == settlement && !IsHostile(c, nowMs)).ToList();
+    public List<Crime> ArrestableIn(string settlement, long nowMs)
+    {
+        lock (_sync) return _open.Where(c => c.Known && c.Settlement == settlement && !IsHostile(c, nowMs)).ToList();
+    }
 
     /// <summary>The fine the crime table puts on these crimes (the dialogue's own fine is computed by the game).</summary>
     public static int FineOf(IEnumerable<Crime> crimes) => crimes.Sum(c => Wo139Rules.RowOf(c.Kind).Fine);
 
     public int Clear(string? settlement)
     {
-        if (string.IsNullOrEmpty(settlement)) { int n = _open.Count; _open.Clear(); return n; }
-        return _open.RemoveAll(c => c.Settlement == settlement);
+        lock (_sync)
+        {
+            if (string.IsNullOrEmpty(settlement)) { int n = _open.Count; _open.Clear(); return n; }
+            return _open.RemoveAll(c => c.Settlement == settlement);
+        }
     }
 
     public void MarkResisted(string settlement, long nowMs)
     {
-        foreach (var c in _open) if (c.Settlement == settlement) { c.Resisted = true; c.ResistedAtMs = nowMs; }
+        lock (_sync)
+        {
+            foreach (var c in _open) if (c.Settlement == settlement) { c.Resisted = true; c.ResistedAtMs = nowMs; }
+        }
     }
 
     /// <summary>A fight is over (the joiner went down, or died): the crimes stand, but no longer as fresh
     /// or escalated -- the next guard to see him arrests him. Null = every settlement.</summary>
     public void Calm(string? settlement)
     {
-        foreach (var c in _open)
-            if (string.IsNullOrEmpty(settlement) || c.Settlement == settlement) { c.Calmed = true; c.Resisted = false; }
+        lock (_sync)
+        {
+            foreach (var c in _open)
+                if (string.IsNullOrEmpty(settlement) || c.Settlement == settlement) { c.Calmed = true; c.Resisted = false; }
+        }
     }
 
-    public IEnumerable<string> Settlements => _open.Select(c => c.Settlement).Where(s => s.Length > 0).Distinct(StringComparer.Ordinal);
+    public IReadOnlyList<string> Settlements { get { lock (_sync) return _open.Select(c => c.Settlement).Where(s => s.Length > 0).Distinct(StringComparer.Ordinal).ToArray(); } }
 }
