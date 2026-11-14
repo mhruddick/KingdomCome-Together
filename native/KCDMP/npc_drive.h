@@ -84,6 +84,8 @@ uint8_t on_hold(const uint8_t* body, size_t len);
 uint8_t on_config(const uint8_t* body, size_t len);
 // The agent disconnected: every binding is dropped (no stream will follow).
 void on_pipe_closed();
+// A world save load is starting: drop every bound puppet immediately so no transform write or route touches PostLoadReconstruction.
+void drop_all_for_load();
 // WO-138 (joiner): the host announced a pause and its link is alive -- every
 // bound copy stays where the stream left it: no silence drop while on. Turning
 // it off restarts every stream's silence clock, so the 4 s rule counts from the

@@ -18,6 +18,7 @@ public partial class GameBridge
 
     /// <summary>0 none, 1 the host, 2 a joiner in the host's world and not in a load.</summary>
     private byte Wo218Role() => W137Host ? (byte)1 : (W137Joiner && !Wo136Holding ? (byte)2 : (byte)0);
+    private byte _w218RolePushed = 0xFF;
 
     /// <summary>The native word, and the probe that this DLL serves batches (op 180's caps; an older DLL does not know the op).</summary>
     private async Task Wo218PushNativeAsync()
@@ -25,13 +26,18 @@ public partial class GameBridge
         if (Interlocked.CompareExchange(ref _w218Probing, 1, 0) != 0) return;
         try
         {
-            _combat.BatchOn = W218On("pipe_batch");
-            var body = new byte[5];
-            BitConverter.GetBytes(W218Switch.NativeBits(W218On)).CopyTo(body, 0);
-            body[4] = Wo218Role();
-            var r = await _combat.Wo163Async(Protocol.Wo218OpConfig, body);
-            if (r is { Ok: true } rr) _combat.SetBatchSupported(rr.Payload.Length >= 5 && (rr.Payload[4] & 1) != 0);
-            else if (r is not null) _combat.SetBatchSupported(false);
+            do
+            {
+                byte role = Wo218Role();
+                _w218RolePushed = role;
+                _combat.BatchOn = W218On("pipe_batch");
+                var body = new byte[5];
+                BitConverter.GetBytes(W218Switch.NativeBits(W218On)).CopyTo(body, 0);
+                body[4] = role;
+                var r = await _combat.Wo163Async(Protocol.Wo218OpConfig, body);
+                if (r is { Ok: true } rr) _combat.SetBatchSupported(rr.Payload.Length >= 5 && (rr.Payload[4] & 1) != 0);
+                else if (r is not null) _combat.SetBatchSupported(false);
+            } while (_combat.IsConnected && Wo218Role() != _w218RolePushed);
         }
         catch (Exception ex) { Console.WriteLine($"MP-W218 the native word was not sent: {ex.Message}"); }
         finally { Interlocked.Exchange(ref _w218Probing, 0); }
@@ -57,7 +63,7 @@ public partial class GameBridge
     /// 10 s, the status and the stats every 30 s, the mod told every minute.</summary>
     private void Wo218Tick(long n)
     {
-        if (n % 8 == 6 || (_combat.IsConnected && !_combat.BatchProbed && n % 2 == 0)) _ = Wo218PushNativeAsync();
+        if (n % 8 == 6 || Wo218Role() != _w218RolePushed || (_combat.IsConnected && !_combat.BatchProbed && n % 2 == 0)) _ = Wo218PushNativeAsync();
         if (n % 40 == 17 && _combat.IsConnected) Console.WriteLine("MP-PIPE " + _combat.TakeBatchLine() + Wo218ShedLine());
         if (n % 120 == 29 && (W137Host || W137Joiner)) { _ = Wo218NativeStatusAsync(); Console.WriteLine(Wo218StatsLine()); }
         if (n % 240 == 37) _ = Wo218TellModAsync();

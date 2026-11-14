@@ -113,6 +113,8 @@ int wo216_tests(int* passed) {
     WCHECK(hide_unbound(false, false) && !hide_unbound(true, false) && !hide_unbound(false, true), "an unbound body is hidden; a copy or a figure is not");
     WCHECK(streamable_name(63) && !streamable_name(65) && !streamable_name(0),
            "a name the stream cannot carry (the animal care's horses, 65) is never hidden: it can never be a copy");
+    WCHECK(!load_storm_spawns(0) && !load_storm_spawns(kLoadSpawnStorm - 1) && load_storm_spawns(kLoadSpawnStorm) && load_storm_spawns(250),
+           "a save-load spawn storm (>= 48 entities in one frame) trips B off before PostLoadReconstruction");
 
     if (passed) *passed = g_pass;
     return g_fail;

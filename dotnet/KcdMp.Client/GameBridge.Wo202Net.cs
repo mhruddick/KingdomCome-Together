@@ -209,6 +209,7 @@ public partial class GameBridge
         _w202RejoinAsked = true;
         Console.WriteLine($"MP-W202 rejoin: {_w202RejoinFails} tries failed -- asking the player (F11 try again / F12 leave)");
         SetJoinUi("rejoin-ask", Wo202Rules.RejoinQuestion);
+        if (_combat.IsConnected) _ = _combat.Wo140PromptAsync(true, 600);
         await ExecLuaAsync($"if KCD2MP_W140Prompt then KCD2MP_W140Prompt({Wo202Rules.RejoinPromptId}, \"{EscapeLua(Wo202Rules.RejoinQuestion)}\", 600) end");
     }
 
@@ -216,6 +217,8 @@ public partial class GameBridge
     {
         if (!_w202RejoinAsked) return;
         _w202RejoinAsked = false;
+        if (_combat.IsConnected) _ = _combat.Wo140PromptAsync(false, 0);
+        await ExecLuaAsync($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide({Wo202Rules.RejoinPromptId}) end");
         if (tryAgain)
         {
             Console.WriteLine("MP-W202 rejoin: the player said try again");

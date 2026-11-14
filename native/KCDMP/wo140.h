@@ -70,6 +70,7 @@ constexpr uint8_t kOpStart   = 5;
 constexpr uint8_t kOpStop    = 6;
 constexpr uint8_t kOpPull    = 7;
 constexpr uint8_t kOpClock   = 8;
+constexpr uint8_t kOpPrompt  = 9;
 
 constexpr uint8_t kROk         = 0;
 constexpr uint8_t kRBadRequest = 1;
@@ -78,6 +79,7 @@ constexpr uint8_t kRFailed     = 4;
 
 constexpr uint8_t kFrameHeld  = 1;
 constexpr uint8_t kFrameState = 2;
+constexpr uint8_t kFrameKey   = 4;
 
 // Off the main thread (the patch suspends every other thread).
 void install();

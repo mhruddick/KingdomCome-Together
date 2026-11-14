@@ -65,6 +65,29 @@ int wo140_rules_tests(int* passed) {
     SCHECK(pull_verdict(820000000, 829000, 828000) == Pull::Mismatch, "the calendar went 9000 s back past the agent's reading (a load): refused");
     SCHECK(pull_verdict(830000000, 829900, 828000) == Pull::Pulled, "within the 120 s slack: pulled");
 
+    // foreground F11/F12 fallback while a sleep/rejoin prompt is up
+    {
+        PromptKeys pk;
+        SCHECK(pk.step(1000, true, true, false) == PromptKey::None, "disarmed: nothing");
+        pk.arm(1000, 30);
+        // pre-held F11 at arm time must prime without firing
+        SCHECK(pk.step(1010, true, true, false) == PromptKey::None, "first foreground frame primes pre-held F11");
+        SCHECK(pk.step(1020, true, true, false) == PromptKey::None, "continuing to hold F11 does not fire");
+        SCHECK(pk.step(1030, true, false, false) == PromptKey::None, "releasing F11 resets edge");
+        SCHECK(pk.step(1040, false, true, false) == PromptKey::None, "background window F11 press is ignored");
+        SCHECK(pk.step(1050, true, true, false) == PromptKey::None, "returning to foreground with F11 held re-primes");
+        SCHECK(pk.step(1060, true, false, false) == PromptKey::None, "release after foreground re-prime");
+        SCHECK(pk.step(1070, true, true, false) == PromptKey::Yes && pk.untilMs == 0, "fresh foreground F11 edge fires Yes and disarms");
+        SCHECK(pk.step(1080, true, false, true) == PromptKey::None, "disarmed after firing");
+
+        pk.arm(2000, 5);
+        SCHECK(pk.step(2010, true, false, false) == PromptKey::None, "primed idle");
+        SCHECK(pk.step(2020, true, false, true) == PromptKey::No && pk.untilMs == 0, "fresh foreground F12 edge fires No and disarms");
+
+        pk.arm(3000, 5);
+        SCHECK(pk.step(8001, true, true, false) == PromptKey::None && pk.untilMs == 0, "expired prompt disarms without firing");
+    }
+
     *passed = g_pass;
     return g_fail;
 }

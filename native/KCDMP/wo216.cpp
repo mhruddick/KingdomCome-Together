@@ -64,6 +64,8 @@ double now_s() {
 }
 
 std::atomic<uint8_t> g_role{0};   // op 160's role byte: 0 none, 1 the host, 2 a joiner in the host's world (not during a load)
+bool g_loadTripped = false;       // main thread: tripped by a save-load spawn storm while role==2; cleared when role leaves 2
+void b_deactivate_if_active(const char* why);
 void b_exempt(const char* name, bool on, double forS);
 int b_status(char* out, int n);
 
@@ -103,7 +105,12 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
         std::memcpy(&bits, body + 1, 4);
         if (len == 6) {
             const uint8_t was = g_role.exchange(body[5]);
+            if (body[5] != 2) g_loadTripped = false;
             if (was != body[5]) logf("WO216-CFG role %u -> %u (0 none, 1 the host, 2 a joiner in the host's world)", was, body[5]);
+            if (was == 2 && body[5] != 2) {
+                b_deactivate_if_active("role -> 0 (load or session end)");
+                npcdrive::drop_all_for_load();
+            }
         }
         const uint32_t was = g_bits.exchange(bits);
         if (was != bits || !g_configured.exchange(true))
@@ -562,12 +569,16 @@ void b_actions() {
 
 // B going off (the switch, the session's end, a load): the bodies B hid are shown again (their pause stays: the bind-time rule's)
 void b_stop(const char* why) {
+    g_spawnWatch.store(false);
+    g_layerWatch.store(false);
+    { std::lock_guard<std::mutex> l(g_spawnMu); g_spawned.clear(); }
+    { std::lock_guard<std::mutex> l(g_layerMu); g_layersOn.clear(); }
+    g_layerBorn.clear();
+    g_layerBurstUntil = -1e9;
     uint32_t shown = 0;
     for (auto& kv : g_bodies) if (kv.second.hidden) { if (b_hide(kv.first, false)) ++shown; kv.second.hidden = false; }
     g_bodies.clear();
     g_pauseQ.clear(); g_hideQ.clear(); g_showQ.clear();
-    g_spawnWatch.store(false);
-    g_layerWatch.store(false);
     g_swept = false;
     g_cen = Census{};
     g_npcList.clear();
@@ -575,12 +586,18 @@ void b_stop(const char* why) {
     logf("WO216-BRAINS off (%s): %u hidden bodies shown again", why, shown);
 }
 
+void b_deactivate_if_active(const char* why) {
+    if (g_active) { g_active = false; b_stop(why); }
+}
+
 void b_tick(double now) {
     const bool want = g_role.load() == 2;   // the census measures on every joiner in the host's world (the twin too)
     if (!want) {
-        if (g_active) { g_active = false; b_stop("not a joiner in the host's world now"); }
+        g_loadTripped = false;
+        b_deactivate_if_active("not a joiner in the host's world now");
         return;
     }
+    if (g_loadTripped) return;
     const bool act = on(kBitNoBrains);
     if (g_active && g_act && !act) { b_stop("the switch"); g_active = false; }
     g_act = act;
@@ -598,6 +615,15 @@ void b_tick(double now) {
         g_spawnWatch.store(true);
         b_hook_layer();
         g_layerWatch.store(true);
+    }
+    size_t pendingSpawns = 0;
+    { std::lock_guard<std::mutex> l(g_spawnMu); pendingSpawns = g_spawned.size(); }
+    if (wo216rules::load_storm_spawns(pendingSpawns)) {
+        g_loadTripped = true;
+        b_deactivate_if_active("engine save-load spawn storm");
+        npcdrive::drop_all_for_load();
+        logf("WO216-BRAINS save-load storm (%zu spawns in one frame while role=2): B disarmed and puppets dropped before PostLoadReconstruction", pendingSpawns);
+        return;
     }
     b_spawns(now);
     bool layerNow = false;

@@ -71,6 +71,14 @@ public static class KeybindPak
         ("ui_and_dialog_wheel_up", "kcd2mp_listen_wheel_up"), ("ui_and_dialog_wheel_down", "kcd2mp_listen_wheel_down"),
     };
 
+    /// <summary>Non-exclusive overlay actionmap for F11/F12 co-op prompts (active even while seated on a bed, mounted, or in menus).</summary>
+    public const string PromptMap = "kcd2mp_prompt";
+    public static readonly string[] PromptActions = { "kcd2mp_prompt_yes", "kcd2mp_prompt_no" };
+    public static readonly (string Superaction, string Action)[] PromptSuperactions =
+    {
+        ("kcd2mp_dice_bank", "kcd2mp_prompt_yes"), ("kcd2mp_dice_yield", "kcd2mp_prompt_no"),
+    };
+
     /// <summary>WO-178 0.d: the quicksave key's action (its key is the player's choice: settings.json QuickSaveKey, Wo178Rules).</summary>
     public const string QuickSaveAction = "kcd2mp_quicksave";
 
@@ -243,6 +251,24 @@ public static class KeybindPak
     public static string ListenLine(string action, string superaction) =>
         $"\t\t<action name=\"{action}\" map=\"dialog\" /><!-- KCD2MP (WO-204 III.3): the partner's options, on the game's own {superaction} keys -->\r\n" +
         $"\t\t<action name=\"{action}\" map=\"{ListenMap}\" /><!-- KCD2MP (WO-207): the same, in the listener's own map -->\r\n";
+
+    /// <summary>One superaction line mapping an F11/F12 superaction into the non-exclusive prompt overlay actionmap.</summary>
+    public static string PromptLine(string action) =>
+        $"\t\t<action name=\"{action}\" map=\"{PromptMap}\" /><!-- KCD2MP: F11/F12 while a co-op prompt is on screen -->\r\n";
+
+    /// <summary>Inserts the non-exclusive <see cref="PromptMap"/> actionmap before the end of defaultProfile.xml.</summary>
+    public static string? MergePromptMap(string profile, string body, out string why)
+    {
+        if (!Wellformed(profile, out why)) { why = "defaultProfile.xml does not parse: " + why; return null; }
+        if (profile.Contains("\"" + PromptMap + "\"", StringComparison.Ordinal)) { why = "defaultProfile.xml already names " + PromptMap; return null; }
+        int close = profile.LastIndexOf("</profile>", StringComparison.Ordinal);
+        if (close < 0) { why = "no profile root"; return null; }
+        string? merged = InsertChecked(profile, close, body, ProfileEntry, PromptActions, out why);
+        if (merged is null) return null;
+        if (Regex.Matches(merged, "<actionmap\\s+name\\s*=\\s*\"" + PromptMap + "\"").Count != 1)
+        { why = ProfileEntry + ": the prompt map not there once after the merge"; return null; }
+        return merged;
+    }
 
     private static string? InsertAtLineStart(string vanilla, int at, string body, string entry, out string why) =>
         InsertChecked(vanilla, at, body, entry, Actions, out why);
@@ -497,6 +523,17 @@ public static class KeybindPak
             if (s is null) return new Outcome(false, "none", why, source);
             if (BoundKey(s, MenuToggleAction) != menuKey) return new Outcome(false, "none", "the menu key did not land in " + SuperactionsEntry, source);
             if (BoundKey(s, QuickSaveAction) != qsKey) return new Outcome(false, "none", "the quicksave key did not land in " + SuperactionsEntry, source);
+            string? pp = MergePromptMap(p, PatchBody(EmbeddedPatch("defaultProfile.prompt.xml")), out _);
+            if (pp is not null)
+            {
+                string? sp = s;
+                foreach (var (sup, act) in PromptSuperactions)
+                {
+                    sp = sp is null ? null : MergeIntoSuperaction(sp, sup, PromptLine(act), [act], out _);
+                    if (sp is null) break;
+                }
+                if (sp is not null) { p = pp; s = sp; }
+            }
             // WO-203B: the listener's cancel, in the game's own dialog actionmap and Back superaction -- both or neither; a game file
             // without that shape keeps every other key (the listener then leaves through the ESC menu) and the outcome says so
             string? listenNote = null;

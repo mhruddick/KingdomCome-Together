@@ -867,6 +867,21 @@ KCD2MP.diceTurn = nil          -- {text} -- optional glanceable hint; the launch
 local INVITE_TIMEOUT   = 30    -- matches the relay's invite expiry
 local MSG_TIMEOUT      = 5
 
+-- Enables the non-exclusive overlay actionmap ("kcd2mp_prompt", priority="overlays") only while a co-op
+-- F11/F12 prompt is on screen, so F11/F12 reach handleAction even when "interaction" is suppressed by an
+-- exclusive gameplay/UI map (sitting_bed, sitting_chair, horse_mounted, apse/inventory/stash, dialog).
+function KCD2MP_SyncPromptMap()
+    local want = (KCD2MP.invite ~= nil)
+        or (KCD2MP.w140 ~= nil and KCD2MP.w140.prompt ~= nil)
+        or (KCD2MP.quest ~= nil and (KCD2MP.quest.prompt ~= nil
+            or (KCD2MP_QuestWaitingVisible ~= nil and KCD2MP_QuestWaitingVisible() == true)))
+    if want == (KCD2MP._promptMapOn == true) then return end
+    KCD2MP._promptMapOn = want
+    if ActionMapManager and ActionMapManager.EnableActionMap then
+        pcall(ActionMapManager.EnableActionMap, "kcd2mp_prompt", want)
+    end
+end
+
 -- Called by the agent when a peer invites this player. wager (WO-33) is
 -- groschen at stake, 0 for none -- shown in the prompt so the player knows
 -- what's riding on it before answering, and checked against player.inventory:GetMoney()
@@ -874,12 +889,14 @@ local MSG_TIMEOUT      = 5
 function KCD2MP_ShowInvite(sid, who, kind, wager)
     KCD2MP.invite = { sid = sid, who = tostring(who), kind = tostring(kind),
                        wager = tonumber(wager) or 0, shownAt = os.clock() }
+    KCD2MP_SyncPromptMap()
     mp_log("INVITE from " .. tostring(who) .. " (" .. tostring(kind) .. ") session " .. tostring(sid)
         .. " wager=" .. tostring(KCD2MP.invite.wager))
 end
 
 function KCD2MP_HideInvite()
     KCD2MP.invite = nil
+    KCD2MP_SyncPromptMap()
 end
 
 -- Transient feedback: "Declined", "PeerDisconnected", and so on.
@@ -1177,6 +1194,7 @@ function KCD2MP_DrawInteractionUI()
     if KCD2MP_JoinDrawUI then pcall(KCD2MP_JoinDrawUI) end   -- WO-123: "<partner> is joining..."
     if KCD2MP_Wo114DrawUI then pcall(KCD2MP_Wo114DrawUI) end -- WO-114: "Bringing you back to your host in N..."
     if KCD2MP_W140DrawUI then pcall(KCD2MP_W140DrawUI) end   -- WO-140: "Waiting for other players...", the sleep prompt, the own-world line
+    if KCD2MP_SyncPromptMap then pcall(KCD2MP_SyncPromptMap) end
     if KCD2MP_W154MenuBackstop then pcall(KCD2MP_W154MenuBackstop) end   -- WO-154: a queued line; fast travel back if the agent went silent
     mp_screen_frame_end()   -- WO-98 Phase 6: rows that vanished this frame log text=""
 end
@@ -6969,6 +6987,12 @@ function KCD2MP_W136Hold(on, ttlS, why)
             w.hold, w.holdSince, w.holdWhy = true, now, tostring(why or "?")
             w.holdUntil = 0   -- a new hold: an old hold's deadline never carries over
             w.stats.holds = w.stats.holds + 1
+            for pname, p in pairs(KCD2MP.npcPuppets or {}) do
+                p.lastWroteX, p.lastWroteY, p.lastWroteZ = nil, nil, nil
+                if KCD2MP_NpcNativeSync then KCD2MP_NpcNativeSync(pname, p, nil, false, "w136-load") end
+                p.nativeRetryAt = nil
+            end
+            if KCD2MP.w160 and KCD2MP.w160.parkedPeerHorses then KCD2MP.w160.parkedPeerHorses = {} end
             mp_log(string.format("WO136-HOLD on why=%s ttl_s=%d -- no NPC is paused, puppeted, bound, parked or written until the world has loaded",
                 w.holdWhy, ttl))
         end
@@ -16429,12 +16453,14 @@ KCD2MP._itemSeen     = {}   -- tostring(entity.id) -> true, pickables accounted 
 KCD2MP._itemInvCounts = nil -- classGuidStr -> total amount, from last tick
 
 local function mp_item_inv_counts()
+    if not player or not player.inventory then return nil end
     local counts = nil
     pcall(function()
         local t = player.inventory:GetInventoryTable()
+        if not t then return end
         local c = {}
         for i = 1, #t do
-            local it = ItemManager.GetItem(t[i])
+            local it = ItemManager and ItemManager.GetItem and ItemManager.GetItem(t[i]) or nil
             if it and it.class then c[it.class] = (c[it.class] or 0) + (it.amount or 1) end
         end
         counts = c
@@ -19234,15 +19260,21 @@ end
 
 function KCD2MP_W140Prompt(id, text, secs)
     local w = KCD2MP.w140
-    w.prompt = { id = tonumber(id) or 0, text = tostring(text), deadline = os.clock() + (tonumber(secs) or 30) }
+    local rawId = type(id) == "string" and id or string.format("%.0f", tonumber(id) or 0)
+    w.prompt = { id = tonumber(id) or 0, rawId = rawId, text = tostring(text), deadline = os.clock() + (tonumber(secs) or 30) }
     w.stats.prompts = w.stats.prompts + 1
-    mp_log(string.format('WO140-PROMPT %.0f "%s" (F11 yes / F12 no)', w.prompt.id, w.prompt.text))
+    if KCD2MP_SyncPromptMap then KCD2MP_SyncPromptMap() end
+    mp_log(string.format('WO140-PROMPT %s "%s" (F11 yes / F12 no)', rawId, w.prompt.text))
     KCD2MP_ShowNativeToast(w.prompt.text)
 end
 
 function KCD2MP_W140PromptHide(id)
     local w = KCD2MP.w140
-    if w.prompt and (id == nil or w.prompt.id == tonumber(id)) then w.prompt = nil end
+    local wantId = id ~= nil and (type(id) == "string" and id or string.format("%.0f", tonumber(id) or 0)) or nil
+    if w.prompt and (wantId == nil or (w.prompt.rawId or string.format("%.0f", w.prompt.id or 0)) == wantId) then
+        w.prompt = nil
+        if KCD2MP_SyncPromptMap then KCD2MP_SyncPromptMap() end
+    end
 end
 
 -- F11 / F12 / mp_sleep_yes / mp_sleep_no. True = a prompt took it.
@@ -19254,9 +19286,11 @@ function KCD2MP_W140Answer(yes)
         return false
     end
     w.prompt = nil
+    if KCD2MP_SyncPromptMap then KCD2MP_SyncPromptMap() end
     w.stats.answers = w.stats.answers + 1
-    mp_log(string.format("WO140-ANSWER %.0f %s", p.id, yes and "yes" or "no"))
-    KCD2MP_EmitEvent("w140_answer", string.format("%.0f %s", p.id, yes and "yes" or "no"))
+    local rawId = p.rawId or string.format("%.0f", p.id or 0)
+    mp_log(string.format("WO140-ANSWER %s %s", rawId, yes and "yes" or "no"))
+    KCD2MP_EmitEvent("w140_answer", string.format("%s %s", rawId, yes and "yes" or "no"))
     return true
 end
 
@@ -19322,6 +19356,7 @@ function KCD2MP_W140Backstop()
     w.aliveAt = nil
     w.on = false
     w.prompt = nil
+    if KCD2MP_SyncPromptMap then KCD2MP_SyncPromptMap() end
     if w.held then KCD2MP_W140Drop(KCD2MP_W140_NOT_READY, false) end
     w.waiting = nil
     w.sep = nil
@@ -19336,6 +19371,7 @@ function KCD2MP_W140DrawUI()
         local left = math.ceil(p.deadline - os.clock())
         if left < 0 then
             w.prompt = nil
+            if KCD2MP_SyncPromptMap then KCD2MP_SyncPromptMap() end
         else
             mp_draw_row("w140_prompt", 10, 236, p.text .. "  (" .. left .. "s)", 2, p.text)
             mp_draw_row("w140_prompt_keys", 10, 262, "F11 yes / F12 no  (or mp_sleep_yes / mp_sleep_no)", 1.6)
@@ -19417,7 +19453,7 @@ function KCD2MP_W140Status()
     local s = w.stats
     mp_log(string.format("WO140-STATUS session=%s fresh=%s vote=%s wrapped=%s held=%s waiting=%s prompt=%s separate=%s | held=%d go=%d dropped=%d prompts=%d answers=%d sep_said=%d rest_saves=%d",
         tostring(w.on), tostring(KCD2MP_W140Fresh()), w.vote and "on" or "off", tostring(w.wrapper ~= nil and BedTrigger ~= nil and BedTrigger.ReportUse == w.wrapper),
-        w.held and tostring(w.held.name) or "-", w.waiting and "yes" or "no", w.prompt and string.format("%.0f", w.prompt.id) or "-", w.sep and "yes" or "no",
+        w.held and tostring(w.held.name) or "-", w.waiting and "yes" or "no", w.prompt and tostring(w.prompt.rawId or string.format("%.0f", w.prompt.id or 0)) or "-", w.sep and "yes" or "no",
         s.held, s.go, s.dropped, s.prompts, s.answers, s.sepSaid, s.restSaves))
     KCD2MP_EmitEvent("w140_status", "")
 end
@@ -27065,6 +27101,7 @@ do
     end
 
     function KCD2MP_M3HostTick()
+        if KCD2MP_W136Held and KCD2MP_W136Held() then return false end
         if w.saveTackStripped and (os.clock() - (w.saveTackStrippedAt or 0)) >= 15.0 then
             mp_log("WO160-HORSE saveTackStripped safety timeout (15 s) -- restoring peer horse tack")
             KCD2MP_M3AfterHostSave()
@@ -30936,9 +30973,9 @@ ACTS.COMBAT_BLOCK_ACTIONS = {
 -- never consumed by the dice-board block below, so they fall through here
 -- unclaimed. mp_accept / mp_decline remain the documented console fallback.
 ACTS.ACCEPT_ACTIONS  = { ["dialog_answer1"] = true, ["confirm"] = true, ["ui_accept"] = true,
-                           ["kcd2mp_dice_bank"] = true }
+                           ["kcd2mp_dice_bank"] = true, ["kcd2mp_prompt_yes"] = true }
 ACTS.DECLINE_ACTIONS = { ["dialog_answer2"] = true, ["cancel"] = true, ["ui_cancel"] = true,
-                           ["kcd2mp_dice_yield"] = true }
+                           ["kcd2mp_dice_yield"] = true, ["kcd2mp_prompt_no"] = true }
 
 -- Dice-invite keybind (WO-5, real bind added WO-33). dialog_answer3/4 are the
 -- same kind of unverified guess as above, kept harmlessly. The real primary
@@ -32373,10 +32410,12 @@ local function handleAction(action, activation, value)
     -- WO-98 Phase 6: every F11/F12 press the hook actually receives, with the
     -- state it landed in. A prompt window with a reported press and no MP-KEY
     -- line means the input never reached Lua (cutscene input context).
-    if activation == "press" and (action == "kcd2mp_dice_bank" or action == "kcd2mp_dice_yield") and KCD2MP.quest then
+    if activation == "press" and (action == "kcd2mp_dice_bank" or action == "kcd2mp_dice_yield"
+       or action == "kcd2mp_prompt_yes" or action == "kcd2mp_prompt_no") and KCD2MP.quest then
         KCD2MP._stats.keys = KCD2MP._stats.keys + 1
-        mp_log(string.format("MP-KEY action=%s prompt=%d pending=%d waiting=%d cutscene=%d dice=%d",
-            tostring(action), KCD2MP.quest.prompt and 1 or 0, KCD2MP.quest.pendingPrompt and 1 or 0,
+        mp_log(string.format("MP-KEY action=%s prompt=%d sleep_prompt=%d pending=%d waiting=%d cutscene=%d dice=%d",
+            tostring(action), KCD2MP.quest.prompt and 1 or 0, (KCD2MP.w140 and KCD2MP.w140.prompt) and 1 or 0,
+            KCD2MP.quest.pendingPrompt and 1 or 0,
             (KCD2MP_QuestWaitingVisible and KCD2MP_QuestWaitingVisible()) and 1 or 0,
             KCD2MP.cutsceneActive and 1 or 0, (KCD2MP.dice and KCD2MP.dice.open) and 1 or 0))
     end
@@ -36444,6 +36483,7 @@ do
     end
     -- the agent, every 5 s on a joiner: the horse this player rides (or owns as companion) stays exempt
     function KCD2MP_W216Tick()
+        if KCD2MP_W136Held and KCD2MP_W136Held() then return false end
         if not KCD2MP_W216JoinerBrainsOff() then return false end
         local m = KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() or nil
         if not m and KCD2MP._mountedHorseName then m = KCD2MP._mountedHorseName end

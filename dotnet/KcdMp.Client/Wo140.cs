@@ -169,13 +169,14 @@ public static class Wo140Rules
 /// <summary>WO-140: one 0xA5 frame of the DLL's sleep half (native wo140.h).</summary>
 public readonly record struct Wo140Frame(byte Kind, byte Edge, byte Id, float Hours, byte State)
 {
-    public const byte KindHeld = 1, KindState = 2;
+    public const byte KindHeld = 1, KindState = 2, KindKey = 4;
     public const byte EdgeNone = 0, EdgeOpened = 1, EdgeBegan = 2, EdgeBackedOut = 3, EdgeEnded = 4;
 
     public static bool TryParse(ReadOnlySpan<byte> b, out Wo140Frame f)
     {
         f = default;
         if (b.Length == 2 && b[0] == KindHeld) { f = new Wo140Frame(KindHeld, 0, b[1], 0, 0); return true; }
+        if (b.Length == 2 && b[0] == KindKey && b[1] <= 1) { f = new Wo140Frame(KindKey, 0, b[1], 0, 0); return true; }
         if (b.Length == 8 && b[0] == KindState && b[1] <= EdgeEnded)
         {
             f = new Wo140Frame(KindState, b[1], b[2], System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(b[3..]), b[7]);

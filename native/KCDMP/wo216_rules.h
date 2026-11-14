@@ -192,5 +192,10 @@ inline bool hide_unbound(bool bound, bool figure) { return !bound && !figure; }
 // is longer can never be a copy -- it stays shown here (suspended, frozen), never hidden while the host shows its own
 constexpr size_t kStreamNameMax = 63;
 inline bool streamable_name(size_t nameLen) { return nameLen > 0 && nameLen <= kStreamNameMax; }
+// Save-load storm guard: CGameSerialize::LoadEntities spawns hundreds of entities in one frame before a pause-menu load's kcd.log line
+// reaches the agent. Pausing any body during PostLoadReconstruction stalls the loading screen ~55 s ("Loading screen timeouted while
+// still in post load reconstruction!"), so a single-frame spawn storm trips B off immediately until role cycles through 0 -> 2.
+constexpr size_t kLoadSpawnStorm = 48;
+inline bool load_storm_spawns(size_t spawnsInFrame) { return spawnsInFrame >= kLoadSpawnStorm; }
 
 } // namespace kcdmp::wo216rules

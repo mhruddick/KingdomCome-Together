@@ -101,4 +101,30 @@ inline Pull pull_verdict(int64_t curMs, uint32_t expectSec, uint32_t targetSec, 
     return Pull::Pulled;
 }
 
+// Foreground F11/F12 edge fallback while a sleep/rejoin prompt is on screen (catches F11/F12 even when kdcmp_keys.pak is absent).
+enum class PromptKey : uint8_t { None = 0, Yes = 1, No = 2 };
+struct PromptKeys {
+    uint64_t untilMs = 0;
+    bool primed = false;
+    bool f11Was = false;
+    bool f12Was = false;
+    void arm(uint64_t nowMs, uint32_t secs) {
+        untilMs = secs ? nowMs + static_cast<uint64_t>(secs) * 1000ULL : 0;
+        primed = false;
+        f11Was = f12Was = false;
+    }
+    void disarm() { untilMs = 0; primed = false; f11Was = f12Was = false; }
+    PromptKey step(uint64_t nowMs, bool foreground, bool f11Down, bool f12Down) {
+        if (!untilMs) return PromptKey::None;
+        if (nowMs > untilMs) { disarm(); return PromptKey::None; }
+        if (!foreground) { primed = false; f11Was = f12Was = false; return PromptKey::None; }
+        if (!primed) { primed = true; f11Was = f11Down; f12Was = f12Down; return PromptKey::None; }
+        PromptKey k = PromptKey::None;
+        if (f11Down && !f11Was) { disarm(); k = PromptKey::Yes; }
+        else if (f12Down && !f12Was) { disarm(); k = PromptKey::No; }
+        else { f11Was = f11Down; f12Was = f12Down; }
+        return k;
+    }
+};
+
 } // namespace kcdmp::wo140rules

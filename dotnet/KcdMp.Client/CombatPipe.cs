@@ -1956,6 +1956,16 @@ public sealed partial class CombatPipe : IAsyncDisposable
             : null;
     }
 
+    /// <summary>op 9: arms/disarms the native foreground F11/F12 key fallback while a sleep or rejoin prompt is on screen.</summary>
+    public async Task<bool?> Wo140PromptAsync(bool on, ushort secs = 35, CancellationToken ct = default)
+    {
+        var a = new byte[3];
+        a[0] = (byte)(on ? 1 : 0);
+        BinaryPrimitives.WriteUInt16LittleEndian(a.AsSpan(1), secs);
+        var r = await Wo140Async(9, a, ct);
+        return r is { Ok: true, Payload.Length: >= 1 } x ? x.Payload[0] == 1 : null;
+    }
+
     // ---- WO-137 (native wo137.h) ---------------------------------------------
 
     /// <summary>One WO-137 op: (ok, reason, payload after the 4-byte head), or null when the DLL did not answer.</summary>

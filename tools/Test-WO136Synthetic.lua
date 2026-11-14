@@ -148,6 +148,18 @@ do -- (a) the load hold: queue the newest per NPC, replay once, expire
     clearLog(); KCD2MP_W131Tick(true, true)
     check("a: the copy guard does nothing under the hold", logCount("WO131") == 0)
     KCD2MP_W136Hold(false, 0, "done")
+    -- In-world rejoin hold unbinds live puppets immediately, clears parked peer horses, and gates M3/W216 ticks
+    KCD2MP.npcPuppets["tsem_man_11"] = { nativeOwned = true, nativeSent = true, lastWroteX = 1 }
+    if KCD2MP.w160 then KCD2MP.w160.parkedPeerHorses = { tsem_horse_1 = { peer = "1", at = 99 } } end
+    clearLog()
+    KCD2MP_W136Hold(true, 30, "agent-join")
+    check("a: hold immediately unbinds native puppets before load",
+        KCD2MP.npcPuppets["tsem_man_11"].nativeOwned == false and emits("npc_native") == 1)
+    check("a: hold clears parkedPeerHorses and gates M3HostTick + W216Tick",
+        next((KCD2MP.w160 and KCD2MP.w160.parkedPeerHorses) or {}) == nil
+        and KCD2MP_M3HostTick() == false and KCD2MP_W216Tick() == false)
+    KCD2MP.npcPuppets["tsem_man_11"] = nil
+    KCD2MP_W136Hold(false, 0, "done")
     check("a: no Lua errors", #ERRS == 0, ERRS[1])
 end
 

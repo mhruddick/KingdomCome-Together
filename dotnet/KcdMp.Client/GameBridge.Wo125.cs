@@ -1004,6 +1004,7 @@ public partial class GameBridge
                 return false;
             }
             _ownLoadExpected = true;
+            await Wo136PrepareBeforeLoadAsync("exit-to-menu");
             await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({pl}, \"{name}\", \"exit-to-menu\") end");
             _ = Task.Run(async () =>
             {

@@ -104,6 +104,7 @@ public partial class GameBridge
         _w140AcceptedJoiners.Clear();
         _w140LocalSkipping = false;
         _w140SaveAfter = false;
+        try { await _combat.Wo140PromptAsync(false, 0); } catch { }
         try { await _combat.Wo140ConfigAsync(false); } catch { }
         _w140CfgKey = -1;
         try { await ExecLuaAsync("if KCD2MP_W140Session then KCD2MP_W140Session(false) end"); } catch { }
@@ -324,8 +325,9 @@ public partial class GameBridge
         }
         if (_w140LocalSkipping) { await Wo140AnswerLocalAsync(id, "busy", "this game's own skip is running", asker, kind, host ? (byte)0xFF : Protocol.JoinTargetHost); return; }
         lock (_w140Lock) _w140Prompt = (id, asker, kind, host ? (byte)0xFF : Protocol.JoinTargetHost, Environment.TickCount64 + Protocol.SleepVoteTimeoutSeconds * 1000L);
+        if (_combat.IsConnected) _ = _combat.Wo140PromptAsync(true, (ushort)(Protocol.SleepVoteTimeoutSeconds + 2));
         await ExecLuaAsync(FormattableString.Invariant(
-            $"if KCD2MP_W140Prompt then KCD2MP_W140Prompt({id}, \"{EscapeLua(Wo140Rules.PromptText(W140Name(asker), kind))}\", {Protocol.SleepVoteTimeoutSeconds}) end"));
+            $"if KCD2MP_W140Prompt then KCD2MP_W140Prompt(\"{id}\", \"{EscapeLua(Wo140Rules.PromptText(W140Name(asker), kind))}\", {Protocol.SleepVoteTimeoutSeconds}) end"));
     }
 
     /// <summary>This player's answer to a prompt (F11 / F12, mp_sleep_yes / mp_sleep_no, or the timeout).</summary>
@@ -340,7 +342,8 @@ public partial class GameBridge
             else return;
         }
         var pr = p!.Value;
-        await ExecLuaAsync($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide({id}) end");
+        if (_combat.IsConnected && !_w202RejoinAsked) _ = _combat.Wo140PromptAsync(false, 0);
+        await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide(\"{id}\") end"));
         Console.WriteLine($"MP-W140 this player: {answer.ToUpperInvariant()} to {W140Name(pr.Asker)}'s {pr.Kind} (vote 0x{id:X8}; {why})");
         if (answer == "yes")
             lock (_w140Lock) _w140Accepted = (id, pr.Asker, pr.Kind, Environment.TickCount64 + W140AcceptWaitMs);
@@ -401,7 +404,11 @@ public partial class GameBridge
             foreach (var (j, vid) in _w140AcceptedJoiners.ToArray()) if (vid == v.Id) _w140AcceptedJoiners.TryRemove(j, out _);
             (uint Id, byte Asker, string Kind, byte ReplyTo, long DeadlineMs)? pr;
             lock (_w140Lock) { pr = _w140Prompt; if (pr is { } q && q.Id == v.Id) _w140Prompt = null; }
-            if (pr is { } q2 && q2.Id == v.Id) await ExecLuaAsync($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide({v.Id}) end");
+            if (pr is { } q2 && q2.Id == v.Id)
+            {
+                if (_combat.IsConnected && !_w202RejoinAsked) _ = _combat.Wo140PromptAsync(false, 0);
+                await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide(\"{v.Id}\") end"));
+            }
         }
     }
 
@@ -613,7 +620,11 @@ public partial class GameBridge
             if (_w140Accepted is { } a && a.Id == id) _w140Accepted = null;
             pr = _w140Prompt; if (pr is { } p && p.Id == id) _w140Prompt = null;
         }
-        if (pr is { } p2 && p2.Id == id) await ExecLuaAsync($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide({id}) end");
+        if (pr is { } p2 && p2.Id == id)
+        {
+            if (_combat.IsConnected && !_w202RejoinAsked) _ = _combat.Wo140PromptAsync(false, 0);
+            await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide(\"{id}\") end"));
+        }
         Console.WriteLine($"MP-W140 {W140Name(asker)}'s vote 0x{id:X8} is over ({why}) -- nothing happens here");
     }
 
@@ -621,6 +632,20 @@ public partial class GameBridge
 
     private async Task Wo140OnFrameFromDllAsync(Wo140Frame f)
     {
+        if (f.Kind == Wo140Frame.KindKey)
+        {
+            bool yes = f.Id == 1;
+            if (_w202RejoinAsked)
+            {
+                await Wo202RejoinAnsweredAsync(yes);
+                return;
+            }
+            (uint Id, byte Asker, string Kind, byte ReplyTo, long DeadlineMs)? p;
+            lock (_w140Lock) p = _w140Prompt;
+            if (p is { } cur)
+                await Wo140AnswerLocalAsync(cur.Id, yes ? "yes" : "no", "this player's key (native)");
+            return;
+        }
         if (f.Kind == Wo140Frame.KindHeld)
         {
             Interlocked.Increment(ref _w140HeldNative);
@@ -725,7 +750,11 @@ public partial class GameBridge
                 if (a == "yes" && who != Wo140Rules.LocalMember) await Wo140SendAsync(who, Protocol.SleepCancel, col.Id, Wo140Text.Cancel("backed-out", col.Asker));
             (uint Id, byte Asker, string Kind, byte ReplyTo, long DeadlineMs)? cpr;
             lock (_w140Lock) { cpr = _w140Prompt; if (cpr is { } cq && cq.Id == col.Id) _w140Prompt = null; }
-            if (cpr is { } cq2 && cq2.Id == col.Id) await ExecLuaAsync($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide({col.Id}) end");
+            if (cpr is { } cq2 && cq2.Id == col.Id)
+            {
+                if (_combat.IsConnected && !_w202RejoinAsked) _ = _combat.Wo140PromptAsync(false, 0);
+                await ExecLuaAsync(FormattableString.Invariant($"if KCD2MP_W140PromptHide then KCD2MP_W140PromptHide(\"{col.Id}\") end"));
+            }
         }
     }
 
