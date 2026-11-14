@@ -52,6 +52,38 @@ public static partial class WhsSave
 
     internal static string PathText(ushort[] tags) => string.Join("/", tags.Select(t => t.ToString("x4")));
 
+    /// <summary>Modular save/block splice hook so independent subsystems (horses, reputation, etc.) compose cleanly on HenryParts and SoulList.</summary>
+    public interface ISaveExtension
+    {
+        int Order { get; }
+        void Extract(byte[] raw, HenryParts parts, HashSet<string> henryOwnedItemIds) { }
+        void CollectHostPrivateItemIds(byte[] hostRaw, HashSet<string> hostPrivateItemIds) { }
+        byte[] TransformHenryRecord(byte[] hostRaw, byte[] hostHenryNodeBytes, byte[] builtHenryNodeBytes,
+                                    HenryParts parts, Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep) => builtHenryNodeBytes;
+        byte[] TransformSoulRecord(string soulGuid, byte[] hostRaw, byte[] currentSoulNodeBytes,
+                                   HenryParts parts, Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep) => currentSoulNodeBytes;
+        void AddBlockJobs(byte[] hostRaw, HenryParts parts, Dictionary<string, string> qclasses,
+                          QuestItemMode mode, SpliceReport rep, List<(ushort[] Tags, byte[] Payload)> jobs) { }
+        void AddSplicedPaths(byte[] hostRaw, HenryParts parts, HashSet<string> splicedPaths) { }
+        void CheckSpliced(byte[] hostRaw, byte[] outRaw, HenryParts parts, Dictionary<string, string> qclasses,
+                          QuestItemMode mode, List<string> fails) { }
+    }
+
+    private static readonly object ExtensionLock = new();
+    private static ISaveExtension[] ExtensionsSnapshot = [];
+
+    public static void RegisterExtension(ISaveExtension ext)
+    {
+        ArgumentNullException.ThrowIfNull(ext);
+        lock (ExtensionLock)
+        {
+            if (ExtensionsSnapshot.Any(x => x.GetType() == ext.GetType())) return;
+            ExtensionsSnapshot = ExtensionsSnapshot.Append(ext).OrderBy(x => x.Order).ToArray();
+        }
+    }
+
+    internal static ReadOnlySpan<ISaveExtension> RegisteredExtensions => ExtensionsSnapshot;
+
     /// <summary>Lift the joiner side out of a save's stream.</summary>
     public static HenryParts PartsFromStream(byte[] raw, string build, string origin)
     {
@@ -61,6 +93,7 @@ public static partial class WhsSave
         items.UnionWith(PersonalStashItemSet(ps));
         var p = new HenryParts { Record = rec, Build = build, Seed = ReadSeed(raw), Origin = origin };
         p.Extensions[PersonalStashExtensionKey] = ps;
+        foreach (var ext in RegisteredExtensions) ext.Extract(raw, p, items);
         for (int i = 0; i < SideBlocks.Length; i++) p.Side[i] = Payload(raw, PathNodes(raw, SideBlocks[i])[^1]);
         foreach (var (entry, key) in KeyEntries(raw).Entries)
             if (items.Contains(key)) p.KeyEntries.Add(entry);

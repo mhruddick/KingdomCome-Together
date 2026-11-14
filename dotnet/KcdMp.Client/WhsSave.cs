@@ -713,24 +713,29 @@ public static partial class WhsSave
         else rec = AppendField(rec, 0x12FF, Payload(hrec, hr));
 
         // quest-class items: the joiner's always go (they belong to the joiner's world)
-        if (!HasItemList(rec)) return rec;   // no inventory record (WO-125: the engine-default Henry) or no item list (WO-132)
-        var (ch, items) = InventoryItems(rec);
-        var eq = Equipped(rec);
-        var drop = items.Where(it => qclasses.ContainsKey(it.Cls)).ToList();
-        foreach (var d in drop)
-            if (eq.Contains(d.Inst)) throw new InvalidDataException($"joiner quest item {d.Inst} ({qclasses[d.Cls]}) is equipped; refusing");
-        var lst = ch[^1];
-        var body = new List<byte>(Payload(rec, lst));
-        foreach (var d in drop.OrderByDescending(x => x.Node.Off))
-            body.RemoveRange(d.Node.Off - lst.PayloadOff, 6 + d.Node.Len);
-        rep.QuestItemsRemoved = drop.Select(d => qclasses[d.Cls]).ToList();
-        if (mode == QuestItemMode.Host)
+        if (HasItemList(rec))
         {
-            var hitems = HasItemList(hrec) ? InventoryItems(hrec).Items : [];
-            foreach (var h in hitems)
-                if (qclasses.ContainsKey(h.Cls)) { body.AddRange(NodeBytes(hrec, h.Node)); rep.QuestItemsAdded.Add(qclasses[h.Cls]); }
+            var (ch, items) = InventoryItems(rec);
+            var eq = Equipped(rec);
+            var drop = items.Where(it => qclasses.ContainsKey(it.Cls)).ToList();
+            foreach (var d in drop)
+                if (eq.Contains(d.Inst)) throw new InvalidDataException($"joiner quest item {d.Inst} ({qclasses[d.Cls]}) is equipped; refusing");
+            var lst = ch[^1];
+            var body = new List<byte>(Payload(rec, lst));
+            foreach (var d in drop.OrderByDescending(x => x.Node.Off))
+                body.RemoveRange(d.Node.Off - lst.PayloadOff, 6 + d.Node.Len);
+            rep.QuestItemsRemoved = drop.Select(d => qclasses[d.Cls]).ToList();
+            if (mode == QuestItemMode.Host)
+            {
+                var hitems = HasItemList(hrec) ? InventoryItems(hrec).Items : [];
+                foreach (var h in hitems)
+                    if (qclasses.ContainsKey(h.Cls)) { body.AddRange(NodeBytes(hrec, h.Node)); rep.QuestItemsAdded.Add(qclasses[h.Cls]); }
+            }
+            rec = Replace(rec, ch, body.ToArray());
         }
-        return Replace(rec, ch, body.ToArray());
+        foreach (var ext in RegisteredExtensions)
+            rec = ext.TransformHenryRecord(hostRaw, hrec, rec, parts, qclasses, mode, rep);
+        return rec;
     }
 
     /// <summary>
@@ -928,15 +933,54 @@ public static partial class WhsSave
         return ms.ToArray();
     }
 
+    internal static readonly ushort[] SoulListBlock = [0x01F4, 0x01F8, 0x7308, 0x3529, 0x1161];
+
     private static HashSet<string> HenryItemSet(byte[] raw)
     {
         var set = RecordItemSet(NodeBytes(raw, HenryChain(raw)[^1]));
         set.UnionWith(PersonalStashItemSet(ExtractPersonalStash(raw)));
+        foreach (var ext in RegisteredExtensions) ext.CollectHostPrivateItemIds(raw, set);
         return set;
     }
 
-    private static HashSet<string> RecordItemSet(byte[] rec) =>
+    internal static HashSet<string> RecordItemSet(byte[] rec) =>
         HasItemList(rec) ? InventoryItems(rec).Items.Select(i => i.Inst).ToHashSet() : [];
+
+    private static byte[] ApplySoulExtensions(string soulGuid, byte[] hostRaw, byte[] soulNodeBytes, HenryParts parts,
+                                              Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep)
+    {
+        var cur = soulNodeBytes;
+        foreach (var ext in RegisteredExtensions)
+            cur = ext.TransformSoulRecord(soulGuid, hostRaw, cur, parts, qclasses, mode, rep);
+        return cur;
+    }
+
+    private static byte[]? BuildSoulListIfNonHenryChanged(byte[] hostRaw, byte[] henryNodeBytes, HenryParts parts,
+                                                          Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep)
+    {
+        if (RegisteredExtensions.IsEmpty) return null;
+        var sh = SoulList(hostRaw);
+        bool anyNonHenryChanged = false;
+        var transformed = new byte[sh.Count][];
+        for (int i = 0; i < sh.Count; i++)
+        {
+            string guid = GuidStr(hostRaw.AsSpan(sh[i].Off + 6));
+            if (guid == HenrySoul)
+            {
+                transformed[i] = henryNodeBytes;
+                continue;
+            }
+            var orig = NodeBytes(hostRaw, sh[i]);
+            var next = ApplySoulExtensions(guid, hostRaw, orig, parts, qclasses, mode, rep);
+            transformed[i] = next;
+            if (!ReferenceEquals(orig, next) && !orig.AsSpan().SequenceEqual(next))
+                anyNonHenryChanged = true;
+        }
+        if (!anyNonHenryChanged) return null;
+        using var ms = new MemoryStream();
+        for (int i = 0; i < transformed.Length; i++) ms.Write(transformed[i]);
+        return ms.ToArray();
+    }
 
     /// <summary>The spliced stream: the host's, with the joiner's Henry record and side blocks put in.</summary>
     public static byte[] SpliceStream(byte[] hostRaw, byte[] joinRaw, Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep) =>
@@ -952,8 +996,16 @@ public static partial class WhsSave
         if (PathGet(hostRaw, StashBlock) is not null)
             jobs.Add((StashBlock, MergePersonalStash(hostRaw, parts, qclasses, rep)));
         jobs.Add((KeyBlock, MergeKeys(hostRaw, HenryItemSet(hostRaw), parts.KeyEntries, rep)));
+        var extJobs = new List<(ushort[] Tags, byte[] Payload)>();
+        foreach (var ext in RegisteredExtensions)
+            ext.AddBlockJobs(hostRaw, parts, qclasses, mode, rep, extJobs);
+        foreach (var (tags, payload) in extJobs) jobs.Add((tags, payload));
+
         var henry = BuildHenry(hostRaw, parts, qclasses, mode, rep);
-        jobs.Add((null, henry.AsSpan(6).ToArray()));
+        if (BuildSoulListIfNonHenryChanged(hostRaw, henry, parts, qclasses, mode, rep) is byte[] soulListPayload)
+            jobs.Add((SoulListBlock, soulListPayload));
+        else
+            jobs.Add((null, henry.AsSpan(6).ToArray()));
 
         List<Node> Where(byte[] r, ushort[]? tags) => tags is null ? HenryChain(r) : PathNodes(r, tags);
         var raw = hostRaw;
@@ -1015,10 +1067,11 @@ public static partial class WhsSave
         byte[] h = hc.Raw, o = oc.Raw;
         if (!hc.DescBytes.AsSpan().SequenceEqual(oc.DescBytes)) fails.Add("description header differs from the host");
 
-        var spliced = new List<string> { "01f4/01f8/7302/0006", "01f4/01f8/7302/000b", "01f4/01f8/7308/3529/1161" };
+        var splicedSet = new HashSet<string>(StringComparer.Ordinal) { "01f4/01f8/7302/0006", "01f4/01f8/7302/000b", "01f4/01f8/7308/3529/1161" };
         for (int i = 0; i < SideBlocks.Length; i++)
-            if (parts.Side[i] is not null) spliced.Add(PathText(SideBlocks[i]));
-        bool Under(string k) => spliced.Any(s => k == s || k.StartsWith(s + "/", StringComparison.Ordinal));
+            if (parts.Side[i] is not null) splicedSet.Add(PathText(SideBlocks[i]));
+        foreach (var ext in RegisteredExtensions) ext.AddSplicedPaths(h, parts, splicedSet);
+        bool Under(string k) => splicedSet.Any(s => k == s || k.StartsWith(s + "/", StringComparison.Ordinal));
         var lh = Leaves(h); var lo = Leaves(o);
         foreach (var k in lh.Keys.Union(lo.Keys).OrderBy(x => x, StringComparer.Ordinal))
         {
@@ -1074,9 +1127,14 @@ public static partial class WhsSave
         if (!gh.SequenceEqual(go)) fails.Add("soul list order/membership differs from the host");
         var byO = new Dictionary<string, Node>();
         for (int i = 0; i < so.Count; i++) byO[go[i]] = so[i];
+        var checkRep = new SpliceReport();
         for (int i = 0; i < sh.Count; i++)
-            if (gh[i] != HenrySoul && (!byO.TryGetValue(gh[i], out var r) || !NodeBytes(h, sh[i]).AsSpan().SequenceEqual(NodeBytes(o, r))))
+        {
+            if (gh[i] == HenrySoul) continue;
+            var expSoul = ApplySoulExtensions(gh[i], h, NodeBytes(h, sh[i]), parts, qclasses, mode, checkRep);
+            if (!byO.TryGetValue(gh[i], out var r) || !expSoul.AsSpan().SequenceEqual(NodeBytes(o, r)))
                 fails.Add("soul changed: " + gh[i]);
+        }
 
         var dh = DecodePlayerSoul(h, FindSoul(h, HenrySoul)!.Value);
         var dj = DecodePlayerSoul(parts.Record, RecordNode(parts.Record));
@@ -1093,9 +1151,12 @@ public static partial class WhsSave
         if (mode == QuestItemMode.Host) expInv.AddRange(dh.Inventory.Where(i => qclasses.ContainsKey(i.Class)));
         if (!expInv.SequenceEqual(dout.Inventory)) fails.Add($"Henry inventory is not the expected list ({dout.Inventory.Count} vs {expInv.Count} items)");
         var fo = SoulFields(o, FindSoul(o, HenrySoul)!.Value);
-        var fh = SoulFields(h, FindSoul(h, HenrySoul)!.Value);
-        if (!fo.ContainsKey(0x12FF) || !fh.ContainsKey(0x12FF) || !Payload(o, fo[0x12FF][0]).AsSpan().SequenceEqual(Payload(h, fh[0x12FF][0])))
-            fails.Add("Henry 0x12FF renown is not the host's");
+        var expHenry = BuildHenry(h, parts, qclasses, mode, new SpliceReport());
+        var fhExp = SoulFields(expHenry, RecordNode(expHenry));
+        if (!fo.ContainsKey(0x12FF) || !fhExp.ContainsKey(0x12FF) || !Payload(o, fo[0x12FF][0]).AsSpan().SequenceEqual(Payload(expHenry, fhExp[0x12FF][0])))
+            fails.Add("Henry 0x12FF renown does not match expected");
+        foreach (var ext in RegisteredExtensions)
+            ext.CheckSpliced(h, o, parts, qclasses, mode, fails);
         return fails;
     }
 
