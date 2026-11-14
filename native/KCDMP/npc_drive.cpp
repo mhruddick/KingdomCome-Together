@@ -999,6 +999,7 @@ uint8_t on_config(const uint8_t* body, size_t len) {
 }
 
 void on_pipe_closed() { g_dropAll = true; g_holdAll = false; }
+void drop_all_for_load() { g_dropAll = true; g_holdAll = false; }
 
 uint32_t chase_follows() { return c_chaseFollow.load(); }
 uint32_t chase_hold_ends() { return c_chaseEnded.load(); }

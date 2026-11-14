@@ -43,11 +43,17 @@ using StopFn    = uint8_t (__fastcall*)(void*, int, bool);
 using SetTimeFn = void (__fastcall*)(void*, int64_t);
 using IFn       = void* (*)();
 using GiFn      = const void* (*)();
+using GetFgFn   = HWND (WINAPI*)();
+using GetPidFn  = DWORD (WINAPI*)(HWND, LPDWORD);
+using KeyFn     = SHORT (WINAPI*)(int);
 
 ShowFn g_show = nullptr;
 SetTimeFn g_setTime = nullptr;
 IFn g_I = nullptr;
 GiFn g_gi = nullptr;
+GetFgFn g_getFg = nullptr;
+GetPidFn g_getPid = nullptr;
+KeyFn g_keyState = nullptr;
 void* g_inst = nullptr;                // main thread, resolved on first use
 bool g_instTried = false;
 std::atomic<bool> g_hook{false};
@@ -62,8 +68,26 @@ Held g_held{};
 std::atomic<bool> g_heldNew{false};
 std::atomic<uint64_t> g_approveUntil{0};
 wo140rules::Tracker g_track{};
+wo140rules::PromptKeys g_promptKeys{};   // main thread
 FrameFn g_frame = nullptr;
-std::atomic<uint32_t> c_held{0}, c_passed{0}, c_replayed{0}, c_edges{0}, c_started{0}, c_startRefused{0}, c_stopped{0}, c_pulled{0};
+std::atomic<uint32_t> c_held{0}, c_passed{0}, c_replayed{0}, c_edges{0}, c_started{0}, c_startRefused{0}, c_stopped{0}, c_pulled{0}, c_promptKeys{0};
+
+bool is_this_process_foreground() {
+    if (!g_getFg || !g_getPid) return false;
+    HWND fg = nullptr;
+    DWORD pid = 0;
+    KCDMP_FAULT_CALL(site, "wo140::is_this_process_foreground");
+    if (!fault::guarded(site, [&] { fg = g_getFg(); if (fg) g_getPid(fg, &pid); })) return false;
+    return fg != nullptr && pid == GetCurrentProcessId();
+}
+
+bool key_down(int vk) {
+    if (!g_keyState) return false;
+    SHORT s = 0;
+    KCDMP_FAULT_CALL(site, "wo140::key_down");
+    if (!fault::guarded(site, [&] { s = g_keyState(vk); })) return false;
+    return (s & 0x8000) != 0;
+}
 
 bool rd(const void* p, void* out, size_t n) {
     KCDMP_FAULT_READ(site, "wo140::rd");
@@ -166,6 +190,11 @@ void send_state(wo140rules::Edge e, int id, float hours, uint32_t st) {
 } // namespace
 
 void install() {
+    if (HMODULE u32 = GetModuleHandleA("user32.dll")) {
+        g_getFg = reinterpret_cast<GetFgFn>(GetProcAddress(u32, "GetForegroundWindow"));
+        g_getPid = reinterpret_cast<GetPidFn>(GetProcAddress(u32, "GetWindowThreadProcessId"));
+        g_keyState = reinterpret_cast<KeyFn>(GetProcAddress(u32, "GetAsyncKeyState"));
+    }
     HMODULE pm = GetModuleHandleA("PlayerModule.dll");
     HMODULE rpg = GetModuleHandleA("RPGModule.dll");
     HMODULE sh = GetModuleHandleA("Shared.dll");
@@ -220,10 +249,21 @@ int skip_state_now() {
 void on_pipe_closed() {
     g_on = false;
     g_approveUntil = 0;
-    main_thread::post([] { g_held = {}; });
+    main_thread::post([] { g_held = {}; g_promptKeys.disarm(); });
 }
 
 void tick() {
+    if (g_promptKeys.untilMs != 0) {
+        const bool fg = is_this_process_foreground();
+        const auto pk = g_promptKeys.step(GetTickCount64(), fg, fg && key_down(VK_F11), fg && key_down(VK_F12));
+        if (pk != wo140rules::PromptKey::None) {
+            c_promptKeys.fetch_add(1, std::memory_order_relaxed);
+            const uint8_t yes = pk == wo140rules::PromptKey::Yes ? 1 : 0;
+            logf("WO140-KEY native %s -> %s", yes ? "F11" : "F12", yes ? "yes" : "no");
+            uint8_t kb[2] = { kFrameKey, yes };
+            if (g_frame) g_frame(kb, sizeof kb);
+        }
+    }
     if (!g_on.load(std::memory_order_relaxed)) { g_track = {}; return; }
     if (g_heldNew.exchange(false)) {
         const Held h = g_held;
@@ -356,6 +396,17 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             logf("WO140-PULL the clock %u -> %u (target %u, the agent read %u): %s", before, after, target, expect,
                  v == wo140rules::Pull::Pulled ? "pulled back to the host's" : v == wo140rules::Pull::NotNeeded ? "not ahead, nothing done"
                  : v == wo140rules::Pull::SkipRunning ? "waits: this game's own skip is running" : "REFUSED: the calendar went back past the agent's reading");
+            return kROk;
+        }
+        case kOpPrompt: {
+            if ((len != 2 && len != 4) || cap < 1) return kRBadRequest;
+            const bool on = body[1] != 0;
+            uint16_t secs = 35;
+            if (len == 4) std::memcpy(&secs, body + 2, 2);
+            if (on) g_promptKeys.arm(GetTickCount64(), secs ? secs : 35u);
+            else g_promptKeys.disarm();
+            out[0] = (g_getFg && g_getPid && g_keyState) ? 1 : 0;
+            *outLen = 1;
             return kROk;
         }
         case kOpClock: {

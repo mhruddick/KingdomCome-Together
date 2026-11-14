@@ -341,6 +341,17 @@ do
     NOW = NOW + 31; session(true)
     frame()
     check("P: past its seconds the prompt leaves the screen (the agent answers timeout)", KCD2MP.w140.prompt == nil)
+    -- Overlay prompt actionmap ("kcd2mp_prompt") and string vote IDs (> 2^24)
+    local maps = {}
+    ActionMapManager = { EnableActionMap = function(m, on) maps[m] = on end }
+    KCD2MP._promptMapOn = false
+    KCD2MP_W140Prompt("33554433", "Fahrice wants to sleep. Sleep too?", 30)
+    check("P: prompt enables kcd2mp_prompt overlay actionmap immediately", maps["kcd2mp_prompt"] == true)
+    local mark2 = #LOG
+    KCD2MP_W140Answer(true)
+    check("P: string vote id > 2^24 preserved verbatim and kcd2mp_prompt disabled on answer",
+        emitted("w140_answer", mark2)[1] == "33554433 yes" and maps["kcd2mp_prompt"] == false,
+        tostring(emitted("w140_answer", mark2)[1]))
     noErrs("P")
 end
 

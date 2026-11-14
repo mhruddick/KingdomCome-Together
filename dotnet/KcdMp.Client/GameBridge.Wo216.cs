@@ -23,6 +23,9 @@ public partial class GameBridge
 
     /// <summary>B: 0 none, 1 the host, 2 a joiner in the host's world and not in a load (the DLL's census runs only then).</summary>
     private byte Wo216Role() => W137Host ? (byte)1 : (W137Joiner && !Wo136Holding ? (byte)2 : (byte)0);
+    internal byte Wo216RoleForTest => Wo216Role();
+    internal byte Wo217RoleForTest => Wo217Role();
+    internal byte Wo218RoleForTest => Wo218Role();
     private byte _w216RolePushed = 0xFF;
 
     private async Task Wo216PushNativeAsync()
@@ -67,7 +70,7 @@ public partial class GameBridge
     private void Wo216Tick(long n)
     {
         if (n % 8 == 5 || Wo216Role() != _w216RolePushed) _ = Wo216PushNativeAsync();   // a load or the join's end goes at once
-        if (n % 20 == 3 && W137Joiner && W216On("no_brains")) _ = ExecLuaAsync("if KCD2MP_W216Tick then KCD2MP_W216Tick() end");
+        if (n % 20 == 3 && W137Joiner && !Wo136Holding && W216On("no_brains")) _ = ExecLuaAsync("if KCD2MP_W216Tick then KCD2MP_W216Tick() end");
         if (n % 120 == 47 && (W137Host || W137Joiner)) { _ = Wo216NativeStatusAsync(); Console.WriteLine(Wo216StatsLine()); }
         if (n % 240 == 53) _ = Wo216TellModAsync();
     }

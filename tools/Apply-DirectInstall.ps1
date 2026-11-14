@@ -126,7 +126,15 @@ $manifest = @(Get-Content (Join-Path $AppDir 'install-manifest.txt') |
     Where-Object { $_.Count -ge 4 })
 
 $appRel = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-foreach ($e in $manifest) { if ($e[0] -eq 'APP') { [void]$appRel.Add($e[1]) } }
+$modKeep = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($e in $manifest) {
+    if ($e[0] -eq 'APP') { [void]$appRel.Add($e[1]) }
+    elseif ($e[0] -eq 'MOD') { [void]$modKeep.Add($e[1]) }
+}
+# WO-134 / WO-148: paks built locally on the player's machine (rebrand + keybind patches) live beside kdcmp.pak
+# and must never be swept by Apply.ps1 (matching ModInstall.cs and installer\KCDMP.iss).
+[void]$modKeep.Add('Data\kdcmp_keys.pak')
+[void]$modKeep.Add('Data\kdcmp_brand.pak')
 
 $appFull = (Get-Item $AppDir).FullName
 $removed = @()
@@ -151,7 +159,7 @@ foreach ($f in Get-ChildItem $appFull -Recurse -File) {
 $modFull = (Get-Item $ModDir).FullName
 foreach ($stray in Get-ChildItem $modFull -Recurse -File -ErrorAction SilentlyContinue) {
     $rel = $stray.FullName.Substring($modFull.Length + 1)
-    if ($rel -ne 'mod.manifest' -and $rel -ne 'Data\kdcmp.pak') {
+    if (-not $modKeep.Contains($rel)) {
         $stray.IsReadOnly = $false
         Remove-Item $stray.FullName -Force
         $removed += "mod: $rel"
@@ -166,6 +174,24 @@ foreach ($dir in (Get-ChildItem $modFull -Recurse -Directory -ErrorAction Silent
     if ((Get-ChildItem $dir.FullName -Force -ErrorAction SilentlyContinue).Count -eq 0) {
         Remove-Item $dir.FullName -Force
         $removed += "mod: $rel\"
+    }
+}
+
+# WO-148: refresh Mods\kdcmp\Data\kdcmp_keys.pak immediately from the player's own game files so F11/F12,
+# dice, menu, quicksave and mark keys are present even if the game is started directly from Steam.
+$clientExe = Join-Path $appFull 'KcdMpClient.exe'
+$gameRoot = Split-Path (Split-Path $modFull -Parent) -Parent
+if ((Test-Path $clientExe) -and $gameRoot -and (Test-Path (Join-Path $gameRoot 'Data'))) {
+    Write-Host 'Refreshing Data\kdcmp_keys.pak ...'
+    try {
+        $settingsFile = Join-Path $appFull 'settings.json'
+        $keysArgs = @('--keys-pak', '--game-root', $gameRoot, '--mod-dir', $modFull)
+        if (Test-Path $settingsFile) { $keysArgs += @('--settings', $settingsFile) }
+        $keysOut = & $clientExe @keysArgs 2>&1
+        $keysLine = @($keysOut | Where-Object { $_ -like 'KEYS-PAK *' }) | Select-Object -Last 1
+        if ($keysLine) { Write-Host "  $keysLine" }
+    } catch {
+        Write-Host "  keys pak refresh warning: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 

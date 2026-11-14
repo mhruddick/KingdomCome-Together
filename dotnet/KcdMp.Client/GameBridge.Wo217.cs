@@ -18,14 +18,17 @@ public partial class GameBridge
 
     /// <summary>0 none, 1 the host, 2 a joiner in the host's world and not in a load.</summary>
     private byte Wo217Role() => W137Host ? (byte)1 : (W137Joiner && !Wo136Holding ? (byte)2 : (byte)0);
+    private byte _w217RolePushed = 0xFF;
 
     private async Task Wo217PushNativeAsync()
     {
         try
         {
+            byte role = Wo217Role();
+            _w217RolePushed = role;
             var body = new byte[5];
             BitConverter.GetBytes(W217Switch.NativeBits(W217On)).CopyTo(body, 0);
-            body[4] = Wo217Role();
+            body[4] = role;
             var r = await _combat.Wo163Async(Protocol.Wo217OpConfig, body);
             if (r is not { Ok: true } && !_w217NativeToldOld) { _w217NativeToldOld = true; Console.WriteLine("MP-W217 the DLL did not take op 170 (an older KCDMP.dll?)"); }
         }
@@ -52,7 +55,7 @@ public partial class GameBridge
     /// <summary>The 4 Hz session tick: the native word every 2 s, its status and the stats every 30 s, the mod told every minute.</summary>
     private void Wo217Tick(long n)
     {
-        if (n % 8 == 5) _ = Wo217PushNativeAsync();
+        if (n % 8 == 5 || Wo217Role() != _w217RolePushed) _ = Wo217PushNativeAsync();
         if (n % 120 == 23 && (W137Host || W137Joiner)) { _ = Wo217NativeStatusAsync(); Console.WriteLine(Wo217StatsLine()); }
         if (n % 240 == 31) _ = Wo217TellModAsync();
         Wo217TickMore(n);

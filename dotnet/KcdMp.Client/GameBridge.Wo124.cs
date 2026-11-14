@@ -629,6 +629,7 @@ public partial class GameBridge
             j.LoadStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             j.GameplayStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
             j.LoadFailed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            await Wo136PrepareBeforeLoadAsync("join");
             j.LoadCmdUtc = DateTime.UtcNow;
             await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({j.Playline}, \"{j.Name}\", \"join\") end");
             // The engine prints "Loading saved game '...'" at once; from the menu it
@@ -1035,6 +1036,7 @@ public partial class GameBridge
         await Task.Delay(4000);
         _ownLoadExpected = true;
         _w207LeaveTarget = src.Base;   // WO-207 C.4: what the mod's last-loaded save reads once this leave is in
+        await Wo136PrepareBeforeLoadAsync("leave");
         await ExecLuaAsync($"if KCD2MP_Wo124LoadGame then KCD2MP_Wo124LoadGame({src.Playline}, \"{src.Base}\", \"leave\") end");
     }
 

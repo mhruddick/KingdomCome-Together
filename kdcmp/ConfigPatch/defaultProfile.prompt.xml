@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="us-ascii"?>
+<!-- Copyright (C) 2026 the Kingdom Come: Together contributors (AUTHORS). SPDX-License-Identifier: GPL-3.0-only
+     GPLv3 section 7 additional terms: NOTICE. This project's own material only; Kingdom Come: Deliverance II and
+     its content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
+
+     Non-exclusive overlay actionmap for co-op yes/no prompts (sleep vote, invites, quest/rejoin prompts).
+     "interaction" lives inside "player" (priority=default) and is suppressed whenever an exclusivity="1" map above
+     default is active (sitting_bed, sitting_chair, horse_mounted, apse/inventory/stash, dialog). Enabled only while
+     a prompt is up on screen, priority="overlays" exclusivity="0" delivers F11/F12 without blocking any game input. -->
+<kdcmp_patch target="Libs/Config/defaultProfile.xml" insert="end-of-root:profile">
+	<actionmap name="kcd2mp_prompt" priority="overlays" exclusivity="0"><!-- KCD2MP: F11/F12 while a co-op prompt is on screen -->
+		<action name="kcd2mp_prompt_yes" onPress="1" keyboard="_keybinds_ref_" />
+		<action name="kcd2mp_prompt_no" onPress="1" keyboard="_keybinds_ref_" />
+	</actionmap>
+</kdcmp_patch>

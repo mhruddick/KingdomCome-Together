@@ -132,7 +132,35 @@ public partial class GameBridge
         Wo147ForgetGuardsOnLoad(what);   // WO-147: a load re-creates the copies -- their guards are gone with the old ones
         _w136SettleUntilUtc = DateTime.MinValue;
         _w136LuaReleased = false;
+        if (_combat.IsConnected)
+        {
+            if (Wo216Role() != _w216RolePushed) _ = Wo216PushNativeAsync();
+            if (Wo217Role() != _w217RolePushed) _ = Wo217PushNativeAsync();
+            if (Wo218Role() != _w218RolePushed) _ = Wo218PushNativeAsync();
+        }
         _ = ExecLuaAsync($"if KCD2MP_W136Hold then KCD2MP_W136Hold(true, 240, \"agent-{what}\") end");
+    }
+
+    /// <summary>
+    /// Synchronous pre-load barrier before any wh_sys_LoadGame: marks _where = Loading, arms the Lua W136 hold,
+    /// drops native WO-216/217/218 joiner roles to 0 (disarming spawn/layer watches and unbinding native puppets),
+    /// and forgets WO-141 activities BEFORE the engine begins LoadGameData + PostLoadReconstruction.
+    /// </summary>
+    internal async Task Wo136PrepareBeforeLoadAsync(string why)
+    {
+        _where = GameWhere.Loading;
+        W160WorldGone();
+        Wo147ForgetGuardsOnLoad(why);
+        _w136SettleUntilUtc = DateTime.MinValue;
+        _w136LuaReleased = false;
+        if (_combat.IsConnected)
+        {
+            await Wo216PushNativeAsync();
+            await Wo217PushNativeAsync();
+            await Wo218PushNativeAsync();
+            try { await _combat.Wo141ForgetAsync(); } catch { }
+        }
+        await ExecLuaAsync($"if KCD2MP_W136Hold then KCD2MP_W136Hold(true, 240, \"agent-{why}\") end");
     }
 
     /// <summary>"Gameplay started": the settle starts; the hold ends W136Settle later.</summary>
