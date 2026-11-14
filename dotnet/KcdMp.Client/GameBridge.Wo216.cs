@@ -323,7 +323,11 @@ public partial class GameBridge
         // WO-217 route_skip: with this machine's mp_route off nothing in the DLL reads a line (the replay and the horse replay need it on),
         // and each line handed in is a pipe round trip -- the busy village's 25 a second held the joiner's queue 30-100 s behind
         if (Wo217Rules.SkipRoute(W217On("route_skip"), W215On("route"))) { Interlocked.Increment(ref _w216RouteSkipped); return; }
-        if (!Wo216Rules.TryRekeyRoute(body, name => _npcEntityIds.TryGetValue(name, out uint e) ? e : 0u, out byte[] op, out int known, out int unknown))
+        if (!Wo216Rules.TryRekeyRoute(body,
+                name => M3DropOwnHorseStream(name) || (!_w136Ridden.IsEmpty && Wo136Rules.DropRidden(_w136Ridden, name, DateTime.UtcNow))
+                    ? 0u
+                    : (_npcEntityIds.TryGetValue(name, out uint e) ? e : 0u),
+                out byte[] op, out int known, out int unknown))
         {
             Interlocked.Increment(ref _w216RouteBad);
             return;
@@ -414,8 +418,12 @@ public static class Wo216Rules
     {
         name = ""; on = false; secs = 0;
         var f = (arg ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (f.Length != 3 || f[0].Length is 0 or > 63 || f[1] is not ("on" or "off")) return false;
-        foreach (char c in f[0]) if (!(char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.')) return false;
+        if (f.Length != 3 || f[0].Length is 0 or > Protocol.MaxHorseNameLen || f[1] is not ("on" or "off")) return false;
+        char c0 = f[0][0];
+        if (!(char.IsAsciiLetterOrDigit(c0) || c0 == '_')) return false;
+        if (f[0].Contains("//", StringComparison.Ordinal)) return false;
+        foreach (char c in f[0])
+            if (!(char.IsAsciiLetterOrDigit(c) || c is '_' or '-' or '.' or '[' or ']' or '/' or ':')) return false;
         if (!ushort.TryParse(f[2], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out secs) || secs is 0 or > 3600) return false;
         name = f[0]; on = f[1] == "on";
         return true;

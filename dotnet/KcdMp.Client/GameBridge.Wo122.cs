@@ -456,6 +456,7 @@ public partial class GameBridge
         }
         _lastWorldSaveUtc = s.AtUtc;
         Wo192OnHostSaved(s.Display);   // WO-192: any host save starts the next autosave interval
+        if (Volatile.Read(ref _w178SaveBusy) == 0) _ = M3AfterHostSaveAsync();   // M3: restore temp peer horse tack after native host saves
         var ws = new WorldSaved(++_worldSavedSeq, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), s.Kind, s.Playline, s.Idx, s.Md5);
         var body = ws.Encode();
         var pkt = new byte[3 + body.Length];

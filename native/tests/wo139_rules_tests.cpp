@@ -54,6 +54,16 @@ int wo139_rules_tests(int* passed) {
         char longName[80]; for (int i = 0; i < 64; ++i) longName[i] = 'a'; longName[64] = 0;
         RCHECK(!is_engine_name(longName, 64) && is_engine_name(longName, 63), "63 characters at most");
     }
+    {
+        const char* bracketHorse = "horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]";
+        RCHECK(is_entity_name(bracketHorse, std::strlen(bracketHorse)), "65-char bracketed Trosky horse entity name");
+        RCHECK(is_entity_name("tsem_horseForSale_2", 19), "standard horse entity name");
+        RCHECK(!is_entity_name("kcd2mp_peerhorse_1", 18) && !is_entity_name("KCD2MP_horse_2", 14), "mod proxy names refused");
+        RCHECK(!is_entity_name("[bad_start]", 11) && !is_entity_name("bad\"quote", 9) && !is_entity_name("bad space", 9), "unsafe chars refused");
+        RCHECK(!is_entity_name("horse[animalcare//horseCare6]", 29), "consecutive // comment marker refused");
+        char tooLong[130]; for (int i = 0; i < 121; ++i) tooLong[i] = 'h'; tooLong[121] = 0;
+        RCHECK(is_entity_name(tooLong, 120) && !is_entity_name(tooLong, 121), "120 characters at most for entity contexts");
+    }
 
     // the punishment's nodes (the WO-139 scope of the WO-137 time hook)
     using kcdmp::wo137rules::is_punishment_path;

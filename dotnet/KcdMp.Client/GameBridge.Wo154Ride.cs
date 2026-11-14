@@ -36,7 +36,7 @@ public partial class GameBridge
                 Console.WriteLine($"MP-W154 ride: ghost {ghost} off {was.Horse} -- its horse is no longer fed from the rider's stream");
             return;
         }
-        if (f.Length < 3 || !NpcNamePattern.IsMatch(f[1]) || f[1].Length > NativeNpcCodec.MaxNameLen
+        if (f.Length < 3 || (!NpcNamePattern.IsMatch(f[1]) && !M3HorseRules.IsHorseEntityName(f[1])) || f[1].Length > NativeNpcCodec.MaxNameLen
             || !float.TryParse(f[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float dz) || !float.IsFinite(dz) || dz < 0 || dz > 3) return;
         _w154RideFeed[ghost] = (f[1], dz);
         Interlocked.Increment(ref _w154RideFeeds);

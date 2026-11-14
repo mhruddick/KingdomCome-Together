@@ -177,7 +177,8 @@ public partial class GameBridge
             case "w136_ride":
             {
                 var f = arg.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                if (f.Length == 2 && NpcNamePattern.IsMatch(f[0])) _ = Task.Run(() => Wo136OnRideAsync(f[0], f[1] == "1"));
+                if (f.Length == 2 && (NpcNamePattern.IsMatch(f[0]) || M3HorseRules.IsHorseEntityName(f[0])))
+                    _ = Task.Run(() => Wo136OnRideAsync(f[0], f[1] == "1"));
                 return;
             }
             case "w136_torch":
@@ -229,9 +230,14 @@ public partial class GameBridge
 
     private readonly ConcurrentDictionary<string, DateTime> _w136Ridden = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Joiner, NpcStateDown: the host's stream for a horse this player rides is not applied (native or Lua).</summary>
+    /// <summary>Joiner, NpcStateDown: the host's stream for a horse this player rides (or owns as companion) is not applied (native or Lua).</summary>
     private bool Wo136DropRidden(string npcName)
     {
+        if (M3DropOwnHorseStream(npcName))
+        {
+            Interlocked.Increment(ref _w136RiddenDropped);
+            return true;
+        }
         if (_w136Ridden.IsEmpty || !Wo136Rules.DropRidden(_w136Ridden, npcName, DateTime.UtcNow)) return false;
         Interlocked.Increment(ref _w136RiddenDropped);
         return true;
@@ -240,23 +246,23 @@ public partial class GameBridge
     /// <summary>w136_ride &lt;horse&gt; 1|0: this player mounted a host horse copy (take it) / its settle after the dismount ended.</summary>
     private async Task Wo136OnRideAsync(string horse, bool on)
     {
+        string? alias = M3HorseRules.LongAlias(horse);
         if (on)
         {
             _w136Ridden[horse] = DateTime.MaxValue;
+            if (alias is not null) _w136Ridden[alias] = DateTime.MaxValue;
             Interlocked.Increment(ref _w136Rides);
-            // Off the host's hold entirely: the copy guard (imm buff) and any engagement.
-            if (_w131Guarded.TryRemove(horse, out uint eid))
-            {
-                try { await _combat.Wo131CopyGuardAsync(false, eid); } catch { }
-                await Wo132DiscardAsync(false, eid);
-            }
-            if (_w132Engaged.TryRemove(horse, out var eg)) { try { await _combat.Wo132EngageAsync(false, eg.Eid, default); } catch { } }
+            // Off the host's hold entirely: the copy guard (imm buff), native bind, and any engagement (for both name and WO-217 lh* alias).
+            await M3LiftNativeHoldOnHorseAsync(horse);
+            if (alias is not null) await M3LiftNativeHoldOnHorseAsync(alias);
             Console.WriteLine($"MP-W136 ride: this player rides {horse} -- the rider owns it: the host's stream for it is ignored, its copy guard lifted; the host's horse follows this player's avatar");
         }
         else
         {
             _w136Ridden.TryRemove(horse, out _);
-            Console.WriteLine($"MP-W136 ride: {horse} is the host's again (dismounted {Wo136Rules.RideReturn.TotalSeconds:F0} s ago) -- its stream is applied from where the rider left it");
+            if (alias is not null) _w136Ridden.TryRemove(alias, out _);
+            if (!M3DropOwnHorseStream(horse))
+                Console.WriteLine($"MP-W136 ride: {horse} is the host's again (dismounted {Wo136Rules.RideReturn.TotalSeconds:F0} s ago) -- its stream is applied from where the rider left it");
         }
     }
 

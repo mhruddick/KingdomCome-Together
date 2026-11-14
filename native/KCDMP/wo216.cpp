@@ -74,14 +74,14 @@ uint8_t op(uint8_t opc, const uint8_t* body, size_t len, uint8_t* out, size_t ca
     *outLen = 0;
     if (opc == kOpOutfitRead) { if (len != 2) return wo163::kRBadRequest; return d_read(body[1], out, cap, outLen); }
     if (opc == kOpOutfitOf) {
-        if (len < 3 || len != 2u + body[1] || body[1] == 0 || body[1] > 63) return wo163::kRBadRequest;
-        char nm[64]{};
+        if (len < 3 || len != 2u + body[1] || body[1] == 0 || body[1] > 120) return wo163::kRBadRequest;
+        char nm[128]{};
         std::memcpy(nm, body + 2, body[1]);
         return d_of(nm, out, cap, outLen);
     }
     if (opc == kOpExempt) {   // [on:1][secs:2][nameLen:1][name]
-        if (len < 5 || len != 5u + body[4] || body[4] == 0 || body[4] > 63) return wo163::kRBadRequest;
-        char nm[64]{};
+        if (len < 5 || len != 5u + body[4] || body[4] == 0 || body[4] > 120) return wo163::kRBadRequest;
+        char nm[128]{};
         std::memcpy(nm, body + 5, body[4]);
         uint16_t secs = 0;
         std::memcpy(&secs, body + 2, 2);
@@ -535,7 +535,7 @@ void b_spawns(double now) {
 
 void b_actions() {
     int budget = kPerFrame;
-    char cmd[96];
+    char cmd[160];
     while (budget > 0 && !g_pauseQ.empty()) {
         const uint32_t eid = g_pauseQ.back();
         g_pauseQ.pop_back();

@@ -26,8 +26,11 @@ int wo200_tests(int* passed) {
     WCHECK(method_kind("wh::xgenaimodule::RequestMonologue") == Method::Monologue, "RequestMonologue");
     WCHECK(method_kind("wh::entitymodule::CreatePlayerReward") == Method::PlayerReward, "CreatePlayerReward (rewards, createmoney_player)");
     WCHECK(method_kind("EquipPlayersItem") == Method::PlayerReward && method_kind("UnequipPlayersItem") == Method::PlayerReward, "player items");
+    WCHECK(method_kind("ReplacePlayerHorse") == Method::PlayerHorse && method_kind("wh::playermodule::SetPlayerHorse") == Method::PlayerHorse
+           && method_kind("ClearPlayerHorse") == Method::PlayerHorse, "player horse assignments");
     WCHECK(method_kind("wh::rpgmodule::AddBuff") == Method::AddBuff && method_kind("SetState") == Method::SetState, "body effects by soul");
-    WCHECK(method_kind("TakeDamage") == Method::Damage && method_kind("Revive") == Method::Damage, "KillNpc's TakeDamage, Revive");
+    WCHECK(method_kind("TakeDamage") == Method::Damage && method_kind("Revive") == Method::Damage
+           && method_kind("wh::rpgmodule::Kill") == Method::Damage, "KillNpc's TakeDamage, Revive, Kill");
     WCHECK(method_kind("CreateItems") == Method::Items && method_kind("MoveItems") == Method::Items, "inventories");
     WCHECK(method_kind("math::boolean::Or") == Method::Other && method_kind("GetState") == Method::Other, "pure logic and reads run");
     WCHECK(method_kind(nullptr) == Method::Other && method_kind("") == Method::Other, "no name: other");
@@ -86,6 +89,20 @@ int wo200_tests(int* passed) {
            "AddReward in the joiner's closure: not on the host's Henry");
     WCHECK(decide(kRoleHost, Kind::Function, Method::PlayerReward, Target::Unknown, true, false, false, false, on) == Verdict::TalkerOnlyHost,
            "CreatePlayerReward / createmoney_player: not on the host's Henry");
+    WCHECK(decide(kRoleHost, Kind::Function, Method::PlayerHorse, Target::Unknown, true, false, false, false, on) == Verdict::TalkerOnlyHost,
+           "ReplacePlayerHorse in the joiner's closure: never overwrites the host's horse");
+    WCHECK(decide(kRoleHost, Kind::Function, Method::PlayerHorse, Target::Unknown, false, false, false, false, on) == Verdict::Run,
+           "ReplacePlayerHorse outside a closure: the host's own horse claim/purchase runs");
+    WCHECK(decide(kRoleJoiner, Kind::Function, Method::PlayerHorse, Target::Unknown, false, true, false, false, on) == Verdict::TalkerOnlyJoiner,
+           "ReplacePlayerHorse mirrored from the host's talk: never overwrites the joiner's horse");
+    WCHECK(decide(kRoleJoiner, Kind::Function, Method::PlayerHorse, Target::Unknown, false, false, false, false, on) == Verdict::Run,
+           "ReplacePlayerHorse in the joiner's own talk: runs on the joiner's machine");
+    WCHECK(decide(kRoleHost, Kind::Function, Method::Damage, Target::Other, true, false, false, false, on, Scene::Unknown, true) == Verdict::TalkerOnlyHost,
+           "Kill inside replaceplayerhorse_disposeoldifexists in the joiner's closure: never kills the host's PreviousHorse");
+    WCHECK(decide(kRoleHost, Kind::Function, Method::Damage, Target::Other, true, false, false, false, on, Scene::Unknown, false) == Verdict::Run,
+           "Kill on an ordinary NPC outside horse-dispose in the joiner's closure: still runs on the host");
+    WCHECK(is_horse_dispose_parent("replaceplayerhorse_disposeoldifexists") && is_horse_dispose_parent("ReplacePlayerHorse_1")
+           && !is_horse_dispose_parent("killnpc_bandit"), "horse dispose parent libraries");
     WCHECK(decide(kRoleHost, Kind::Function, Method::Items, Target::Unknown, true, false, false, true, on) == Verdict::TalkerOnlyHost,
            "MoveMoney_* (a money library's MoveItems): not on the host");
     WCHECK(decide(kRoleHost, Kind::Function, Method::Items, Target::Unknown, true, false, false, false, on) == Verdict::Run,

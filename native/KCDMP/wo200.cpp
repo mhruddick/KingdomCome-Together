@@ -705,18 +705,19 @@ bool gate(void* node, void* /*ctx*/) {
     }
     Target t = Target::Unknown;
     if (needs_target(role, k, m, inClosure, mirror, c)) t = read_target(node);
-    bool urge = false, money = false;
-    if ((role == kRoleHost && inClosure && k == Kind::Behaviour) || (k == Kind::Function && m == Method::Items && (inClosure || mirror))) {
+    bool urge = false, money = false, horseDispose = false;
+    if ((role == kRoleHost && inClosure && k == Kind::Behaviour) ||
+        (k == Kind::Function && (m == Method::Items || m == Method::Damage) && (inClosure || mirror))) {
         char pn[128];
         ++t_inGate;
         const bool ok = parent_name(node, pn, sizeof pn);
         --t_inGate;
-        if (ok) { urge = is_urge_parent(pn); money = is_money_parent(pn); }
+        if (ok) { urge = is_urge_parent(pn); money = is_money_parent(pn); horseDispose = is_horse_dispose_parent(pn); }
     }
     // WO-203 I.5: a scene handler -- may its Execute start a scene, and (the host inside a replay closure) is that scene the player's?
     HandlerRead hr;
     if (k == Kind::SceneStarter) read_handler(node, role == kRoleHost && inClosure && c.hostClosure, &hr);
-    Verdict v = decide(role, k, m, t, inClosure, mirror, urge, money, c, hr.scene);
+    Verdict v = decide(role, k, m, t, inClosure, mirror, urge, money, c, hr.scene, horseDispose);
     // WO-201 B7: the joiner's own quest logic starts no story bark (his own conversation's chain and interactions stay his; WO-203 I.5: a
     // chain carried across a scene his conversation started is his own too)
     if (v == Verdict::Run && role == kRoleJoiner && c.joined && c.storyBarks && story_starter(k, m)) {
