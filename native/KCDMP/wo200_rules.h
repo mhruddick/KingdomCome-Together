@@ -43,8 +43,9 @@ enum class Method : uint8_t {
     PlayerReward,  // CreatePlayerReward (rewards, createmoney_player), EquipPlayersItem, UnequipPlayersItem: always the player
     AddBuff,       // AddBuff: a buff on whose body the soul input names
     SetState,      // SetState (HealTo, set health): a soul's health / stamina / ... written
-    Damage,        // TakeDamage (KillNpc), Revive: a soul's life
+    Damage,        // TakeDamage (KillNpc), Revive, Kill: a soul's life
     Items,         // CreateItems, MoveItems (inventories: money when the library around it is a money one)
+    PlayerHorse,   // ReplacePlayerHorse, SetPlayerHorse, ClearPlayerHorse: always the player's own horse assignment
 };
 
 inline const char* last_segment(const char* name) {
@@ -60,9 +61,11 @@ inline Method method_kind(const char* methodName) {
     if (!std::strcmp(s, "RequestMonologue")) return Method::Monologue;
     if (!std::strcmp(s, "CreatePlayerReward") || !std::strcmp(s, "EquipPlayersItem") || !std::strcmp(s, "UnequipPlayersItem"))
         return Method::PlayerReward;
+    if (!std::strcmp(s, "ReplacePlayerHorse") || !std::strcmp(s, "SetPlayerHorse") || !std::strcmp(s, "ClearPlayerHorse"))
+        return Method::PlayerHorse;
     if (!std::strcmp(s, "AddBuff")) return Method::AddBuff;
     if (!std::strcmp(s, "SetState")) return Method::SetState;
-    if (!std::strcmp(s, "TakeDamage") || !std::strcmp(s, "Revive")) return Method::Damage;
+    if (!std::strcmp(s, "TakeDamage") || !std::strcmp(s, "Revive") || !std::strcmp(s, "Kill")) return Method::Damage;
     if (!std::strcmp(s, "CreateItems") || !std::strcmp(s, "MoveItems")) return Method::Items;
     return Method::Other;
 }
@@ -120,14 +123,17 @@ inline bool needs_target(uint8_t role, Kind k, Method m, bool inClosure, bool mi
 }
 
 // The decision. `urgeParent`: a Behaviour node inside an UrgeADialog library (an NPC walks up and starts a dialogue with the player);
-// `moneyParent`: an Items function inside a money library (MoveMoney_*, createmoney*); `scene`: a SceneStarter's read (WO-203 I.5).
+// `moneyParent`: an Items function inside a money library (MoveMoney_*, createmoney*); `scene`: a SceneStarter's read (WO-203 I.5);
+// `horseDisposeParent`: a Kill/Damage function inside replaceplayerhorse_disposeoldifexists (disposes the buyer's PreviousHorse).
 inline Verdict decide(uint8_t role, Kind k, Method m, Target t, bool inClosure, bool mirrorTalker, bool urgeParent, bool moneyParent,
-                      const Cfg& c, Scene scene = Scene::Unknown) {
+                      const Cfg& c, Scene scene = Scene::Unknown, bool horseDisposeParent = false) {
     if (k == Kind::None) return Verdict::Run;
     const bool playerBody = (k == Kind::BodyEffect || k == Kind::Interrupt ||
                              (k == Kind::Function && (m == Method::AddBuff || m == Method::SetState || m == Method::Damage))) && t == Target::Player;
-    const bool alwaysPlayer = k == Kind::RewardPlayer || (k == Kind::Function && m == Method::PlayerReward) ||
-                              (k == Kind::Function && m == Method::Items && moneyParent);
+    const bool alwaysPlayer = k == Kind::RewardPlayer || (k == Kind::Function && m == Method::PlayerHorse) ||
+                              (k == Kind::Function && m == Method::PlayerReward) ||
+                              (k == Kind::Function && m == Method::Items && moneyParent) ||
+                              (k == Kind::Function && m == Method::Damage && horseDisposeParent);
     if (role == kRoleJoiner && c.joined) {
         // I.5 first: a quest behaviour on a puppet never runs here, whatever started it (the WO's list: behaviours -- duels, tours,
         // skirmishes --, entity contexts, scheduler links, the teleport interrupts, KillNpc's damage), nor a health written into a copy
@@ -248,6 +254,9 @@ inline bool joiner_story_bark(uint8_t role, Kind k, Method m, bool urgeParent, b
     return true;
 }
 inline bool is_money_parent(const char* parentName) { return icontains(parentName, "money"); }
+inline bool is_horse_dispose_parent(const char* parentName) {
+    return icontains(parentName, "replaceplayerhorse") || icontains(parentName, "disposeold");
+}
 
 // A soul-typed port, by its rttr type name ("wh::rpgmodule::I_Soul*", "wh::rpgmodule::Souls", ...).
 inline bool is_soul_type(const char* typeName) {

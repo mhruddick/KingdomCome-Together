@@ -52,4 +52,28 @@ inline bool is_engine_name(const char* s, size_t n) {
     return true;
 }
 
+// Authored entity names including bracketed/slashed horse names (e.g. horse[animalcare/horseCare6_<guid>]), 1..120 chars, never kcd2mp_*.
+inline bool is_entity_name(const char* s, size_t n) {
+    if (!s || n < 1 || n > 120) return false;
+    const char c0 = s[0];
+    if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || (c0 >= '0' && c0 <= '9') || c0 == '_')) return false;
+    if (n >= 7) {
+        const char pfx[7] = {'k', 'c', 'd', '2', 'm', 'p', '_'};
+        bool match = true;
+        for (size_t i = 0; i < 7; ++i) {
+            char a = s[i];
+            if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+            if (a != pfx[i]) { match = false; break; }
+        }
+        if (match) return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        const char c = s[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '[' || c == ']' || c == '/' || c == '-' || c == ':';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 } // namespace kcdmp::wo139rules
