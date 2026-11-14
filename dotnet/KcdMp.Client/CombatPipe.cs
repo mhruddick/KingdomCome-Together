@@ -32,6 +32,9 @@ public sealed partial class CombatPipe : IAsyncDisposable
     /// <summary>WO-154 6.6: another pipe name, for tests only (a test server must never take the game's "kcdmp").</summary>
     public CombatPipe(string pipeName) => _pipeName = pipeName;
 
+    /// <summary>When true (--verbose), prints raw [combat] pipe frame lines on ReadLoopAsync.</summary>
+    public bool VerboseLogging { get; set; }
+
     private const byte ApplyDamage       = 0x01;
     private const byte ApplyDeath        = 0x02;
     private const byte Ping              = 0x03;
@@ -2160,9 +2163,7 @@ public sealed partial class CombatPipe : IAsyncDisposable
             while (_pipe?.IsConnected == true)
             {
                 var (type, body) = await ReadFrameAsync(CancellationToken.None);
-                // WO-118: replies are logged by their callers; 0x81/0x86/0x89
-                // arrive at frame-feed and heartbeat rates and would flood.
-                if (type is not (Result or LocalStateReply or NpcStatusReply or BodyStateReply or LocalAction or PvpHitOut or NpcCombatOut or Wo132Reply or Wo131Reply or Wo137Reply or QuestChangeOut or BatchReply))
+                if (VerboseLogging && type is not (Result or LocalStateReply or NpcStatusReply or BodyStateReply or LocalAction or PvpHitOut or NpcCombatOut or Wo132Reply or Wo131Reply or Wo137Reply or QuestChangeOut or BatchReply))
                     Console.WriteLine($"[combat] pipe frame 0x{type:X2} ({body.Length} bytes)");
                 if (type == LocalHit && body.Length >= 24)
                 {

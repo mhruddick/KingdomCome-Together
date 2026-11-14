@@ -357,6 +357,7 @@ namespace KCDMP_launcher.Pages
                     try
                     {
                         hostedRelayProcess = Process.GetProcessById(d.Pid);
+                        Lifecycle.TrackRelay(hostedRelayProcess);
                         Log.Information(d.LogLine);
                         return false;
                     }

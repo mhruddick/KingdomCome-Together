@@ -23,7 +23,7 @@ namespace KcdMp.Client;
 /// GET /version-status -> { "myReleaseVersion": "0.9.5", "peers": [{"ghostId":1,"releaseVersion":"0.9.4"}] }
 /// </summary>
 public sealed class VersionIpcServer(Func<KeyValuePair<byte, string>[]> getPeers, int port, Func<string>? getJoinStatus = null, Action<string>? onJoinChoice = null,
-    Func<string>? getConnectionStatus = null)
+    Func<string>? getConnectionStatus = null, Action? onShutdown = null)
 {
     private readonly HttpListener _listener = new();
     private CancellationTokenSource? _cts;
@@ -168,6 +168,25 @@ public sealed class VersionIpcServer(Func<KeyValuePair<byte, string>[]> getPeers
                 res.ContentLength64 = bytes.Length;
                 await res.OutputStream.WriteAsync(bytes);
                 res.Close();
+                return;
+            }
+
+            if ((req.HttpMethod == "POST" || req.HttpMethod == "GET") && req.Url?.AbsolutePath == "/shutdown")
+            {
+                var remote = req.RemoteEndPoint?.Address;
+                if (remote is null || !IPAddress.IsLoopback(remote))
+                {
+                    res.StatusCode = 403;
+                    res.Close();
+                    return;
+                }
+                var bytes = Encoding.UTF8.GetBytes("{\"Ok\":true}");
+                res.StatusCode = 200;
+                res.ContentType = "application/json";
+                res.ContentLength64 = bytes.Length;
+                await res.OutputStream.WriteAsync(bytes);
+                res.Close();
+                onShutdown?.Invoke();
                 return;
             }
 

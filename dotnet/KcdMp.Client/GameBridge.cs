@@ -1130,27 +1130,35 @@ public partial class GameBridge(ClientConfig config)
         // connection) so a reconnect doesn't tear down and re-open the
         // Discord IPC pipe.
         _discordPresence = new DiscordPresence(config);
+        _combat.VerboseLogging = config.VerboseLogging;
 
-        // WO-127: the launcher's IPC (version, join status, and now the plain
-        // connection status) lives as long as the agent, not one connection, so
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var token = runCts.Token;
+
+        // WO-127: the launcher's IPC (version, join status, plain connection status,
+        // and loopback /shutdown) lives as long as the agent, not one connection, so
         // a failure BEFORE the first connection can be shown too.
         _versionIpcServer = new VersionIpcServer(() => _ghostReleaseVersions.ToArray(), config.VersionIpcPort, JoinStatusJson, Wo125OnLauncherChoice,
-            AgentConnectionStatus.Json);
+            AgentConnectionStatus.Json, () =>
+            {
+                Console.WriteLine("[shutdown] Launcher requested graceful exit.");
+                try { runCts.Cancel(); } catch { }
+            });
         _versionIpcServer.Start();
         AgentConnectionStatus.Set("waiting-for-game", string.IsNullOrWhiteSpace(config.SteamCode) ? "direct" : "steam", "Waiting for the game...");
         // WO-202 I.1: the game process watch -- a game that ends without its quit line gets the agent's part of its crash report
-        Wo202CrashWatch.Start(() => KcdLogLocator.Find() is string klog ? Path.GetDirectoryName(klog) : null, ct);
+        Wo202CrashWatch.Start(() => KcdLogLocator.Find() is string klog ? Path.GetDirectoryName(klog) : null, token);
 
         try
         {
-            await RunLoopAsync(http, ct);
+            await RunLoopAsync(http, token);
             // WO-127: a fatal refusal (version, full, Steam code/app) ends the loop;
             // stay up, quiet, so the launcher can still read why. It kills this
             // agent before starting the next one.
-            if (!ct.IsCancellationRequested)
+            if (!token.IsCancellationRequested)
             {
                 Console.WriteLine("MP-CONN not retrying (see the reason above); waiting for the launcher");
-                await Task.Delay(Timeout.Infinite, ct).ContinueWith(_ => { });
+                await Task.Delay(Timeout.Infinite, token).ContinueWith(_ => { });
             }
         }
         finally
@@ -2303,7 +2311,7 @@ public partial class GameBridge(ClientConfig config)
                         // read -- one pipe round trip serves both channels.
                         if (local is LocalBodyState lb)
                             await SendAttackEdgeAsync(stream, lb, cts.Token);
-                        if (moved)
+                        if (moved && config.VerboseLogging)
                             Console.WriteLine($"[pos] {x:F1} {y:F1} {z:F1}  rot={rotZ:F2}  riding={riding}  read={sw.ElapsedMilliseconds}ms path={(nat is null ? "log" : "native")}");
                     }
                 }
@@ -5724,7 +5732,8 @@ public partial class GameBridge(ClientConfig config)
         try
         {
             await ExecLuaAsync($@"KCD2MP_UpdateGhost(""{ghostId}"",{gx},{gy},{gz},{rot},{ride}{tail})");
-            Console.WriteLine($"[ghost {ghostId}] {gx} {gy} {gz} riding={isRiding}");
+            if (config.VerboseLogging)
+                Console.WriteLine($"[ghost {ghostId}] {gx} {gy} {gz} riding={isRiding}");
         }
         catch { /* game might have unloaded */ }
     }
