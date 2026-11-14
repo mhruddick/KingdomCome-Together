@@ -335,4 +335,192 @@ do
     noErrs("M")
 end
 
+-- (O) M3 independent horse ownership, dismount parking, same-soul proxy, and save-safe tack sync ------------------------------------
+do
+    ERRS = {}
+    local BY_ID = {}
+    local nextSpawnId = 5000
+    local origGetEnt = System.GetEntity
+    local origSpawn = System.SpawnEntity
+    local origRemove = System.RemoveEntity
+    local origSphere = System.GetEntitiesInSphere
+    local removedIds = {}
+
+    local function mkHorse(name, eid, x, y, z, legal)
+        local invItems = {}
+        local eqItems = {}
+        local h = {
+            id = eid,
+            class = "Horse",
+            px = x or 10, py = y or 10, pz = z or 0,
+            mountIsLegal = legal == true,
+            noSave = false,
+            invItems = invItems,
+            eqItems = eqItems,
+            GetName = function() return name end,
+            GetWorldPos = function(self) return { x = self.px, y = self.py, z = self.pz } end,
+            SetWorldPos = function(self, p) self.px, self.py, self.pz = p.x, p.y, p.z end,
+            GetWorldAngles = function() return { x = 0, y = 0, z = 0 } end,
+            SetWorldAngles = function() end,
+            SetMountIsLegal = function(self, v) self.mountIsLegal = (v == true) end,
+            IsMountLegal = function(self) return self.mountIsLegal == true end,
+            SetMountableByPlayer = function(self, v) self.mountable = v end,
+            Hide = function() end,
+            SetFlags = function(self, flag, mode) if mode == 0 or mode == 1 then self.noSave = true end end,
+            GetFlags = function(self) return self.noSave and 1 or 0 end,
+            soul = { GetId = function() return "userdata: 0500000000000BBB" end },
+            inventory = {
+                CreateItem = function(_, cls)
+                    local handle = "item:" .. cls
+                    invItems[handle] = cls
+                    return handle
+                end,
+                FindItem = function(_, cls)
+                    for k, v in pairs(invItems) do if v == cls then return k end end
+                    return nil
+                end,
+                GetInventoryTable = function()
+                    local t = {}
+                    for k in pairs(invItems) do t[#t + 1] = k end
+                    return t
+                end,
+                DeleteItem = function(_, handle)
+                    invItems[handle] = nil
+                    eqItems[handle] = nil
+                    return true
+                end,
+            },
+            actor = {
+                EquipInventoryItem = function(_, handle) eqItems[handle] = true; return true end,
+                UnequipInventoryItem = function(_, handle) eqItems[handle] = nil; return true end,
+            },
+        }
+        ENTS[name] = h
+        BY_ID[eid] = h
+        return h
+    end
+
+    System.GetEntity = function(id) return BY_ID[id] end
+    System.SpawnEntity = function(params)
+        nextSpawnId = nextSpawnId + 1
+        local h = mkHorse(params.name, nextSpawnId, params.position.x, params.position.y, params.position.z, false)
+        return h
+    end
+    System.RemoveEntity = function(eid)
+        local h = BY_ID[eid]
+        if h then ENTS[h:GetName()] = nil; BY_ID[eid] = nil end
+        removedIds[eid] = true
+    end
+
+    -- O1: Joiner reports bracketed horse name and "-" on clear
+    local bracketName = "horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]"
+    local hBracket = mkHorse(bracketName, 701, 20, 20, 0, false)
+    local ownHorseId = hBracket.id
+    player.player = { GetHorseId = function() return ownHorseId end }
+    KCD2MP.w137.joiner, KCD2MP.w137.host, KCD2MP.w137.active = true, false, true
+    KCD2MP.w160.ownHorse = { name = nil, at = -1e9 }
+    local mark = #LOG
+    NOW = NOW + 10
+    KCD2MP_W160OwnHorseTick()
+    check("O1: joiner reports 65-char bracketed Trosky horse name", countEvt("w160_ownhorse", bracketName, mark) == 1)
+    ownHorseId = 0
+    mark = #LOG
+    NOW = NOW + 10
+    KCD2MP_W160OwnHorseTick()
+    check("O1b: joiner clearing/selling horse emits w160_ownhorse -", countEvt("w160_ownhorse", "-", mark) == 1)
+
+    -- O2/O3/O4/O5: Host owns Pebbles, Joiner 1 owns tsem_horseForSale_2 with saddle + bridle
+    KCD2MP.w137.joiner, KCD2MP.w137.host, KCD2MP.w137.active = false, true, true
+    local pebbles = mkHorse("tsem_sedivka", 702, 5, 5, 0, false)
+    local horseB = mkHorse("tsem_horseForSale_2", 703, 12, 10, 0, false)
+    local lent = mkHorse("lent_horse", 704, 15, 10, 0, true)
+    ownHorseId = pebbles.id
+    System.GetEntitiesInSphere = function() return { pebbles, horseB, lent } end
+
+    local saddle = "bf06d242-4dcb-48e9-bbf1-b6a36f368a57"
+    local bridle = "505343b8-b5ff-4f47-94d9-470a1977a421"
+    mark = #LOG
+    check("O2: host marks joiner's Horse B legal, emits context, and equips tack",
+        KCD2MP_W160PeerHorse(1, "tsem_horseForSale_2", saddle .. "," .. bridle) == true
+        and horseB.mountIsLegal == true
+        and countEvt("m3_peerhorse_ctx", "tsem_horseForSale_2 1", mark) == 1
+        and horseB.eqItems["item:" .. saddle] == true
+        and horseB.eqItems["item:" .. bridle] == true)
+
+    mark = #LOG
+    KCD2MP_W139HostHorses()
+    check("O3: W139HostHorses shares lent world horses only (neither host's Pebbles nor joiner's private Horse B)",
+        countEvt("w139_horses", "lent_horse", mark) == 1
+        and countEvt("w139_horses", "tsem_sedivka", mark) == 0
+        and countEvt("w139_horses", "tsem_horseForSale_2", mark) == 0)
+
+    -- Joiner 1 mounts & dismounts Horse B -> stays parked (paused), never wh_ai_ResumeNPC!
+    KCD2MP.ghosts["1"] = { entity = { id = 801, GetWorldPos = function() return { x = 12, y = 10, z = 1.5 } end, human = { ForceDismount = function() end, IsMounted = function() return false end } }, istate = { isRiding = true, spawnedAtClock = -100 } }
+    KCD2MP.ghostHorseName["1"] = "tsem_horseForSale_2"
+    CMDS = {}
+    KCD2MP_SpawnHorse("1", 12, 10, 0, 0)
+    KCD2MP_W154RideNative("1", true)
+    CMDS = {}
+    KCD2MP.ghosts["1"].istate.isRiding = false
+    KCD2MP_GhostDismount("1", KCD2MP.ghosts["1"], "dismount")
+    KCD2MP_RemoveHorse("1")
+    local sawResume = false
+    local sawPause = false
+    for _, c in ipairs(CMDS) do
+        if c == "wh_ai_ResumeNPC tsem_horseForSale_2" then sawResume = true end
+        if c == "wh_ai_PauseNPC tsem_horseForSale_2" then sawPause = true end
+    end
+    check("O4: dismounting joiner's Horse B keeps it AI-paused at the dismount spot instead of walking back to Semine",
+        sawPause == true and sawResume == false and KCD2MP.w160.parkedPeerHorses["tsem_horseForSale_2"] ~= nil)
+
+    -- O5: Pre-save strips mod-created tack from world horse; post-save restores it
+    KCD2MP_M3BeforeHostSave()
+    check("O5a: before host save, temp tack is stripped from world Horse B so .whs stays clean",
+        next(horseB.invItems) == nil and next(horseB.eqItems) == nil)
+    KCD2MP_M3AfterHostSave()
+    check("O5b: after host save, temp tack is restored onto world Horse B",
+        horseB.eqItems["item:" .. saddle] == true and horseB.eqItems["item:" .. bridle] == true)
+
+    -- O6: Same-soul collision (Joiner 2 also owns tsem_sedivka == Host's own horse!)
+    KCD2MP.ghosts["2"] = { entity = { id = 802, GetWorldPos = function() return { x = 8, y = 8, z = 1.5 } end, human = { ForceDismount = function() end, IsMounted = function() return false end } }, istate = { isRiding = true, spawnedAtClock = -100 } }
+    KCD2MP.ghostHorseName["2"] = "tsem_sedivka"
+    CMDS = {}
+    KCD2MP_W160PeerHorse(2, "tsem_sedivka", saddle)
+    local spawnedProxy = KCD2MP_SpawnHorse("2", 8, 8, 0, 0)
+    check("O6: same-soul collision leaves Host's Pebbles untouched and mounts Joiner 2 on NO_SAVE kcd2mp_peerhorse_2 with tack",
+        pebbles.eqItems["item:" .. saddle] == nil
+        and KCD2MP.w160.parkedPeerHorses["tsem_sedivka"] == nil
+        and spawnedProxy ~= nil and spawnedProxy ~= pebbles
+        and spawnedProxy:GetName() == "kcd2mp_peerhorse_2"
+        and spawnedProxy.eqItems["item:" .. saddle] == true)
+    KCD2MP_RemoveHorse("2")
+    check("O6b: dismounting same-soul stand-in parks kcd2mp_peerhorse_2 without destroying it while Joiner 2 stays connected",
+        KCD2MP.w160.peerProxies["2"] ~= nil and removedIds[spawnedProxy.id] == nil)
+
+    -- O7: Disconnect / clear releases world horse + removes peer proxy
+    mark = #LOG
+    CMDS = {}
+    KCD2MP_W160PeerHorse(1, "-", "")
+    KCD2MP_W160PeerHorse(2, "-", "")
+    local resumedHorseB = false
+    for _, c in ipairs(CMDS) do if c == "wh_ai_ResumeNPC tsem_horseForSale_2" then resumedHorseB = true end end
+    check("O7: peer disconnect strips tack, restores legality, clears crime context, unparks Horse B, and deletes stand-in proxy",
+        next(horseB.invItems) == nil and horseB.mountIsLegal == false
+        and countEvt("m3_peerhorse_ctx", "tsem_horseForSale_2 0", mark) == 1
+        and resumedHorseB == true
+        and removedIds[spawnedProxy.id] == true)
+
+    -- Cleanup stubs
+    for _, n in ipairs({ bracketName, "tsem_sedivka", "tsem_horseForSale_2", "lent_horse", "kcd2mp_peerhorse_2" }) do ENTS[n] = nil end
+    KCD2MP.ghosts["1"] = nil; KCD2MP.ghosts["2"] = nil
+    KCD2MP.ghostHorseName["1"] = nil; KCD2MP.ghostHorseName["2"] = nil
+    KCD2MP.w137.host, KCD2MP.w137.joiner, KCD2MP.w137.active = false, false, false
+    player.player = nil
+    System.GetEntity = origGetEnt
+    System.SpawnEntity = origSpawn
+    System.RemoveEntity = origRemove
+    System.GetEntitiesInSphere = origSphere
+    noErrs("O")
+end
+
 OUT = table.concat(RESULTS, "\n")
