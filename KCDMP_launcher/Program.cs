@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using KCDMP_launcher;
 using System.IO;
 using System;
+using KCDMP_launcher.Models;
 using KCDMP_launcher.Services;
 using Microsoft.Extensions.Logging;
 using Serilog;
@@ -29,6 +30,9 @@ class Program
                 rollingInterval: RollingInterval.Day,
                 retainedFileCountLimit: 10)
             .CreateLogger();
+
+        using var lifecycle = new LauncherLifecycle(AppContext.BaseDirectory, msg => Log.Information("{Message}", msg));
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => lifecycle.ShutdownAll("process-exit");
 
         try
         {
@@ -67,6 +71,7 @@ class Program
                 loggingBuilder.AddSerilog(dispose: true);
             });
 
+            appBuilder.Services.AddSingleton(lifecycle);
             appBuilder.Services.AddSingleton<KCDMP_launcher.Services.UiService>();
             appBuilder.Services.AddSingleton<KCDMP_launcher.Services.NetService>();
             appBuilder.RootComponents.Add<App>("#app");
@@ -79,6 +84,11 @@ class Program
                 .SetMaximized(true)
                 .SetResizable(true)
                 .SetContextMenuEnabled(false)
+                .RegisterWindowClosingHandler((_, _) =>
+                {
+                    lifecycle.ShutdownAll("window-close");
+                    return false;
+                })
                 .Center();
 
             // WO-50: <ApplicationIcon> in the csproj only sets the .exe's own
@@ -111,6 +121,7 @@ class Program
             };
 
             app.Run();
+            lifecycle.ShutdownAll("app-run-end");
 
             // WO-39 (item I): the launcher never logged anything on a normal
             // exit, so WO-38's "two silent sub-second crashes" (33 boot
@@ -127,6 +138,7 @@ class Program
         }
         finally
         {
+            lifecycle.ShutdownAll("main-finally");
             Log.CloseAndFlush();
         }
     }

@@ -306,6 +306,8 @@ namespace KCDMP_launcher.Pages
 
             StopExistingAgent();
             agentProcess = StartChecked(agentStartInfo);   // WO-154: Windows refusing it is told plainly by the caller
+            Lifecycle.Configure(settings.GamePath, settings.VersionIpcPort);
+            Lifecycle.TrackAgent(agentProcess, settings.VersionIpcPort);
             Log.Information("Agent started via {Via}", server.SteamCode is null ? "address" : "Steam");
             pendingServer = server;
             steamFallbackShown = false;

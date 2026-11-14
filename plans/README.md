@@ -7,7 +7,8 @@ Tracking folder for our four co-op campaign milestones on `KingdomCome-Together`
 1. Dedicated branch & git worktree per milestone under `d:\Code\kcd2\worktrees\`.
 2. Implementation plan with numbered task checklist committed first in `plans/`.
 3. One atomic commit per completed task (updating `[x]` in the milestone plan).
-4. Pull request back to `main` once all tasks and automated gates pass.
+4. Record durable design, wire, save-format, and engine-hook decisions in [../docs/adr/README.md](../docs/adr/README.md) (`docs/adr/NNNN-*.md` — never upstream `WO-*` files) so future upstream merges have clear context.
+5. Pull request back to `main` once all tasks and automated gates pass.
 
 ## Milestones
 

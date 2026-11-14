@@ -34,6 +34,7 @@ namespace KCDMP_launcher.Pages
         [Inject] public required UiService UiService { get; set; }
 
         [Inject] public required NetService NetService { get; set; }
+        [Inject] public required LauncherLifecycle Lifecycle { get; set; }
 
         #region Constants
         private const string FavoritesFileName = "favorites.json";
@@ -201,6 +202,15 @@ namespace KCDMP_launcher.Pages
         {
             LoadFavorites();
             LoadSettings();
+            Lifecycle.Configure(settings.GamePath, settings.VersionIpcPort);
+            Lifecycle.RegisterCancelCallback(() =>
+            {
+                versionPollCts?.Cancel();
+                agentPollCts?.Cancel();
+                hostPollCts?.Cancel();
+                setupPollCts?.Cancel();
+                connectGateCts?.Cancel();
+            });
             LoadCustomServers();
             StartSetupCheck();   // WO-150: in the background; replaces the old "open Settings when no game path" check
             CheckInstallIntegrity();
@@ -653,7 +663,7 @@ namespace KCDMP_launcher.Pages
                 StartAgent(pendingServer);   // WO-127: also used by the Steam -> address fallback
 
                 launchStage = LaunchStage.Connected;
-                launchStatusMessage = "The game is ready. The line at the bottom of this window shows the connection; you can close this.";
+                launchStatusMessage = "The game is ready. Minimize this window while playing; closing it shuts down Kingdom Come: Together.";
                 StateHasChanged();
             }
             catch (LaunchBlockedException lb)
@@ -917,6 +927,7 @@ namespace KCDMP_launcher.Pages
                     WorkingDirectory = Path.GetDirectoryName(relayPath)
                 };
                 hostedRelayProcess = StartChecked(relayStartInfo);
+                Lifecycle.TrackRelay(hostedRelayProcess);
                 // Give it a moment to bind before anyone tries to connect.
                 // WO-154: until it answers, or 8 s -- a relay that failed to bind used to die after the
                 // fixed 500 ms and looked hosted; the host's agent then went without its host claim.
@@ -1032,6 +1043,7 @@ namespace KCDMP_launcher.Pages
                     Log.Warning("Process.Start returned null for the master server; not retrying this launch.");
                     return;
                 }
+                Lifecycle.TrackMasterServer(hostedMasterServerProcess);
                 Log.Information("Starting local master server: {Path} (pid {Pid})", masterServerPath, hostedMasterServerProcess.Id);
 
                 // Polled rather than a single fixed delay: a self-contained
@@ -1268,11 +1280,13 @@ namespace KCDMP_launcher.Pages
 
         private void ConfirmExit()
         {
-            versionPollCts?.Cancel();
-            hostPollCts?.Cancel();
-            setupPollCts?.Cancel();   // WO-150
-            StopHostedRelay();
-            StopHostedMasterServer();
+            Lifecycle.Configure(settings.GamePath, settings.VersionIpcPort);
+            Lifecycle.ShutdownAll("exit-button");
+            hostedRelayProcess = null;
+            hostedMasterServerProcess = null;
+            agentProcess = null;
+            Log.Information("=== Launcher exiting (clean) ===");
+            Log.CloseAndFlush();
             Environment.Exit(0);
         }
 
@@ -1346,6 +1360,7 @@ namespace KCDMP_launcher.Pages
         private void SaveSettings()
         {
             WriteSettings("the settings window");
+            Lifecycle.Configure(settings.GamePath, settings.VersionIpcPort);
             showSettings = false;
         }
 

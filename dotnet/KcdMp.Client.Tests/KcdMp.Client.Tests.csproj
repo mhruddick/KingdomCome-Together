@@ -45,6 +45,8 @@
     <Compile Include="..\..\KCDMP_launcher\Models\MenuTakeover.cs" Link="Launcher\MenuTakeover.cs" />
     <!-- WO-175 S2: the rolling saves backups and their restore. -->
     <Compile Include="..\..\KCDMP_launcher\Models\Wo175Backup.cs" Link="Launcher\Wo175Backup.cs" />
+    <!-- Fork QOL: companion process & Modding Tools trace_server shutdown lifecycle. -->
+    <Compile Include="..\..\KCDMP_launcher\Models\LauncherLifecycle.cs" Link="Launcher\LauncherLifecycle.cs" />
   </ItemGroup>
 
 </Project>

@@ -286,6 +286,7 @@ namespace KCDMP_launcher.Pages
             catch (Exception ex) { Log.Warning("MP-W159 menu driver stopped: {Kind}: {Msg}", ex.GetType().Name, ex.Message); }
             try { await game.WaitForExitAsync(); } catch { }
             Log.Information("MP-W159 the game exited");
+            Lifecycle.StopTraceServerIfGameExited(settings.GamePath);
             await Wo159RemoveLogoAsync();
             string agent = ResolveAgainstLauncher(settings.AgentPath);
             if (await AgentHelper.RunAsync<W159UnstageData>(agent, "--w159 unstage", "W159", TimeSpan.FromSeconds(20)) is { } u && u.Lines.Count > 0)

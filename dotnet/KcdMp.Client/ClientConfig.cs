@@ -202,6 +202,13 @@ public sealed class ClientConfig
     public bool DiscordPresenceEnabled { get; set; } = true;
 
     /// <summary>
+    /// Opt-in per-frame diagnostic logging ([combat] pipe frame, [pos], [ghost]).
+    /// Off by default so the live console and agent.log show meaningful events and
+    /// periodic summaries instead of ~84% high-rate frame spam. CLI: --verbose.
+    /// </summary>
+    public bool VerboseLogging { get; set; } = false;
+
+    /// <summary>
     /// WO-50: this project's Discord Application ID. Not a secret — it is
     /// the public identifier Discord's client uses to look up the Rich
     /// Presence art assets and shows up in every Discord user's own client
@@ -402,6 +409,12 @@ public sealed class ClientConfig
                         break;
                     case "--no-discord":
                         DiscordPresenceEnabled = false;
+                        break;
+                    case "--verbose":
+                        VerboseLogging = true;
+                        break;
+                    case "--no-verbose":
+                        VerboseLogging = false;
                         break;
                     case "--hosting":
                         IsHosting = true;
