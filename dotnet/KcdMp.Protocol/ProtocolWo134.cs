@@ -62,14 +62,16 @@ public static partial class Protocol
     public static string LootAskName(byte k) => k switch
     {
         LootAskBodyOpen => "body-open", LootAskBodyTake => "body-take", LootAskBodyPut => "body-put", LootAskItemTake => "item-take",
-        LootAskTakedown => "takedown", LootAskTakeReq => "take-request", LootAskTakeAck => "take-ack", LootAskLiveEnd => "live-end", _ => $"unknown-{k}",
+        LootAskTakedown => "takedown", LootAskTakeReq => "take-request", LootAskTakeAck => "take-ack", LootAskLiveEnd => "live-end",
+        LootAskNestShot => "nest-shot", _ => $"unknown-{k}",
     };
 
     public static string LootHostName(byte k) => k switch
     {
         LootHostBodyState => "body-state", LootHostTakeResult => "take-result", LootHostItemResult => "item-result",
         LootHostItemGone => "item-gone", LootHostLedger => "ledger", LootHostTakedownResult => "takedown-result", LootHostBuild => "build",
-        LootHostBodyList => "body-list", LootHostTakeVerdict => "take-verdict", LootHostCorpses => "corpses", LootHostCarts => "carts", LootHostProp => "prop", LootHostPropGone => "prop-gone", _ => $"unknown-{k}",
+        LootHostBodyList => "body-list", LootHostTakeVerdict => "take-verdict", LootHostCorpses => "corpses", LootHostCarts => "carts",
+        LootHostProp => "prop", LootHostPropGone => "prop-gone", LootHostNest => "nest", _ => $"unknown-{k}",
     };
 }
 

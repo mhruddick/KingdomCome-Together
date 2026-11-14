@@ -186,6 +186,7 @@ local function world()
     w.bodySig = {}; w.chestSess = {}
     w.bodies, w.items, w.chests = true, true, true
     W217.L.sess = {}; W217.L.hostLive = {}; W217.L.hostEsc = {}; W217.L.partial = {}; W217.L.fellBack = {}; W217.L.active = 0
+    if KCD2MP_W217ForgetNests then KCD2MP_W217ForgetNests() end
     LOG = {}; TOASTS = {}; LOOTS = {}; TIMERS = {}
 end
 local function asJoiner()
@@ -769,6 +770,165 @@ check("R4c once chest streams back in, 5 reserved arrows return -> chest has all
     count(unlChest.inventory, ARROW) == 20 and #(W217.L.pendingReturns or {}) == 0, count(unlChest.inventory, ARROW))
 
 MERGE_STACKS = {}
+
+-- ================= R5: bird nests (knockdown + landing sync, tree-to-ground resolution, ReportOpened(true), and re-opening within 8 m) =================
+System.GetEntitiesByClass = function(cls)
+    local o = {}
+    for _, e in pairs(ENTS) do if e.class == cls then o[#o + 1] = e end end
+    return o
+end
+
+Nest = {
+    Client = {
+        OnHit = function(self, hit)
+            if (self.shot or 0) == 0 then
+                self:AfterShot(hit)
+                self.shot = 1
+            end
+        end,
+    },
+    AfterShot = function(self)
+        self.afterShotCount = (self.afterShotCount or 0) + 1
+    end,
+    Open = function(self, user)
+        self.bOpened = 1
+        CHEST_OPENS[#CHEST_OPENS + 1] = "nest:" .. self:GetName()
+    end,
+    OnUsed = function(self, user, slot)
+        return self:Open(user)
+    end,
+}
+
+local function mkNest(slotKey, rawName, x, y, z)
+    local e = mkWorldChest(slotKey, rawName, "Nest", x, y, z)
+    e.shot = 0
+    e.ax, e.ay, e.az = 0, 0, 0
+    e.awake = 1
+    e.SetWorldPos = function(self, p) self.px, self.py, self.pz = p.x, p.y, p.z end
+    e.GetWorldAngles = function(self) return { x = self.ax, y = self.ay, z = self.az } end
+    e.SetWorldAngles = function(self, a) self.ax, self.ay, self.az = a.x, a.y, a.z end
+    e.AwakePhysics = function(self, v) self.awake = v end
+    local strictOpenedArg = nil
+    e.stash = {
+        opened = false,
+        IsOpened = function(self) return self.opened end,
+        ReportOpened = function(self, byPlayer)
+            if type(byPlayer) ~= "boolean" then error("Wrong parameter type: ReportOpened expects boolean") end
+            strictOpenedArg = byPlayer
+            self.opened = true
+        end,
+        LastArg = function() return strictOpenedArg end,
+    }
+    setmetatable(e, { __index = Nest })
+    e.Client = Nest.Client
+    return e
+end
+
+-- R5a: Joiner re-opens the SAME fallen nest 3 times in a row while standing right beside it (< 8 m) without "The host didn't answer"
+world(); asJoiner()
+KCD2MP_W217ChestInstall()
+CHEST_OPENS = {}; TOASTS = {}; LOG = {}
+player.GetWorldPos = function() return { x = 1655.0, y = 1737.5, z = 76.9 } end
+local jNest141 = mkNest("j_nest141", "Nest1[Stash/nest141_4e0a7d99-5271-4187-b874-f54cfe686adf]", 1655.68, 1737.81, 76.92)
+jNest141.shot = 1
+local k141 = KCD2MP_W217ChestKey(jNest141)
+
+-- Open #1 (with 1 egg)
+jNest141:OnUsed(player, 1)
+KCD2MP_W217BodyList(k141, 1, 1, 1, { { id = "negg1", cls = EGG, amt = 1, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("R5a first nest open opens UI with Host's egg", #CHEST_OPENS == 1 and count(jNest141.inventory, EGG) == 1)
+-- Close UI while still standing 0.8 m from the nest (L.sess[k141] stays alive!)
+jNest141.bOpened = 0
+if KCD2MP_W166AudioLine then KCD2MP_W166AudioLine("PlayAudio: ui_inv_screen_out_one_pane") end
+if KCD2MP_W201InvScreen then KCD2MP_W201InvScreen("out", "element") end
+
+-- Open #2 after Host looted the nest empty (rev=2, empty list) while L.sess[k141] is still alive
+jNest141:OnUsed(player, 1)
+KCD2MP_W217BodyList(k141, 2, 1, 1, {})
+NOW = NOW + 5.0
+KCD2MP.w134.loopOnce()
+check("R5a second open within 8 m opens empty nest UI immediately and never times out with 'The host didn't answer'",
+    #CHEST_OPENS == 2 and count(jNest141.inventory, EGG) == 0 and KCD2MP.w134.pendingOpen[k141] == nil and #TOASTS == 0,
+    TOASTS[1])
+
+-- Open #3 right after closing again
+jNest141.bOpened = 0
+if KCD2MP_W166AudioLine then KCD2MP_W166AudioLine("PlayAudio: ui_inv_screen_out_one_pane") end
+jNest141:OnUsed(player, 1)
+KCD2MP_W217BodyList(k141, 3, 1, 1, {})
+check("R5a third consecutive open within 8 m also opens UI cleanly", #CHEST_OPENS == 3 and KCD2MP.w134.pendingOpen[k141] == nil)
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- R5b: Fallen Joiner nest key resolves Host's unshot nest 7.6 m up in tree (and 60 m downhill), passes boolean to ReportOpened(true), and never cross-matches nearby nest141
+world(); asHost(1)
+KCD2MP_W217ChestInstall()
+local hNest140 = mkNest("h_nest140", "Nest1[Stash/nest140_a95925c4-5c63-4e46-840e-03b1a56d7e32]", 1657.082, 1736.691, 84.797)
+hNest140.inventory:CreateItem(EGG, 1, 2)
+local hNest141 = mkNest("h_nest141", "Nest1[Stash/nest141_4e0a7d99-5271-4187-b874-f54cfe686adf]", 1655.680, 1737.810, 76.920)
+hNest141.shot = 1
+local jFallenKey140 = KCD2MP_W217EncodeChestKey("Nest", "Nest1[Stash/nest140_a95925c4-5c63-4e46-840e-03b1a56d7e32]", 1655.91, 1736.08, 77.30)
+local jRolled60mKey140 = KCD2MP_W217EncodeChestKey("Nest", "Nest1[Stash/nest140_a95925c4-5c63-4e46-840e-03b1a56d7e32]", 1710.00, 1736.08, 65.00)
+check("R5b fallen nest140 key resolves hNest140 in tree (7.6 m up) and across 60 m hillside roll without matching hNest141 1.8 m away",
+    KCD2MP_W217ResolveChestKey(jFallenKey140) == hNest140 and KCD2MP_W217ResolveChestKey(jRolled60mKey140) == hNest140)
+LOG = {}
+KCD2MP_W134HostOpen(1, 0, jFallenKey140)
+check("R5b HostOpen on fallen Joiner nest resolves hNest140, calls ReportOpened(true) without script error, drops unshot Host nest, and sends w217_blist",
+    #events("w217_blist") == 1 and #events("w134_bstate") == 0 and hNest140.stash.LastArg() == true and hNest140.shot == 1 and #ERRS == 0,
+    ERRS[1] or events("w217_blist")[1])
+
+-- R5c: Host shoots a nest -> emits w217_nest (shot + settled) -> Joiner drops same nest and snaps to Host's exact settled ground spot
+world(); asHost(1)
+KCD2MP_W217ChestInstall()
+TIMERS = {}; LOG = {}
+local hsNest = mkNest("hs_nest", "Nest1[Stash/nest200_11111111-2222-3333-4444-555555555555]", 500.0, 600.0, 28.0)
+local treeKey200 = KCD2MP_W217ChestKey(hsNest)
+hsNest.Client.OnHit(hsNest, {})
+local shotEvt = events("w217_nest")[1] or ""
+check("R5c Host shooting nest emits immediate w217_nest with tree key and settled=0",
+    hsNest.shot == 1 and shotEvt:find("^" .. treeKey200 .. " ") ~= nil and shotEvt:sub(-2) == " 0", shotEvt)
+-- Simulate physics falling & coming to rest at (504.25, 602.50, 19.40)
+hsNest:SetWorldPos({ x = 504.25, y = 602.50, z = 19.40 })
+hsNest:SetWorldAngles({ x = 0.1, y = -0.2, z = 1.2 })
+for _ = 1, 4 do
+    NOW = NOW + 0.3
+    local curTimers = TIMERS; TIMERS = {}
+    for _, tm in ipairs(curTimers) do tm.f() end
+end
+local settledEvts = events("w217_nest")
+local lastSettled = settledEvts[#settledEvts] or ""
+check("R5c once Host nest rests, Host emits w217_nest settled=1 at resting coordinates",
+    lastSettled:find("504.250 602.500 19.400", 1, true) ~= nil and lastSettled:sub(-2) == " 1", lastSettled)
+
+-- Apply on Joiner: Joiner's nest drops out of tree without re-emitting w217_nestask and snaps to (504.25, 602.50, 19.40) asleep
+world(); asJoiner()
+KCD2MP_W217ChestInstall()
+LOG = {}
+local jsNest = mkNest("js_nest", "Nest1[Stash/nest200_11111111-2222-3333-4444-555555555555]", 500.0, 600.0, 28.0)
+KCD2MP_W217OnHostNest(treeKey200, 500.0, 600.0, 28.0, 0, 0, 0, 0)
+check("R5c Joiner drops nest on settled=0 without echoing w217_nestask",
+    jsNest.shot == 1 and jsNest.afterShotCount == 1 and #events("w217_nestask") == 0)
+KCD2MP_W217OnHostNest(treeKey200, 504.25, 602.50, 19.40, 0.1, -0.2, 1.2, 1)
+check("R5c Joiner snaps fallen nest to Host's settled ground coordinates and puts physics to sleep",
+    math.abs(jsNest.px - 504.25) < 0.001 and math.abs(jsNest.py - 602.50) < 0.001 and math.abs(jsNest.pz - 19.40) < 0.001 and jsNest.awake == 0)
+
+-- R5d: Joiner shoots a nest -> emits w217_nestask -> Host drops its nest (shot=1) and broadcasts authoritative pose
+world(); asJoiner()
+KCD2MP_W217ChestInstall()
+LOG = {}; TIMERS = {}
+local jShotNest = mkNest("jshot_nest", "Nest1[Stash/nest201_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]", 610.0, 710.0, 30.0)
+local treeKey201 = KCD2MP_W217ChestKey(jShotNest)
+jShotNest.Client.OnHit(jShotNest, {})
+local askEvt = events("w217_nestask")[1] or ""
+check("R5d Joiner shooting nest emits w217_nestask with untouched tree key",
+    jShotNest.shot == 1 and askEvt:find("^" .. treeKey201 .. " ") ~= nil, askEvt)
+
+world(); asHost(1)
+KCD2MP_W217ChestInstall()
+LOG = {}; TIMERS = {}
+local hShotNest = mkNest("hshot_nest", "Nest1[Stash/nest201_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee]", 610.0, 710.0, 30.0)
+KCD2MP_W217HostNestShot(1, treeKey201, 610.0, 710.0, 30.0, 0, 0, 0, 0)
+check("R5d Host receives Joiner nest shot, marks shot=1 on Host for .whs save, and broadcasts knockdown",
+    hShotNest.shot == 1 and hShotNest.afterShotCount == 1 and #events("w217_nest") == 1)
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

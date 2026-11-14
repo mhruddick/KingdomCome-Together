@@ -193,4 +193,36 @@ public class Wo217Tests
         Assert.False(Wo217LootRules.TryDecodeChestKey("wc_X_p1_p2_p3_00000000_c", out _, out _, out _, out _, out _));
         Assert.False(Wo217LootRules.TryDecodeChestKey("wc_S_p1_p2_p3_00000000_bad\"quote", out _, out _, out _, out _, out _));
     }
+
+    [Fact]
+    public void Nest_and_destrostash_shot_messages_parse_and_fit_relay_loot_rows()
+    {
+        Assert.Equal("nest-shot", Protocol.LootAskName(Protocol.LootAskNestShot));
+        Assert.Equal("nest", Protocol.LootHostName(Protocol.LootHostNest));
+
+        const string nestName = "Nest1[Stash/nest140_a95925c4-5c63-4e46-840e-03b1a56d7e32]";
+        string key = Wo217LootRules.EncodeChestKey("Nest", nestName, 1657.082f, 1736.691f, 84.797f)!;
+        Assert.NotNull(key);
+
+        string wire = $"{key} 1655.910 1736.080 77.300 0.1250 -0.2500 1.5708 1";
+        var parsed = Wo217LootRules.ParseNestShot(wire);
+        Assert.NotNull(parsed);
+        Assert.Equal(key, parsed!.Key);
+        Assert.Equal("Nest", parsed.ContainerClass);
+        Assert.Equal(1655.910f, parsed.X, 3);
+        Assert.Equal(1736.080f, parsed.Y, 3);
+        Assert.Equal(77.300f, parsed.Z, 3);
+        Assert.True(parsed.Settled);
+
+        var upAsk = new LootMsg(Protocol.LootAskNestShot, 0, wire).BuildUp(Protocol.LootAskUp, Protocol.JoinTargetHost);
+        var upHost = new LootMsg(Protocol.LootHostNest, 0, wire).BuildUp(Protocol.LootHostUp, 1);
+        Assert.True(Protocol.IsUpLenOk(Protocol.LootAskUp, upAsk.Length - 3));
+        Assert.True(Protocol.IsUpLenOk(Protocol.LootHostUp, upHost.Length - 3));
+
+        // Regular Stash chest keys and malformed payloads are rejected by ParseNestShot
+        string stashKey = Wo217LootRules.EncodeChestKey("Stash", "Stash19", 100f, 200f, 10f)!;
+        Assert.Null(Wo217LootRules.ParseNestShot($"{stashKey} 100 200 10 0 0 0 1"));
+        Assert.Null(Wo217LootRules.ParseNestShot($"{key} 100 200 10 0 0 0 2"));
+        Assert.Null(Wo217LootRules.ParseNestShot($"{key} NaN 200 10 0 0 0 1"));
+    }
 }

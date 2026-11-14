@@ -6993,6 +6993,7 @@ function KCD2MP_W136Hold(on, ttlS, why)
                 p.nativeRetryAt = nil
             end
             if KCD2MP.w160 and KCD2MP.w160.parkedPeerHorses then KCD2MP.w160.parkedPeerHorses = {} end
+            if KCD2MP_W217ForgetNests then pcall(KCD2MP_W217ForgetNests) end
             mp_log(string.format("WO136-HOLD on why=%s ttl_s=%d -- no NPC is paused, puppeted, bound, parked or written until the world has loaded",
                 w.holdWhy, ttl))
         end
@@ -17409,6 +17410,10 @@ function KCD2MP_W134LootRequest(body, orig, user, slot)
     if not (w.bodies and KCD2MP_W134JoinerActive()) then return false end
     local name = W134.name(body)
     if not name then return false end
+    if KCD2MP_W217LootLive and KCD2MP_W217LootLive() and W217 and W217.L and W217.L.sess[name] then
+        if KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(name) then return false end
+        W217.L.sess[name].opened = false
+    end
     w.pendingOpen[name] = { at = os.clock(), ent = body, orig = orig, user = user, slot = slot }
     w.stats.opens = w.stats.opens + 1
     KCD2MP_EmitEvent("w134_open", name)
@@ -17454,7 +17459,8 @@ function W134.bodyState(name, reason, flags, list)
             if s and W217.L.abortSession then W217.L.abortSession(name, s) else W217.L.sess[name] = nil end
         end
         if isChest then
-            KCD2MP_ShowNativeToast("Move closer to your host to open this chest.")
+            local wantCls = KCD2MP_W217DecodeChestKey and KCD2MP_W217DecodeChestKey(name) or nil
+            KCD2MP_ShowNativeToast(wantCls == "Nest" and "Move closer to your host to open this nest." or "Move closer to your host to open this chest.")
             W134.log(string.format("WO217-CHEST open-deferred key=%s reason=%s -- unresolved on host; local chest untouched", tostring(name), tostring(reason)))
         elseif reason == "open" then
             KCD2MP_ShowNativeToast("The host's body isn't ready yet -- try again.")
@@ -18405,8 +18411,9 @@ function W134.loop()
             W134.log(string.format("WO134-ITEM timeout tok=%s cls=%s", tok, tostring(r.cls)))
         end
     end
-    -- joiner: cached tombstones for unstreamed world items
+    -- joiner: cached tombstones for unstreamed world items and unstreamed fallen nests
     if KCD2MP_W134JoinerActive() and w.items then W134.sweepJoinerTombstones() end
+    if KCD2MP_W134JoinerActive() and KCD2MP_W217SweepShotStashes then pcall(KCD2MP_W217SweepShotStashes) end
     -- host
     if #w.hostVerify > 0 then W134.hostVerifyPass() end
     if w.host and w.shared and W134.fresh() and w.items then W134.sweepHostTombstones() end
@@ -18424,6 +18431,7 @@ function W134.forgetWorld(why)
     for _ in pairs(w.chestSess) do n = n + 1 end
     w.chestSess = {}; w.sessions = {}; w.pendingOpen = {}; w.itemReq = {}; w.stash = {}; w.partial = {}; w.hostVerify = {}
     w.hostTaken = {}; w.goneWorldItems = {}; w.goneTombstones = {}
+    if KCD2MP_W217ForgetNests then pcall(KCD2MP_W217ForgetNests) end
     if KCD2MP.w166 then KCD2MP.w166.loot.openOn = nil; KCD2MP.w166.loot.deferred = {}; KCD2MP.w166.loot.takebacks = {} end   -- WO-166 L1: a new world
     KCD2MP_EmitEvent("w134_itomb", "sync")
     if n > 0 then W134.log(string.format("WO134-CHEST reset why=%s -- %d chest snapshot(s) dropped; the next pass takes new ones", tostring(why), n)) end
@@ -36900,13 +36908,31 @@ do
     function KCD2MP_W217ResolveChestKey(key)
         local wantCls, x, y, z, hash8 = KCD2MP_W217DecodeChestKey(key)
         if not wantCls then return nil end
-        local radii = wantCls == "CartStash" and { 2.5, 8.0 } or { 2.5 }
+        local radii = wantCls == "CartStash" and { 2.5, 8.0 }
+            or (wantCls == "Nest" and { 2.5, 15.0, 45.0 } or { 2.5 })
         for _, r in ipairs(radii) do
             local best, bd2 = nil, r * r
             local ents = {}
             pcall(function() ents = System.GetEntitiesInSphere({ x = x, y = y, z = z }, r + 0.05) or {} end)
             for _, e in ipairs(ents) do
                 if e and e.class == wantCls and KCD2MP_W217IsSharedChest(e) then
+                    local nm, p = nil, nil
+                    pcall(function() nm = e:GetName() end)
+                    pcall(function() p = e:GetWorldPos() end)
+                    if nm and p and KCD2MP_W217ChestHash(nm) == hash8 then
+                        local d2 = (p.x - x) ^ 2 + (p.y - y) ^ 2 + (p.z - z) ^ 2
+                        if d2 <= bd2 then best, bd2 = e, d2 end
+                    end
+                end
+            end
+            if best then return best end
+        end
+        if wantCls == "Nest" and System.GetEntitiesByClass then
+            local best, bd2 = nil, 120.0 * 120.0
+            local ents = {}
+            pcall(function() ents = System.GetEntitiesByClass("Nest") or {} end)
+            for _, e in ipairs(ents) do
+                if e and KCD2MP_W217IsSharedChest(e) then
                     local nm, p = nil, nil
                     pcall(function() nm = e:GetName() end)
                     pcall(function() p = e:GetWorldPos() end)
@@ -36932,7 +36958,7 @@ do
     function L.markChestTouched(e)
         if not (e and KCD2MP_W217IsSharedChest(e)) then return end
         pcall(function()
-            if e.stash and type(e.stash.ReportOpened) == "function" then e.stash:ReportOpened() end
+            if e.stash and type(e.stash.ReportOpened) == "function" then e.stash:ReportOpened(true) end
         end)
     end
 
@@ -36983,7 +37009,10 @@ do
         if locked then return false end
         local key = KCD2MP_W217ChestKey(ent)
         if not key then return false end
-        if L.sess[key] and KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(key) then return false end
+        if L.sess[key] then
+            if KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(key) then return false end
+            L.sess[key].opened = false
+        end
         local w = KCD2MP.w134
         w.pendingOpen[key] = {
             at = os.clock(),
@@ -37006,8 +37035,228 @@ do
         return true
     end
 
+    L.fallingNests = L.fallingNests or {}
+    L.hostShotStashes = L.hostShotStashes or {}
     L.wrappedOpenFns = L.wrappedOpenFns or {}
     L.wrappedUsedFns = L.wrappedUsedFns or {}
+    L.wrappedAfterShotFns = L.wrappedAfterShotFns or {}
+    L.wrappedOnHitFns = L.wrappedOnHitFns or {}
+
+    function KCD2MP_W217ForgetNests()
+        L.fallingNests = {}
+        L.hostShotStashes = {}
+        L.nestWatchTimer = false
+        L.nestWatchAt = nil
+    end
+
+    function L.nestAngles(e)
+        local a = nil
+        pcall(function() if e and e.GetWorldAngles then a = e:GetWorldAngles() end end)
+        if type(a) == "table" and a.x and a.y and a.z then return a end
+        return { x = 0, y = 0, z = 0 }
+    end
+
+    function L.emitNestEvent(evName, key, e, settled)
+        if not (key and e) then return false end
+        local p = nil
+        pcall(function() p = e:GetWorldPos() end)
+        if not p then return false end
+        local a = L.nestAngles(e)
+        KCD2MP_EmitEvent(evName, string.format("%s %.3f %.3f %.3f %.4f %.4f %.4f %d",
+            tostring(key), p.x, p.y, p.z, a.x or 0, a.y or 0, a.z or 0, settled and 1 or 0))
+        return true
+    end
+
+    function L.applyRemoteShot(e, x, y, z, ax, ay, az, settled, placePose)
+        if not e then return false end
+        local wasShot = false
+        pcall(function() wasShot = (e.shot or 0) ~= 0 end)
+        if not wasShot then
+            L.bypassAfterShot = true
+            pcall(function() if type(e.AfterShot) == "function" then e:AfterShot() end end)
+            L.bypassAfterShot = false
+            pcall(function() e.shot = 1; e.__w217ShotDone = true end)
+        end
+        if e.class == "Nest" and placePose and x and y and z then
+            pcall(function()
+                if e.SetWorldPos then e:SetWorldPos({ x = x, y = y, z = z }) end
+                if ax and ay and az and e.SetWorldAngles then e:SetWorldAngles({ x = ax, y = ay, z = az }) end
+                if tonumber(settled) == 1 and e.AwakePhysics then e:AwakePhysics(0) end
+            end)
+        end
+        return not wasShot
+    end
+
+    function L.nestWatchTick()
+        L.nestWatchTimer = false
+        if not L.fallingNests or next(L.fallingNests) == nil then return end
+        local now = os.clock()
+        L.nestWatchAt = now
+        for key, st in pairs(L.fallingNests) do
+            local roleOk = st.asJoiner and (KCD2MP_W134JoinerActive and KCD2MP_W134JoinerActive())
+                or ((not st.asJoiner) and KCD2MP_W134HostActive and KCD2MP_W134HostActive())
+            local p = nil
+            if roleOk and st.ent then pcall(function() p = st.ent:GetWorldPos() end) end
+            if not p then
+                L.fallingNests[key] = nil
+            else
+                local d2 = (p.x - st.lastX) ^ 2 + (p.y - st.lastY) ^ 2 + (p.z - st.lastZ) ^ 2
+                local fromStart2 = (p.x - st.startX) ^ 2 + (p.y - st.startY) ^ 2 + (p.z - st.startZ) ^ 2
+                st.lastX, st.lastY, st.lastZ = p.x, p.y, p.z
+                if fromStart2 > 0.04 or (now - st.since) >= 1.25 then
+                    if d2 < 0.0009 then st.quiet = st.quiet + 1 else st.quiet = 0 end
+                end
+                if not st.asJoiner and d2 >= 0.04 and (now - st.lastSent) >= 0.75 then
+                    st.lastSent = now
+                    L.emitNestEvent("w217_nest", key, st.ent, false)
+                end
+                if st.quiet >= 3 or (now - st.since) >= 12.0 then
+                    L.fallingNests[key] = nil
+                    if st.asJoiner then
+                        L.emitNestEvent("w217_nestask", key, st.ent, true)
+                    else
+                        if st.joinerSettled and fromStart2 < 0.09 then
+                            local js = st.joinerSettled
+                            L.applyRemoteShot(st.ent, js.x, js.y, js.z, js.ax, js.ay, js.az, 1, true)
+                        end
+                        L.emitNestEvent("w217_nest", key, st.ent, true)
+                        local fp = st.ent:GetWorldPos()
+                        if fp then lg("WO217-NEST host-settled key=%s at=(%.2f,%.2f,%.2f)", key, fp.x, fp.y, fp.z) end
+                    end
+                end
+            end
+        end
+        if next(L.fallingNests) ~= nil then
+            L.nestWatchTimer = true
+            Script.SetTimer(250, L.nestWatchTick)
+        end
+    end
+
+    function L.trackFallingNest(e, key, asJoiner)
+        if not (e and e.class == "Nest" and key) then return end
+        local p = nil
+        pcall(function() p = e:GetWorldPos() end)
+        if not p then return end
+        local now = os.clock()
+        local prev = L.fallingNests[key]
+        L.fallingNests[key] = {
+            ent = e, key = key, asJoiner = asJoiner == true,
+            startX = p.x, startY = p.y, startZ = p.z,
+            lastX = p.x, lastY = p.y, lastZ = p.z,
+            since = now, lastSent = now, quiet = 0,
+            joinerSettled = prev and prev.joinerSettled or nil,
+        }
+        if not L.nestWatchTimer or (now - (L.nestWatchAt or -1e9)) > 0.6 then
+            L.nestWatchTimer = true
+            L.nestWatchAt = now
+            Script.SetTimer(250, L.nestWatchTick)
+        end
+    end
+
+    function L.onLocalShootableHit(ent, preKey)
+        if not (ent and KCD2MP_W217ChestLive()) then return end
+        local key = preKey or KCD2MP_W217ChestKey(ent)
+        if not key then return end
+        if KCD2MP_W134HostActive and KCD2MP_W134HostActive() then
+            local settled = ent.class ~= "Nest"
+            L.emitNestEvent("w217_nest", key, ent, settled)
+            if ent.class == "Nest" then L.trackFallingNest(ent, key, false) end
+            lg("WO217-NEST host-shot key=%s class=%s", key, tostring(ent.class))
+        elseif KCD2MP_W134JoinerActive and KCD2MP_W134JoinerActive() then
+            local settled = ent.class ~= "Nest"
+            L.emitNestEvent("w217_nestask", key, ent, settled)
+            if ent.class == "Nest" then L.trackFallingNest(ent, key, true) end
+            lg("WO217-NEST joiner-shot key=%s class=%s -- asked host to drop and sync pose", key, tostring(ent.class))
+        end
+    end
+
+    function KCD2MP_W217HostNestShot(peer, key, x, y, z, ax, ay, az, settled)
+        if not (KCD2MP_W217ChestLive() and KCD2MP_W134HostActive and KCD2MP_W134HostActive()) then return false end
+        key = tostring(key or "")
+        x, y, z = tonumber(x), tonumber(y), tonumber(z)
+        ax, ay, az = tonumber(ax) or 0, tonumber(ay) or 0, tonumber(az) or 0
+        local isSettled = tonumber(settled) == 1
+        local e = KCD2MP_W217ResolveChestKey(key)
+        if not e then
+            lg("WO217-NEST host-shot-unresolved key=%s peer=%s", key, tostring(peer))
+            return false
+        end
+        if e.class == "DestroStash" then
+            if L.applyRemoteShot(e, x, y, z, ax, ay, az, 1, false) then
+                L.emitNestEvent("w217_nest", key, e, true)
+                lg("WO217-NEST host-destrostash key=%s from=%s -- broken on host", key, tostring(peer))
+            end
+            return true
+        end
+        local newlyShot = L.applyRemoteShot(e, x, y, z, ax, ay, az, 0, false)
+        if newlyShot then
+            L.emitNestEvent("w217_nest", key, e, false)
+            L.trackFallingNest(e, key, false)
+            lg("WO217-NEST host-drop key=%s from=%s -- dropped on host", key, tostring(peer))
+        end
+        if isSettled then
+            local st = L.fallingNests and L.fallingNests[key] or nil
+            if st then
+                st.joinerSettled = { x = x, y = y, z = z, ax = ax, ay = ay, az = az }
+            else
+                local hp = nil
+                pcall(function() hp = e:GetWorldPos() end)
+                if hp and z and (hp.z - z) > 1.5 then
+                    L.applyRemoteShot(e, x, y, z, ax, ay, az, 1, true)
+                end
+                L.emitNestEvent("w217_nest", key, e, true)
+            end
+        end
+        return true
+    end
+
+    function KCD2MP_W217OnHostNest(key, x, y, z, ax, ay, az, settled)
+        if not (KCD2MP_W217ChestLive() and KCD2MP_W134JoinerActive and KCD2MP_W134JoinerActive()) then return false end
+        key = tostring(key or "")
+        x, y, z = tonumber(x), tonumber(y), tonumber(z)
+        ax, ay, az = tonumber(ax) or 0, tonumber(ay) or 0, tonumber(az) or 0
+        local isSettled = tonumber(settled) == 1
+        if isSettled and L.fallingNests then L.fallingNests[key] = nil end
+        local e = KCD2MP_W217ResolveChestKey(key)
+        if not e then
+            local count = 0
+            for _ in pairs(L.hostShotStashes) do count = count + 1 end
+            if count < 64 or L.hostShotStashes[key] then
+                L.hostShotStashes[key] = { key = key, x = x, y = y, z = z, ax = ax, ay = ay, az = az, settled = isSettled and 1 or 0 }
+            end
+            return false
+        end
+        L.hostShotStashes[key] = nil
+        if e.class == "DestroStash" then
+            L.applyRemoteShot(e, x, y, z, ax, ay, az, 1, false)
+            return true
+        end
+        L.applyRemoteShot(e, x, y, z, ax, ay, az, isSettled and 1 or 0, isSettled)
+        if isSettled then lg("WO217-NEST joiner-synced key=%s at=(%.2f,%.2f,%.2f)", key, x or 0, y or 0, z or 0) end
+        return true
+    end
+
+    function KCD2MP_W217SweepShotStashes()
+        if not L.hostShotStashes or next(L.hostShotStashes) == nil or not player then return false end
+        local pp = nil
+        pcall(function() pp = player:GetWorldPos() end)
+        if not pp then return false end
+        for key, rec in pairs(L.hostShotStashes) do
+            if rec.x and rec.y and ((pp.x - rec.x) ^ 2 + (pp.y - rec.y) ^ 2) <= (120.0 * 120.0) then
+                local e = KCD2MP_W217ResolveChestKey(key)
+                if e then
+                    L.hostShotStashes[key] = nil
+                    if e.class == "DestroStash" then
+                        L.applyRemoteShot(e, rec.x, rec.y, rec.z, rec.ax, rec.ay, rec.az, 1, false)
+                    else
+                        L.applyRemoteShot(e, rec.x, rec.y, rec.z, rec.ax, rec.ay, rec.az, rec.settled, rec.settled == 1)
+                    end
+                end
+            end
+        end
+        return true
+    end
+
     function KCD2MP_W217ChestInstall()
         for _, clsName in ipairs({ "Stash", "CartStash", "Nest", "DestroStash" }) do
             local tbl = rawget(_G, clsName)
@@ -37039,6 +37288,45 @@ do
                     end
                     L.wrappedUsedFns[wrapUsed] = true
                     tbl.OnUsed = wrapUsed
+                end
+            end
+        end
+        for _, clsName in ipairs({ "ShootableStashBase", "Nest", "DestroStash" }) do
+            local tbl = rawget(_G, clsName)
+            if type(tbl) == "table" then
+                if type(tbl.AfterShot) == "function" and not L.wrappedAfterShotFns[tbl.AfterShot] then
+                    local origAfterShot = tbl.AfterShot
+                    local wrapAfterShot = function(self, ...)
+                        local preKey = nil
+                        if not L.bypassAfterShot and self and (self.class == "Nest" or self.class == "DestroStash") and not self.__w217ShotDone and (self.shot or 0) == 0 then
+                            preKey = KCD2MP_W217ChestKey(self)
+                        end
+                        local r = origAfterShot(self, ...)
+                        if preKey and not L.bypassAfterShot and not self.__w217ShotDone then
+                            self.__w217ShotDone = true
+                            pcall(L.onLocalShootableHit, self, preKey)
+                        end
+                        return r
+                    end
+                    L.wrappedAfterShotFns[wrapAfterShot] = true
+                    tbl.AfterShot = wrapAfterShot
+                end
+                if type(tbl.Client) == "table" and type(tbl.Client.OnHit) == "function" and not L.wrappedOnHitFns[tbl.Client.OnHit] then
+                    local origOnHit = tbl.Client.OnHit
+                    local wrapOnHit = function(self, hit, ...)
+                        local preKey = nil
+                        if not L.bypassAfterShot and self and (self.class == "Nest" or self.class == "DestroStash") and not self.__w217ShotDone and (self.shot or 0) == 0 then
+                            preKey = KCD2MP_W217ChestKey(self)
+                        end
+                        local r = origOnHit(self, hit, ...)
+                        if preKey and not L.bypassAfterShot and not self.__w217ShotDone and (self.shot or 0) ~= 0 then
+                            self.__w217ShotDone = true
+                            pcall(L.onLocalShootableHit, self, preKey)
+                        end
+                        return r
+                    end
+                    L.wrappedOnHitFns[wrapOnHit] = true
+                    tbl.Client.OnHit = wrapOnHit
                 end
             end
         end
@@ -37157,6 +37445,17 @@ do
                 KCD2MP_EmitEvent("w134_bstate", string.format("%s 0 %s open 2 1 1 -", tostring(peer), name))
                 lg("WO217-CHEST host-open-unresolved key=%s peer=%s -- chest not loaded on host; refused open", name, tostring(peer))
                 return false
+            end
+            if ce.class == "Nest" then
+                local unshot = false
+                pcall(function() unshot = (ce.shot or 0) == 0 end)
+                if unshot then
+                    local _, qx, qy, qz = KCD2MP_W217DecodeChestKey(name)
+                    if L.applyRemoteShot(ce, qx, qy, qz, 0, 0, 0, 0, false) then
+                        L.emitNestEvent("w217_nest", name, ce, false)
+                        L.trackFallingNest(ce, name, false)
+                    end
+                end
             end
             L.ensureHostChestInit(ce)
         else
@@ -37808,19 +38107,23 @@ do
         lg("WO217-LOOT list npc=%s rev=%d items=%d -> made=%d out=%d flags=%d", name, rev, #list, made, out, flagsSet)
         if out > 0 then KCD2MP_EmitEvent("w218_lootout", string.format("%s %d %d", name, rev, out)) end   -- WO-218 E.4: the screen's rows went now
         s.snap = L.ids(e)
-        if po and not s.opened then
+        if po then
             w.pendingOpen[name] = nil
-            s.opened = true
-            s.at = os.clock()
-            s.pinv = L.ids(player)
-            local openReach = KCD2MP_W217IsChestKey(name) and 7.0 or 5.0
-            if W134.near(e, openReach) then
-                if KCD2MP_W201InvIntent then pcall(KCD2MP_W201InvIntent, name, "ours") end
-                local ok, err = pcall(function() po.orig(po.ent, po.user or player, po.slot) end)
-                if ok and KCD2MP_W166LootOpened then KCD2MP_W166LootOpened(name, "ours") end
-                lg("WO217-LOOT open npc=%s -- the loot screen opens on the host's items (%d), live ok=%s%s", name, #list, tostring(ok), ok and "" or (" err=" .. tostring(err)))
+            local alreadyOpen = KCD2MP_W166LootOpenOn and KCD2MP_W166LootOpenOn(name)
+            if not s.opened and not alreadyOpen and (now - po.at) <= 8.0 then
+                s.opened = true
+                s.at = os.clock()
+                s.pinv = L.ids(player)
+                local openReach = KCD2MP_W217IsChestKey(name) and 7.0 or 5.0
+                local nearOk = W134.near(e, openReach) or (po.ent ~= nil and po.ent ~= e and W134.near(po.ent, openReach))
+                if nearOk then
+                    if KCD2MP_W201InvIntent then pcall(KCD2MP_W201InvIntent, name, "ours") end
+                    local ok, err = pcall(function() po.orig(po.ent or e, po.user or player, po.slot) end)
+                    if ok and KCD2MP_W166LootOpened then KCD2MP_W166LootOpened(name, "ours") end
+                    lg("WO217-LOOT open npc=%s -- the loot screen opens on the host's items (%d), live ok=%s%s", name, #list, tostring(ok), ok and "" or (" err=" .. tostring(err)))
+                end
+                L.setActive()
             end
-            L.setActive()
         end
     end
     -- the agent, ten times a second while a session lives (both machines)
@@ -38382,6 +38685,7 @@ local ok2, err2 = pcall(function()
         if origOnInit then origOnInit(self) end
         System.LogAlways("[KCD2-MP] Player loaded!")
         KCD2MP_GetPos()
+        if KCD2MP_W217ChestInstall then pcall(KCD2MP_W217ChestInstall) end
         if KCD2MP_W175AfterLoad then pcall(KCD2MP_W175AfterLoad, "oninit") end   -- WO-175: every load (no agent needed): the save-lock chain
 
         -- Re-install OnAction hooks here (after player fully initialized).

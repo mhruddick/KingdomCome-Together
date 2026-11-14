@@ -120,6 +120,14 @@ public partial class GameBridge
                 if (Wo134Rules.BodyName.IsMatch(arg ?? ""))
                     _ = Wo134SendAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskLiveEnd, 0, arg!);
                 return true;
+            case "w217_nestask": // joiner: <wc_key> <x> <y> <z> <ax> <ay> <az> <settled:0|1>
+                if (arg is { Length: > 0 } && arg.Length <= Protocol.LootTextMax && Wo217LootRules.ParseNestShot(arg) is not null)
+                    _ = Wo134SendAsync(Protocol.LootAskUp, Protocol.JoinTargetHost, Protocol.LootAskNestShot, 0, arg);
+                return true;
+            case "w217_nest":    // host: <wc_key> <x> <y> <z> <ax> <ay> <az> <settled:0|1>
+                if (arg is { Length: > 0 } && arg.Length <= Protocol.LootTextMax && Wo217LootRules.ParseNestShot(arg) is not null)
+                    foreach (byte j in Wo134Peers()) _ = Wo134SendAsync(Protocol.LootHostUp, j, Protocol.LootHostNest, 0, arg);
+                return true;
         }
         return false;
     }
@@ -145,7 +153,12 @@ public partial class GameBridge
                     if (!Wo134HostRole) return true;
                     await ExecLuaAsync($"if KCD2MP_W217HostEnd then KCD2MP_W217HostEnd({src}, \"{f[0]}\") end");
                     return true;
-                case Protocol.LootAskTakeReq or Protocol.LootAskTakeAck or Protocol.LootAskLiveEnd:
+                case Protocol.LootAskNestShot when Wo217LootRules.ParseNestShot(m.Text) is { } ns:
+                    if (!Wo134HostRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
+                    await ExecLuaAsync(string.Create(CultureInfo.InvariantCulture,
+                        $"if KCD2MP_W217HostNestShot then KCD2MP_W217HostNestShot({src}, \"{ns.Key}\", {ns.X:0.###}, {ns.Y:0.###}, {ns.Z:0.###}, {ns.Ax:0.####}, {ns.Ay:0.####}, {ns.Az:0.####}, {(ns.Settled ? 1 : 0)}) end"));
+                    return true;
+                case Protocol.LootAskTakeReq or Protocol.LootAskTakeAck or Protocol.LootAskLiveEnd or Protocol.LootAskNestShot:
                     Interlocked.Increment(ref _w217LootDropped);
                     Console.WriteLine($"MP-W217 loot: a malformed {Protocol.LootAskName(m.Kind)} from ghost {src} -- dropped");
                     return true;
@@ -186,7 +199,12 @@ public partial class GameBridge
                 if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
                 await Wo217OnCartsAsync(carts.HostMs, carts.Rows);
                 return true;
-            case Protocol.LootHostBodyList or Protocol.LootHostTakeVerdict or Protocol.LootHostCorpses or Protocol.LootHostCarts or Protocol.LootHostProp or Protocol.LootHostPropGone:
+            case Protocol.LootHostNest when Wo217LootRules.ParseNestShot(m.Text) is { } hn:
+                if (!Wo134JoinerRole) { Interlocked.Increment(ref _w217LootDropped); return true; }
+                await ExecLuaAsync(string.Create(CultureInfo.InvariantCulture,
+                    $"if KCD2MP_W217OnHostNest then KCD2MP_W217OnHostNest(\"{hn.Key}\", {hn.X:0.###}, {hn.Y:0.###}, {hn.Z:0.###}, {hn.Ax:0.####}, {hn.Ay:0.####}, {hn.Az:0.####}, {(hn.Settled ? 1 : 0)}) end"));
+                return true;
+            case Protocol.LootHostBodyList or Protocol.LootHostTakeVerdict or Protocol.LootHostCorpses or Protocol.LootHostCarts or Protocol.LootHostProp or Protocol.LootHostPropGone or Protocol.LootHostNest:
                 Interlocked.Increment(ref _w217LootDropped);
                 Console.WriteLine($"MP-W217 loot: a malformed {Protocol.LootHostName(m.Kind)} from the host -- dropped ({(m.Text.Length > 60 ? m.Text[..60] : m.Text)})");
                 return true;
@@ -406,6 +424,28 @@ public static class Wo217LootRules
         if (s.Length < 2 || !long.TryParse(s.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture, out long cm) || cm > 9999999) return false;
         v = (float)((s[0] == 'n' ? -cm : cm) / 100.0);
         return true;
+    }
+
+    public sealed record NestShot(string Key, string ContainerClass, float X, float Y, float Z, float Ax, float Ay, float Az, bool Settled);
+
+    /// <summary>Shootable Nest / DestroStash knockdown + resting pose: "&lt;wc_N_...|wc_D_...&gt; &lt;x&gt; &lt;y&gt; &lt;z&gt; &lt;ax&gt; &lt;ay&gt; &lt;az&gt; &lt;0|1&gt;".</summary>
+    public static NestShot? ParseNestShot(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return null;
+        var p = s.Split(' ');
+        if (p.Length != 8 || p[7] is not ("0" or "1")) return null;
+        if (!TryDecodeChestKey(p[0], out string cls, out _, out _, out _, out _) || cls is not ("Nest" or "DestroStash")) return null;
+        if (!float.TryParse(p[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float x)
+            || !float.TryParse(p[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float y)
+            || !float.TryParse(p[3], NumberStyles.Float, CultureInfo.InvariantCulture, out float z)
+            || !float.TryParse(p[4], NumberStyles.Float, CultureInfo.InvariantCulture, out float ax)
+            || !float.TryParse(p[5], NumberStyles.Float, CultureInfo.InvariantCulture, out float ay)
+            || !float.TryParse(p[6], NumberStyles.Float, CultureInfo.InvariantCulture, out float az)
+            || !float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z)
+            || !float.IsFinite(ax) || !float.IsFinite(ay) || !float.IsFinite(az)
+            || Math.Abs(x) >= 100000f || Math.Abs(y) >= 100000f || Math.Abs(z) >= 100000f
+            || Math.Abs(ax) >= 100f || Math.Abs(ay) >= 100f || Math.Abs(az) >= 100f) return null;
+        return new NestShot(p[0], cls, x, y, z, ax, ay, az, p[7] == "1");
     }
 }
 
