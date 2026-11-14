@@ -252,4 +252,142 @@ public class Wo134Tests
         }
         finally { try { Directory.Delete(root, true); } catch { } }
     }
+
+    [Fact]
+    public void M2_world_item_tombstones_dedupe_mark_swept_pair_with_host_saves_and_fit_console_calls()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "wo134t-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var st = new WorldItemTombstoneStore(root);
+            string tag = "0123456789", md5a = new string('a', 32), md5b = new string('b', 32);
+            var l = new Wo134Rules.ItemTombstoneLedger();
+            l.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Coat.ToUpperInvariant(), X = 2150.4f, Y = -1890.2f, Z = 112.1f, By = "1", Swept = false });
+            l.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Coat, X = 2150.45f, Y = -1890.2f, Z = 112.1f, By = "1", Swept = false });   // <0.15 m dedupe
+            Assert.Single(l.Items);
+            Assert.False(l.Items[0].Swept);
+
+            st.SaveCurrent(tag, l);
+            st.Pair(tag, md5a, l);   // Save A: before Host walked to the tree (Swept == false)
+
+            Assert.True(l.MarkSwept(Coat, 2152.1f, -1890.2f, 112.1f));   // within 5.0 m physics drift
+            Assert.True(l.Items[0].Swept);
+            st.Pair(tag, md5b, l);   // Save B: after Host walked to the tree and swept it
+
+            Assert.False(st.Paired(tag, md5a)!.Items[0].Swept);   // reloading Save A restores unswept tombstone!
+            Assert.True(st.Paired(tag, md5b)!.Items[0].Swept);
+            Assert.Throws<ArgumentException>(() => st.Current("../bad"));
+
+            // Bad JSON or unsafe strings are rejected cleanly
+            var bad = Wo134Rules.ItemTombstoneLedger.FromJson("{\"Items\":[{\"Cls\":\"" + Coat + "\",\"X\":1,\"Y\":2,\"Z\":3,\"By\":\"a\\\"b\",\"Swept\":false},{\"Cls\":\"" + Dice + "\",\"X\":10,\"Y\":20,\"Z\":30,\"By\":\"2\",\"Swept\":false}]}");
+            Assert.Single(bad.Items);
+            Assert.Equal(Dice, bad.Items[0].Cls);
+
+            // Large tombstone sync calls pack cleanly below KCD2's 2,100-char console limit
+            var many = new Wo134Rules.ItemTombstoneLedger();
+            for (int i = 0; i < 60; i++)
+                many.AddOrUpdate(new Wo134Rules.ItemTombstone { Cls = Dice, X = i * 10f, Y = -500.125f, Z = 42.5f, By = "1", Swept = i % 2 == 0 });
+            var calls = Wo134Rules.TombstoneSyncCalls(many.Items);
+            Assert.True(calls.Count >= 2);
+            Assert.Contains("}, true) end", calls[0]);
+            Assert.All(calls.Skip(1), c => Assert.Contains("}, false) end", c));
+            Assert.All(calls, c => Assert.True(Uri.EscapeDataString("#" + c).Length < 2100));
+
+            // Empty tombstone list with reset=true emits an explicit Lua reset call; reset=false emits nothing
+            Assert.Equal(["if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({}, true) end"], Wo134Rules.TombstoneSyncCalls([], reset: true));
+            Assert.Empty(Wo134Rules.TombstoneSyncCalls([], reset: false));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    private sealed class RecordingTransport : IGameTransport
+    {
+        public List<string> LuaCalls { get; } = [];
+        public string Name => "recording";
+        public int RoundTripsPerStateRead => 0;
+        public Task<bool> IsGameReadyAsync(CancellationToken ct = default) => Task.FromResult(true);
+        public Task<PlayerState?> ReadPlayerStateAsync(CancellationToken ct = default) => Task.FromResult<PlayerState?>(null);
+        public Task ExecuteAsync(string lua, CancellationToken ct = default) { LuaCalls.Add(lua); return Task.CompletedTask; }
+        public Task ExecuteNowAsync(string lua, CancellationToken ct = default) { LuaCalls.Add(lua); return Task.CompletedTask; }
+        public Task FlushAsync(CancellationToken ct = default) => Task.CompletedTask;
+        public Task<Guid[]?> ReadEquippedItemClassesAsync(CancellationToken ct = default) => Task.FromResult<Guid[]?>(null);
+        public Task<Guid[]?> ReadGhostEquippedItemClassesAsync(string ghostSoulName, CancellationToken ct = default) => Task.FromResult<Guid[]?>(null);
+        public Task EquipItemOnGhostAsync(string ghostSoulName, Guid itemClass, bool createIfMissing, CancellationToken ct = default) => Task.CompletedTask;
+        public Task UnequipItemOnGhostAsync(string ghostSoulName, Guid itemClass, CancellationToken ct = default) => Task.CompletedTask;
+        public Task<Guid?> ReadGhostSoulGuidAsync(string ghostSoulName, CancellationToken ct = default) => Task.FromResult<Guid?>(null);
+        public Task<string?> ReadSoulNameByGuidAsync(Guid soulGuid, CancellationToken ct = default) => Task.FromResult<string?>(null);
+        public Task<(Guid? Guid, string? Name)> ReadPlayerSoulIdentityAsync(CancellationToken ct = default) => Task.FromResult<(Guid?, string?)>((null, null));
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    [Fact]
+    public void Loading_an_older_or_unpaired_save_resets_future_tombstones_in_store_and_lua()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "wo134load-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            const uint seed = 0x12345678u;
+            string tag = WhsSave.SeedTag(seed);
+            string md5Pre = new('0', 32);   // older unpaired save (pre-M2 or solo save)
+            string md5A = new('a', 32);     // paired save with 0 tombstones
+            string md5B = new('b', 32);     // paired save with 1 tombstone [X]
+
+            var store = new WorldItemTombstoneStore(root);
+            var tx = new RecordingTransport();
+            var gb = new GameBridge(new ClientConfig());
+            gb.Wo134ConfigureTestHost(store, tx, seed);
+
+            // 1. Save paired md5_A with 0 tombstones
+            gb.Wo134HostWorldForTest(tag, md5A, loaded: false);
+            Assert.NotNull(store.Paired(tag, md5A));
+            Assert.Empty(store.Paired(tag, md5A)!.Items);
+
+            // 2. Record pickup tombstone X, then save paired md5_B (1 tombstone)
+            gb.Wo134TombEventForTest($"add {Coat} 100.000 200.000 10.000 1");
+            gb.Wo134HostWorldForTest(tag, md5B, loaded: false);
+            Assert.Single(store.Paired(tag, md5B)!.Items);
+
+            // 3. Record pickup tombstone Y after save B (future pickup!)
+            gb.Wo134TombEventForTest($"add {Dice} 300.000 400.000 15.000 2");
+            Assert.Equal(2, gb.Wo134CurrentHostTombsForTest(tag).Count);
+            Assert.Equal(2, store.Current(tag).Items.Count);
+
+            // 4. Load md5_B -> restores ONLY [X] (drops Y) and pushes reset+[X] to Lua
+            tx.LuaCalls.Clear();
+            gb.Wo134HostWorldForTest(tag, md5B, loaded: true);
+            var afterB = gb.Wo134CurrentHostTombsForTest(tag);
+            Assert.Single(afterB);
+            Assert.Equal(Coat, afterB[0].Cls);
+            Assert.Single(store.Current(tag).Items);
+            Assert.Single(tx.LuaCalls);
+            Assert.Contains(Coat, tx.LuaCalls[0]);
+            Assert.DoesNotContain(Dice, tx.LuaCalls[0]);
+            Assert.Contains("}, true) end", tx.LuaCalls[0]);
+
+            // 5. Record pickup Y again + queue a pre-load pending tombstone, then load older UNPAIRED save md5_pre -> resets to empty and pushes {}, true!
+            gb.Wo134TombEventForTest($"add {Dice} 300.000 400.000 15.000 2");
+            gb.Wo134AddPendingTombForTest(new Wo134Rules.ItemTombstone { Cls = Money, X = 10f, Y = 20f, Z = 5f, By = "1", Swept = false });
+            Assert.Null(store.Paired(tag, md5Pre));
+            tx.LuaCalls.Clear();
+            gb.Wo134HostWorldForTest(tag, md5Pre, loaded: true);
+            Assert.Empty(gb.Wo134CurrentHostTombsForTest(tag));
+            Assert.Empty(store.Current(tag).Items);
+            Assert.Equal(["if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({}, true) end"], tx.LuaCalls);
+
+            // 6. Record pickup Y again, then load paired EMPTY save md5_A -> resets to empty AND pushes {}, true to Lua!
+            gb.Wo134TombEventForTest($"add {Dice} 300.000 400.000 15.000 2");
+            Assert.Single(gb.Wo134CurrentHostTombsForTest(tag));
+            tx.LuaCalls.Clear();
+            gb.Wo134HostWorldForTest(tag, md5A, loaded: true);
+            Assert.Empty(gb.Wo134CurrentHostTombsForTest(tag));
+            Assert.Empty(store.Current(tag).Items);
+            Assert.Equal(["if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({}, true) end"], tx.LuaCalls);
+
+            // 7. Lua loop-start w134_itomb sync on empty ledger also pushes {}, true so Lua clears in-memory tables
+            tx.LuaCalls.Clear();
+            gb.Wo134TombEventForTest("sync");
+            Assert.Equal(["if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({}, true) end"], tx.LuaCalls);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 }

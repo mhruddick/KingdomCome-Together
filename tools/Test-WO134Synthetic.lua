@@ -230,6 +230,7 @@ local function world()
     KCD2MP.ghosts = {}; KCD2MP.npcPuppets = {}
     local w = KCD2MP.w134
     w.pendingOpen = {}; w.sessions = {}; w.partial = {}; w.stash = {}; w.itemReq = {}; w.hostTaken = {}; w.hostVerify = {}
+    w.goneWorldItems = {}; w.goneTombstones = {}
     w.bodySig = {}; w.chestSess = {}
     w.bodies, w.items, w.chests = true, true, true
     -- WO-217: this suite is WO-134's own loot -- the path with mp_loot_live and mp_item_flags off; WO-217's live loot (a take is a
@@ -367,6 +368,17 @@ PickableItem.OnUsed(egg, player)
 check("I1 pressing again while asking sends nothing more", #events("w134_item") == 1)
 KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
 check("I2 host ok: picked up here by the game's own pickup", ENTS["egg000352"] == nil and player.inventory:GetCountOfClass(EGG) == 1)
+-- M2 3.4: bow leaning against a tree where async OnUsed fails after network RTT (focus moved slightly)
+local bowW = newItem(COAT, 0.82, 1)
+local bowEnt = mkPickable("bow_tree001", COAT, 1, 0.82, 101.5, 100, 10, bowW)
+bowEnt.item.OnUsed = function() return false end   -- interactor focus lost during RTT: native OnUsed does nothing!
+bowEnt.item.GetId = function() return bowW end
+-- Also test a lingering empty prop even if AddItem didn't clear ENTS (by temporarily shielding ENTS["bow_tree001"] until RemoveEntity)
+LOG = {}; PickableItem.OnUsed(bowEnt, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+check("I2b async weapon pickup fallback: bow transferred directly into player.inventory and world prop cleaned up",
+    ENTS["bow_tree001"] == nil and player.inventory:GetCountOfClass(COAT) == 1 and ITEMS[bowW].health == 0.82)
+player.inventory:DeleteItem(bowW, -1)
 local egg2 = mkPickable("egg000351", EGG, 1, 1, 101, 100.06, 10, newItem(EGG, 1, 1))
 LOG = {}; PickableItem.OnUsed(egg2, player)
 KCD2MP_W134ItemResult(firstTok("w134_item"), "gone")
@@ -390,26 +402,102 @@ local drop2 = mkPickable("onion008888", ONION, 1, 1, 104, 100, 10, newItem(ONION
 KCD2MP.itemDrops["3000000010"] = { state = "ground", entName = "onion008888", mine = false }
 KCD2MP_W134ItemGone(ONION, 104, 100, 10)
 check("I7 ... never a tracked drop at the same spot", ENTS["onion008888"] ~= nil)
-local far = mkPickable("egg000349", EGG, 1, 1, 110, 100, 10, newItem(EGG, 1, 1))
-KCD2MP_W134ItemGone(EGG, 110.5, 100, 10)
-check("I7 ... nor one 0.5 m off (no guessing)", ENTS["egg000349"] ~= nil)
+-- M2 3.1: physics-settled bow/weapon drifted 2.4 m removes cleanly, while >5.0 m is untouched
+local driftedBow = mkPickable("bow000348", SWORD, 1, 1, 112.4, 100, 10, newItem(SWORD, 1, 1))
+local beyond5m = mkPickable("egg000349", EGG, 1, 1, 120, 100, 10, newItem(EGG, 1, 1))
+KCD2MP_W134ItemGone(SWORD, 110.0, 100, 10)
+KCD2MP_W134ItemGone(EGG, 110.0, 100, 10)
+check("I7 physics-settled item within 5.0 m (2.4 m drift) is matched and removed; item >5.0 m (10 m) stays",
+    ENTS["bow000348"] == nil and ENTS["egg000349"] ~= nil)
+-- M2 3.3: unstreamed ItemGone on Joiner caches tombstone and sweeps as soon as streamed in
+KCD2MP_W134ItemGone(COAT, 500.0, 500.0, 10.0)   -- Joiner is at (100,100,10), bow at (500,500,10) not streamed yet
+mkPickable("bow_unstreamed_j", COAT, 1, 1, 501.8, 500.0, 10.0, newItem(COAT, 1, 1))
+loop()
+check("I7b unstreamed tombstone waits while Joiner is >120 m away", ENTS["bow_unstreamed_j"] ~= nil)
+player.GetWorldPos = function() return { x = 495, y = 500, z = 10 } end
+loop()
+check("I7b once Joiner walks within streaming range, cached tombstone sweeps the drifted bow", ENTS["bow_unstreamed_j"] == nil)
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
 
 world(); asHost(1)
-mkPickable("egg000400", EGG, 1, 1, 101, 100, 10, newItem(EGG, 1, 1))
+-- Dense table items (0.20 m apart): tight 0.35 m match picks exact item, and race on already-taken spot does NOT spill onto 2.0 m neighbor!
+mkPickable("egg_dense_a", EGG, 1, 1, 101.0, 100, 10, newItem(EGG, 1, 1))
+mkPickable("egg_dense_b", EGG, 1, 1, 101.2, 100, 10, newItem(EGG, 1, 1))
+mkPickable("egg_shelf", EGG, 1, 1, 103.0, 100, 10, newItem(EGG, 1, 1))
 LOG = {}
 KCD2MP_W134HostItem(1, 71, EGG, 101.0, 100.0, 10.0, 0)
-check("I8 the host matches the joiner's item by class + position and removes its copy: ok", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 71 ok ", 1, true) == 1 and ENTS["egg000400"] == nil, events("w134_ires")[1])
+check("I8 tight 0.35 m priority picks the exact table item at 0.00 m, leaving the 0.20 m neighbor",
+    events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 71 ok ", 1, true) == 1
+    and ENTS["egg_dense_a"] == nil and ENTS["egg_dense_b"] ~= nil, events("w134_ires")[1])
+ENTS["egg_dense_b"] = nil   -- remove neighbor so only 2.0 m shelf egg remains
 LOG = {}
 KCD2MP_W134HostItem(2, 72, EGG, 101.0, 100.0, 10.0, 0)
-check("I9 the same item asked again: gone", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "2 72 gone ", 1, true) == 1, events("w134_ires")[1])
+check("I9 race on already-taken 101.0 spot returns gone and never steals the 2.0 m shelf egg",
+    events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "2 72 gone ", 1, true) == 1 and ENTS["egg_shelf"] ~= nil, events("w134_ires")[1])
+-- M2 3.2: unstreamed world item (>120 m away on Host) records tombstone + emits w134_itomb add + returns ok; tight repeat asks return mine/gone; Host sweep removes when approaching!
 LOG = {}
-KCD2MP_W134HostItem(1, 73, SWORD, 50, 50, 10, 0)
-check("I10 nothing there: unknown", events("w134_ires")[1] ~= nil and string.find(events("w134_ires")[1], "1 73 unknown ", 1, true) == 1)
+KCD2MP_W134HostItem(1, 73, SWORD, 600, 600, 10, 0)
+check("I10 unstreamed world item on Host records tombstone (w134_itomb add) and grants ok",
+    string.find(events("w134_ires")[1] or "", "1 73 ok ", 1, true) == 1
+    and string.find(events("w134_itomb")[1] or "", "add " .. SWORD .. " 600.000 600.000 10.000 1", 1, true) == 1, events("w134_itomb")[1])
+LOG = {}
+KCD2MP_W134HostItem(1, 731, SWORD, 600.15, 600, 10, 0)
+KCD2MP_W134HostItem(2, 732, SWORD, 600.25, 600, 10, 0)
+check("I10b repeat ask within tight 0.35 m for tombstoned item returns mine to taker and gone to other peer",
+    string.find(events("w134_ires")[1] or "", "1 731 mine ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "2 732 gone ", 1, true) == 1)
+mkPickable("tree_bow_host", SWORD, 1, 1, 602.1, 600, 10, newItem(SWORD, 1, 1))
+player.GetWorldPos = function() return { x = 590, y = 600, z = 10 } end
+LOG = {}; loop()
+check("I10c when Host walks near the tombstoned tree, Host sweeps and removes its bow and marks tombstone swept",
+    ENTS["tree_bow_host"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1, events("w134_itomb")[1])
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- Finding 2a: unstreamed Host with two distinct eggs 2.0 m apart -> BOTH return ok and record two distinct tombstones!
+world(); asHost(1)
+LOG = {}
+KCD2MP_W134HostItem(1, 751, EGG, 100.0, 100.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 752, EGG, 102.0, 100.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 753, EGG, 100.1, 100.0, 10.0, 0, 1)
+check("I10d unstreamed Host: two distinct eggs 2.0 m apart both grant ok with 2 tombstones, while 0.10 m repeat returns mine",
+    string.find(events("w134_ires")[1] or "", "1 751 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "1 752 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[3] or "", "1 753 mine ", 1, true) == 1
+    and #KCD2MP.w134.goneWorldItems == 2,
+    string.format("%s | %s | %s", tostring(events("w134_ires")[1]), tostring(events("w134_ires")[2]), tostring(events("w134_ires")[3])))
+
+-- Joiner end-to-end pickup of both 2.0 m eggs -> Joiner receives BOTH eggs!
+world(); asJoiner()
+local jEggA = mkPickable("egg_pair_a", EGG, 1, 1, 100.0, 100.0, 10.0, newItem(EGG, 1, 1))
+local jEggB = mkPickable("egg_pair_b", EGG, 1, 1, 102.0, 100.0, 10.0, newItem(EGG, 1, 1))
+LOG = {}; PickableItem.OnUsed(jEggA, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+LOG = {}; PickableItem.OnUsed(jEggB, player)
+KCD2MP_W134ItemResult(firstTok("w134_item"), "ok")
+check("I10e Joiner picks up both 2.0 m eggs and receives 2 eggs in inventory",
+    player.inventory:GetCountOfClass(EGG) == 2 and ENTS["egg_pair_a"] == nil and ENTS["egg_pair_b"] == nil)
+
+-- Finding 2b: streamed Joiner with two eggs 2.0 m apart -> removing Egg 1 (and even replaying ItemGone / sweep after Egg 1 is gone) NEVER deletes Egg 2, while drifted bow within 5.0 m IS matched!
+world(); asJoiner()
+mkPickable("egg_stream_1", EGG, 1, 1, 100.0, 100.0, 10.0, newItem(EGG, 1, 1))
+mkPickable("egg_stream_2", EGG, 1, 1, 102.0, 100.0, 10.0, newItem(EGG, 1, 1))
+mkPickable("bow_stream_drift", SWORD, 1, 1, 113.4, 100.0, 10.0, newItem(SWORD, 1, 1))
+KCD2MP_W134ItemGone(EGG, 100.0, 100.0, 10.0)
+KCD2MP_W134ItemGone(EGG, 100.0, 100.0, 10.0)   -- duplicate / replayed ItemGone when Egg 1 is already absent!
+KCD2MP_W134ItemGone(EGG, 98.0, 100.0, 10.0)    -- another absent egg 4.0 m from Egg 2 (unstreamed/eaten earlier) + sweep!
+loop()
+KCD2MP_W134ItemGone(SWORD, 110.0, 100.0, 10.0) -- drifted bow 3.4 m away
+check("I10f streamed Joiner: Egg 2 at 2.0 m is never falsely deleted by Egg 1 removal/replay/sweep, while 3.4 m drifted bow IS matched",
+    ENTS["egg_stream_1"] == nil and ENTS["egg_stream_2"] ~= nil and ENTS["bow_stream_drift"] == nil)
+
+world(); asHost(1)
+
 mkPickable("onion007777", ONION, 1, 1, 104, 100, 10, newItem(ONION, 1, 1))
 KCD2MP.itemDrops["3000000011"] = { state = "ground", entName = "onion007777", mine = true }
 LOG = {}
 KCD2MP_W134HostItem(1, 74, ONION, 104, 100, 10, 0)
-check("I11 a host's tracked drop is never handed out as a world item", ENTS["onion007777"] ~= nil and string.find(events("w134_ires")[1] or "", " unknown ", 1, true) ~= nil)
+loop()
+check("I11 a host's tracked drop is never removed as a world item (even by tombstone sweep)", ENTS["onion007777"] ~= nil)
 local hegg2 = mkPickable("egg000401", EGG, 1, 1, 102, 100, 10, newItem(EGG, 1, 1))
 LOG = {}
 PickableItem.OnUsed(hegg2, player)
@@ -424,49 +512,34 @@ mkPickable("egg000402", EGG, 1, 1, 102, 100, 10, newItem(EGG, 1, 1))
 LOG = {}; PickableItem.OnUsed(ENTS["egg000402"], player); loop()
 check("I14 nobody connected: nothing is sent", #events("w134_igone") == 0 and ENTS["egg000402"] == nil)
 
--- ================= C: chests =================
+-- ================= C: chests (M2: per-player chest delta replay retired; host .whs save is single chest truth) =================
 world(); asHost(0)
 local ch = mkChest("stash[Chest/chest3_c1d92081-d74b-4955-ade8-384e71325794]", "Stash", 101, 100, 10, 7)
 ch.inventory:CreateItem(DICE, 1, 1); ch.inventory:CreateItem(APPLE, 1, 3)
 LOG = {}; loop()
-check("C1 a chest in reach is snapshotted, nothing recorded yet", #events("w134_chest") == 0)
+check("C1 per-player chest recording is retired (host save + WO-217 live sync own world chests)", W134.chestsRecording() == false and #events("w134_chest") == 0)
 local dw = nil
 for _, w in ipairs(ch.inventory.list) do if ITEMS[w].class == DICE then dw = w end end
 ch.inventory:RemoveItem(dw); player.inventory:AddItem(dw)
 loop()
-local ce = events("w134_chest")[1]
-check("C2 the host takes the dice: recorded (+1, the world time, restock 7)", ce == "stash[Chest/chest3_c1d92081-d74b-4955-ade8-384e71325794] " .. DICE .. " 1 1.0000 1000 7", ce)
+check("C2 a host take from a world chest emits no per-player w134_chest delta", #events("w134_chest") == 0)
 ch.inventory:CreateItem(COAT, 0.5, 1)
 LOG = {}; loop()
-check("C3 a put: recorded as -1", events("w134_chest")[1] ~= nil and string.find(events("w134_chest")[1], COAT .. " -1 ", 1, true) ~= nil, events("w134_chest")[1])
+check("C3 a host put into a world chest emits no per-player w134_chest delta", #events("w134_chest") == 0)
 local grave = mkChest("kcdmp_grave_1_123", "StashCorpse", 101, 101, 10, 0)
 grave.inventory:CreateItem(COAT, 1, 1)
 LOG = {}; loop(); grave.inventory.list = {}; loop()
 check("C4 a grave is never a chest", #events("w134_chest") == 0)
-KCD2MP_W134Tick(false, true, false, 0); TIMERS = {}
-ch.inventory:CreateItem(DICE, 1, 1)
-LOG = {}; loop(); loop()
-check("C5 not a shared world: nothing recorded", #events("w134_chest") == 0)
 world(); asJoiner()
 local ca = mkChest("stash[Chest/a]", "Stash", 300, 300, 10, 7)
 local cb = mkChest("stash[Chest/b]", "Stash", 310, 300, 10, 0)
 cb.inventory:CreateItem(DICE, 1, 1)
-local cc = mkChest("stash[Chest/c]", "Stash", 320, 300, 10, 7)
-WORLD_T = 1000 + 10 * 86400
 LOG = {}
 KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, 1000 + 9 * 86400, 7 },
-                        { "stash[Chest/b]", DICE, -1, 1, 1000, 0 },
-                        { "stash[Chest/c]", APPLE, 2, 1, 1000, 7 },
-                        { "stash[Chest/nowhere]", APPLE, 1, 1, 1000, 0 } })
-check("C6 A is full again for the joiner (the host's take put back)", ca.inventory:GetCountOfClass(DICE) == 1)
-check("C6 B stays empty for him (his own take)", cb.inventory:GetCountOfClass(DICE) == 0)
-check("C6 an entry past its restock is left to the engine", cc.inventory:GetCountOfClass(APPLE) == 0)
-check("C6 the apply line counts applied / expired / skipped", events("w134_applied")[1] == "2 1 1", events("w134_applied")[1])
-player.GetWorldPos = function() return { x = 300, y = 300, z = 10 } end
-KCD2MP_W134ChestApply({ { "stash[Chest/a]", DICE, 1, 1, WORLD_T, 7 } })
-LOG = {}; loop(); loop()
-check("C7 an apply beside a chest is never recorded as the joiner's take or put", #events("w134_chest") == 0)
-player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+                        { "stash[Chest/b]", DICE, -1, 1, 1000, 0 } })
+check("C5 retired KCD2MP_W134ChestApply never undoes host chest takes on join", ca.inventory:GetCountOfClass(DICE) == 0)
+check("C6 retired KCD2MP_W134ChestApply never strips chests from stale per-player ledgers", cb.inventory:GetCountOfClass(DICE) == 1)
+check("C7 retired KCD2MP_W134ChestApply reports rows as skipped", events("w134_applied")[1] == "0 0 2", events("w134_applied")[1])
 
 -- ================= extra: order and the engine's take =================
 world(); asJoiner()
@@ -500,6 +573,39 @@ KCD2MP.w134LoopRunning = false                                     -- the load k
 KCD2MP.w134.startLoop(); TIMERS = {}
 LOG = {}; loop()
 check("X3 a chest that changed across a load is not recorded as a take or a put", #events("w134_chest") == 0, events("w134_chest")[1])
+
+-- X4: persisted Host tombstones restored after reload via KCD2MP_W134HostTombstones still sweep when Host walks up to the tree
+world(); asHost(0)
+KCD2MP_W134HostTombstones({ { SWORD, 800.0, 800.0, 10.0, "1", false } }, true)
+mkPickable("reloaded_tree_bow", SWORD, 1, 1, 803.2, 800.0, 10.0, newItem(SWORD, 1, 1))
+loop()
+check("X4 restored unswept tombstone leaves far (>120 m) item alone until Host approaches", ENTS["reloaded_tree_bow"] ~= nil)
+player.GetWorldPos = function() return { x = 795, y = 800, z = 10 } end
+LOG = {}; loop()
+check("X4 restored unswept tombstone sweeps the 3.2 m drifted bow once Host walks near and emits w134_itomb swept",
+    ENTS["reloaded_tree_bow"] == nil and string.find(events("w134_itomb")[1] or "", "swept " .. SWORD, 1, true) == 1)
+player.GetWorldPos = function() return { x = 100, y = 100, z = 10 } end
+
+-- X5 (Finding 4): KCD2MP_W134HostTombstones({}, true) on loading an older/empty save clears goneWorldItems, hostTaken, and hostVerify
+world(); asHost(1)
+KCD2MP_W134HostItem(1, 91, EGG, 450.0, 450.0, 10.0, 0, 1)   -- future unstreamed pickup recorded in goneWorldItems + hostTaken
+mkPickable("egg_stream_future", EGG, 1, 1, 101.0, 100.0, 10.0, newItem(EGG, 1, 1))
+KCD2MP_W134HostItem(1, 92, EGG, 101.0, 100.0, 10.0, 0, 1)   -- future streamed pickup recorded in hostTaken
+KCD2MP.w134.hostVerify[1] = { name = "pending_verify", cls = EGG, x = 105.0, y = 100.0, z = 10.0, at = NOW }
+LOG = {}
+KCD2MP_W134HostItem(1, 93, EGG, 450.0, 450.0, 10.0, 0, 1)
+check("X5 before loading older save, future pickup returns mine", string.find(events("w134_ires")[1] or "", "1 93 mine ", 1, true) == 1)
+KCD2MP_W134HostTombstones({}, true)   -- Host loaded an older save with 0 tombstones
+check("X5 KCD2MP_W134HostTombstones({}, true) clears goneWorldItems, hostTaken, and hostVerify",
+    #KCD2MP.w134.goneWorldItems == 0 and #KCD2MP.w134.hostTaken == 0 and #KCD2MP.w134.hostVerify == 0)
+mkPickable("egg_stream_reloaded", EGG, 1, 1, 101.0, 100.0, 10.0, newItem(EGG, 1, 1))
+LOG = {}
+KCD2MP_W134HostItem(1, 94, EGG, 450.0, 450.0, 10.0, 0, 1)
+KCD2MP_W134HostItem(1, 95, EGG, 101.0, 100.0, 10.0, 0, 1)
+check("X5 after loading older save, both unstreamed and streamed items can be picked up again (ok)",
+    string.find(events("w134_ires")[1] or "", "1 94 ok ", 1, true) == 1
+    and string.find(events("w134_ires")[2] or "", "1 95 ok ", 1, true) == 1
+    and ENTS["egg_stream_reloaded"] == nil)
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

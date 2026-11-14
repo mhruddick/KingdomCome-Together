@@ -3,7 +3,10 @@
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using KcdMp.Wire;
+
+[assembly: InternalsVisibleTo("KcdMp.Client.Tests")]
 
 namespace KcdMp.Client;
 
@@ -28,10 +31,13 @@ public partial class GameBridge
 {
     private volatile bool _w134Connected;
     private readonly ChestLedgerStore _chestStore = new(ChestLedgerStore.DefaultRoot());
+    private WorldItemTombstoneStore _tombStore = new(WorldItemTombstoneStore.DefaultRoot());
     private readonly object _w134Gate = new();
-    private Wo134Rules.Ledger? _w134HostLedger;       // the host's running ledger for _w134HostTag
+    private Wo134Rules.Ledger? _w134HostLedger;       // legacy field kept for stats formatting
+    private Wo134Rules.ItemTombstoneLedger? _w134HostTombs;
+    private readonly List<Wo134Rules.ItemTombstone> _w134TombPending = [];
     private string? _w134HostTag;
-    private readonly List<Wo134Rules.Entry> _w134HostPending = [];   // host takes before the world is identified
+    private readonly List<Wo134Rules.Entry> _w134HostPending = [];
     private bool _w134HostDirty;
     private Wo134Rules.Ledger _w134JoinerLedger = new(); // the joiner's, for _joinedTag
     private HenryStore.Snapshot? _w134RestoreSnap;       // the snapshot a join restored (its ledger comes with it)
@@ -154,6 +160,9 @@ public partial class GameBridge
                     foreach (byte g in Wo134Peers())
                         _ = Wo134SendAsync(Protocol.LootHostUp, g, Protocol.LootHostItemGone, 0, string.Join(' ', f));
                 return;
+            case "w134_itomb":     // M2: sync | add <cls> <x> <y> <z> <by> | swept <cls> <x> <y> <z>
+                Wo134OnItemTombEvent(f);
+                return;
             // ---- both: chests
             case "w134_chest":     // <container> <cls> <n> <hp> <worldT> <restockDays>
                 Wo134OnChestEvent(arg ?? "");
@@ -257,222 +266,202 @@ public partial class GameBridge
                     && Wo134Rules.TryCoord(f[2], out float gy) && Wo134Rules.TryCoord(f[3], out float gz):
                 await ExecLuaAsync($"if KCD2MP_W134ItemGone then KCD2MP_W134ItemGone(\"{gcls:D}\", {Wo134Rules.F3(gx)}, {Wo134Rules.F3(gy)}, {Wo134Rules.F3(gz)}) end");
                 return;
-            case Protocol.LootHostLedger when Wo134Rules.ParseLedgerPart(m.Text) is { } lp:
-                Wo134OnLedgerPart(lp.Part, lp.N, lp.Rows);
-                await Wo134ApplyIfReadyAsync(timeout: false);
+            case Protocol.LootHostLedger when Wo134Rules.ParseLedgerPart(m.Text) is not null:
+                // M2: per-player chest delta replay is retired; world chests share the host's save via WO-217 live sync.
                 return;
         }
         Interlocked.Increment(ref _w134Dropped);
         Console.WriteLine($"MP-WO134 joiner: malformed {Protocol.LootHostName(m.Kind)} from the host -- dropped ({Q(m.Text.Length > 60 ? m.Text[..60] : m.Text)})");
     }
 
-    // ---------------------------------------------------------------- chests: recording
+    // ---------------------------------------------------------------- M2: loose-item tombstones & retired chest replay
 
     private void Wo134OnChestEvent(string arg)
     {
-        var e = Wo134Rules.ParseChestEvent(arg);
-        if (e is null) { Console.WriteLine($"MP-WO134 chests: malformed w134_chest '{arg}'"); return; }
-        lock (_w134Gate)
+        // M2: non-personal world chests are shared live via WO-217 and persisted in the host's .whs save.
+    }
+
+    private Wo134Rules.ItemTombstoneLedger Wo134HostTombsFor(string tag)
+    {
+        if (_w134HostTag != tag || _w134HostTombs is null)
         {
-            // A join or a host reload is loading a world: whatever the mod saw change now
-            // is the load, never the player (found live beside a chest at a rejoin).
-            if (_jj is not null || _rewinding || _rejoinPending || _w134ApplyTag is not null)
+            if (_w134HostTag is string old && _w134HostTombs is { } ol && _w134HostDirty)
             {
-                Console.WriteLine($"MP-WO134 chests: '{arg}' ignored -- a join or reload is loading this world");
-                return;
+                try { _tombStore.SaveCurrent(old, ol); } catch (IOException) { }
             }
-            if (_joinedWorld && _joinedTag is string jt)
-            {
-                _w134JoinerLedger.Add(e);
-                Console.WriteLine($"MP-WO134 chests: joiner {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (world {jt}; ledger {_w134JoinerLedger.Entries.Count}, stored with the next Henry snapshot)");
-                return;
-            }
-            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : null;
-            if (tag is null)
-            {
-                if (_w134HostPending.Count < 2000) _w134HostPending.Add(e);
-                Console.WriteLine($"MP-WO134 chests: host {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (the world is not identified yet: held, {_w134HostPending.Count})");
-                return;
-            }
-            Wo134HostLedgerFor(tag).Add(e);
+            _w134HostTag = tag;
+            _w134HostTombs = _tombStore.Current(tag);
+            _w134HostDirty = false;
+        }
+        if (_w134TombPending.Count > 0)
+        {
+            foreach (var p in _w134TombPending) _w134HostTombs.AddOrUpdate(p);
+            _w134TombPending.Clear();
             _w134HostDirty = true;
-            Console.WriteLine($"MP-WO134 chests: host {(e.N > 0 ? "took" : "put")} {Math.Abs(e.N)} x {e.Cls[..8]} {(e.N > 0 ? "from" : "into")} {e.C} (world {tag}; ledger {_w134HostLedger!.Entries.Count})");
+        }
+        return _w134HostTombs;
+    }
+
+    private void Wo134OnItemTombEvent(string[] f)
+    {
+        if (f.Length == 0 || !Wo134HostRole) return;
+        if (f[0] == "sync" && f.Length == 1)
+        {
+            _ = Wo134PushHostTombstonesToLuaAsync();
+            return;
+        }
+        if (f[0] == "add" && f.Length == 6 && Wo134Rules.TryClass(f[1], out var cls)
+            && Wo134Rules.TryCoord(f[2], out float x) && Wo134Rules.TryCoord(f[3], out float y) && Wo134Rules.TryCoord(f[4], out float z))
+        {
+            var entry = new Wo134Rules.ItemTombstone { Cls = cls.ToString("D"), X = x, Y = y, Z = z, By = f[5], Swept = false };
+            if (!Wo134Rules.ValidTombstone(entry)) return;
+            lock (_w134Gate)
+            {
+                string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+                if (tag is null)
+                {
+                    if (_w134TombPending.Count < Wo134Rules.ItemTombstoneLedger.MaxEntries) _w134TombPending.Add(entry);
+                    return;
+                }
+                Wo134HostTombsFor(tag).AddOrUpdate(entry);
+                _w134HostDirty = true;
+            }
+            Wo134FlushHost();
+            return;
+        }
+        if (f[0] == "swept" && f.Length == 5 && Wo134Rules.TryClass(f[1], out var scls)
+            && Wo134Rules.TryCoord(f[2], out float sx) && Wo134Rules.TryCoord(f[3], out float sy) && Wo134Rules.TryCoord(f[4], out float sz))
+        {
+            lock (_w134Gate)
+            {
+                string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+                if (tag is not null && Wo134HostTombsFor(tag).MarkSwept(scls.ToString("D"), sx, sy, sz)) _w134HostDirty = true;
+            }
+            Wo134FlushHost();
         }
     }
 
-    private Wo134Rules.Ledger Wo134HostLedgerFor(string tag)
+    private async Task Wo134PushHostTombstonesToLuaAsync(bool reset = true, string? explicitTag = null)
     {
-        if (_w134HostTag != tag || _w134HostLedger is null)
+        List<Wo134Rules.ItemTombstone> items;
+        lock (_w134Gate)
         {
-            if (_w134HostTag is string old && _w134HostLedger is { } ol && _w134HostDirty) { try { _chestStore.SaveCurrent(old, ol); } catch (IOException) { } }
-            _w134HostTag = tag;
-            _w134HostLedger = _chestStore.Current(tag);
-            _w134HostDirty = false;
+            string? tag = explicitTag ?? (_hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag);
+            if (tag is null) return;
+            items = Wo134HostTombsFor(tag).Clone().Items;
         }
-        if (_w134HostPending.Count > 0)
-        {
-            foreach (var p in _w134HostPending) _w134HostLedger.Add(p);
-            _w134HostPending.Clear();
-            _w134HostDirty = true;
-        }
-        return _w134HostLedger;
+        if (items.Count == 0 && !reset) return;
+        foreach (var call in Wo134Rules.TombstoneSyncCalls(items, reset))
+            await ExecLuaAsync(call);
     }
 
     private void Wo134FlushHost()
     {
         lock (_w134Gate)
         {
-            if (!_w134HostDirty || _w134HostTag is not string tag || _w134HostLedger is not { } l) return;
-            try { _chestStore.SaveCurrent(tag, l); _w134HostDirty = false; }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Console.WriteLine($"MP-WO134 chests: the host ledger was not written: {ex.Message}"); }
+            if (!_w134HostDirty || _w134HostTag is not string tag || _w134HostTombs is not { } l) return;
+            try { _tombStore.SaveCurrent(tag, l); _w134HostDirty = false; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Console.WriteLine($"MP-WO134 tombs: host tombstones not written: {ex.Message}"); }
         }
     }
 
-    /// <summary>WO-125's host identify: a save written pairs the running ledger; a save loaded brings its paired ledger back.</summary>
+    /// <summary>WO-125's host identify hook: pairs/restores per-world loose-item tombstones alongside each host save.</summary>
     private void Wo134OnHostWorld(string tag, string md5, bool loaded)
     {
+        bool pushToLua = false;
         lock (_w134Gate)
         {
-            var cur = Wo134HostLedgerFor(tag);
             try
             {
                 if (!loaded)
                 {
-                    _chestStore.Pair(tag, md5, cur);
-                    _chestStore.SaveCurrent(tag, cur);
+                    var cur = Wo134HostTombsFor(tag);
+                    _tombStore.Pair(tag, md5, cur);
+                    _tombStore.SaveCurrent(tag, cur);
                     _w134HostDirty = false;
-                    Console.WriteLine($"MP-WO134 chests: host save md5 {md5[..8]}: ledger paired ({cur.Entries.Count} entries)");
                 }
-                else if (_chestStore.Paired(tag, md5) is { } p)
+                else
                 {
-                    _w134HostLedger = p;
-                    _chestStore.SaveCurrent(tag, p);
+                    if (_w134HostTag is string old && old != tag && _w134HostTombs is { } ol && _w134HostDirty)
+                    {
+                        try { _tombStore.SaveCurrent(old, ol); } catch (IOException) { }
+                    }
+                    _w134TombPending.Clear();
+                    _w134HostTag = tag;
+                    var restored = _tombStore.Paired(tag, md5) ?? new Wo134Rules.ItemTombstoneLedger();
+                    _w134HostTombs = restored;
+                    _tombStore.SaveCurrent(tag, restored);
                     _w134HostDirty = false;
-                    Console.WriteLine($"MP-WO134 chests: host loaded md5 {md5[..8]}: its paired ledger is back ({p.Entries.Count} entries)");
+                    pushToLua = true;
                 }
-                else Console.WriteLine($"MP-WO134 chests: host loaded md5 {md5[..8]}: no ledger paired with it (a save from before WO-134, or made with no session) -- the running ledger is kept ({cur.Entries.Count} entries)");
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
             {
-                Console.WriteLine($"MP-WO134 chests: host ledger pairing failed: {ex.Message}");
+                Console.WriteLine($"MP-WO134 tombs: host tombstone pairing failed: {ex.Message}");
             }
         }
+        if (pushToLua) _ = Wo134PushHostTombstonesToLuaAsync(reset: true, explicitTag: tag);
     }
 
-    // ---------------------------------------------------------------- chests: a join
-
-    /// <summary>Host: the joiner is in the world -- send it this world's ledger.</summary>
-    private async Task Wo134SendLedgerAsync(byte joiner)
+    internal void Wo134ConfigureTestHost(WorldItemTombstoneStore store, IGameTransport transport, uint? seed = null)
     {
-        Wo134Rules.Ledger l;
-        lock (_w134Gate)
-        {
-            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : null;
-            l = tag is null ? new Wo134Rules.Ledger() : Wo134HostLedgerFor(tag).Clone();
-        }
-        var parts = Wo134Rules.LedgerParts(l);
-        foreach (var p in parts) await Wo134SendAsync(Protocol.LootHostUp, joiner, Protocol.LootHostLedger, 0, p);
-        Console.WriteLine($"MP-WO134 chests: host ledger sent to ghost {joiner}: {l.Entries.Count} entries in {parts.Count} part(s)");
+        _tombStore = store;
+        _transport = transport;
+        _combatRoleApplied = true;
+        _isDamageAuthority = true;
+        _sharedWorld = true;
+        _hostWorldSeed = seed;
+        _where = GameWhere.World;
     }
 
-    private uint _w134RxStamp;   // WO-206 E: the world epoch the host's ledger parts were stamped with (one ledger, one epoch)
-
-    private void Wo134OnLedgerPart(int part, int n, List<Wo134Rules.Entry> rows)
+    internal void Wo134HostWorldForTest(string tag, string md5, bool loaded) => Wo134OnHostWorld(tag, md5, loaded);
+    internal void Wo134TombEventForTest(string arg) => Wo134OnEvent("w134_itomb", arg);
+    internal IReadOnlyList<Wo134Rules.ItemTombstone> Wo134CurrentHostTombsForTest(string tag)
     {
+        lock (_w134Gate) return Wo134HostTombsFor(tag).Clone().Items;
+    }
+    internal void Wo134AddPendingTombForTest(Wo134Rules.ItemTombstone t)
+    {
+        lock (_w134Gate) _w134TombPending.Add(t);
+    }
+
+    /// <summary>Host: the joiner is in the world -- replay any unswept loose-item tombstones as LootHostItemGone.</summary>
+    private async Task Wo134OnJoinerReadyAsync(byte joiner)
+    {
+        List<Wo134Rules.ItemTombstone> unswept;
         lock (_w134Gate)
         {
-            if (part == 1) { _w134RxParts.Clear(); _w134RxN = n; _w134RxStamp = _w206FrameStamp; }
-            if (n != _w134RxN || _w206FrameStamp != _w134RxStamp) return;   // WO-206 E: a part of another world's ledger is not this one's
-            _w134RxParts[part] = rows;
-            if (_w134RxParts.Count == _w134RxN)
+            string? tag = _hostWorldSeed is uint s ? WhsSave.SeedTag(s) : _w134HostTag;
+            unswept = tag is null ? [] : Wo134HostTombsFor(tag).Items.Where(t => !t.Swept).Select(t => new Wo134Rules.ItemTombstone
             {
-                var l = new Wo134Rules.Ledger();
-                foreach (var kv in _w134RxParts) l.Entries.AddRange(kv.Value);
-                _w134RxLedger = l;
-                _w134RxParts.Clear();
-                Console.WriteLine($"MP-WO134 chests: the host's ledger arrived ({l.Entries.Count} entries)");
-            }
+                Cls = t.Cls, X = t.X, Y = t.Y, Z = t.Z, By = t.By, Swept = false,
+            }).ToList();
         }
+        foreach (var t in unswept)
+            await Wo134SendAsync(Protocol.LootHostUp, joiner, Protocol.LootHostItemGone, 0, $"{t.Cls} {Wo134Rules.F3(t.X)} {Wo134Rules.F3(t.Y)} {Wo134Rules.F3(t.Z)}");
+        if (unswept.Count > 0)
+            Console.WriteLine($"MP-WO134 tombs: replayed {unswept.Count} unswept loose-item tombstone(s) to ghost {joiner}");
     }
 
-    /// <summary>WO-125: the restore picked this snapshot (null = a first join): its chest ledger is the joiner's again.</summary>
-    private void Wo134OnRestorePick(HenryStore.Snapshot? s)
+    /// <summary>WO-125 restore hook (M2: per-player chest ledger sidecar retired).</summary>
+    private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = null;
+
+    /// <summary>Before the join's Ready (M2: per-player chest ledger apply retired; host's .whs save is the chest truth).</summary>
+    private void Wo134AfterReady(string tag)
     {
         lock (_w134Gate)
         {
-            _w134RestoreSnap = s;
+            _w134RestoreSnap = null;
             _w134ApplyTag = null;
             _w134RxLedger = null;
             _w134RxParts.Clear();
         }
     }
 
-    /// <summary>Before the join's Ready goes out: the joiner's ledger is the restored one; wait for the host's, then apply both.</summary>
-    private void Wo134AfterReady(string tag)
-    {
-        bool applyNow;
-        lock (_w134Gate)
-        {
-            string? json = _w134RestoreSnap is { } s && s.Tag == tag ? _henry.LoadChestLedger(s) : null;
-            _w134JoinerLedger = Wo134Rules.Ledger.FromJson(json);
-            Console.WriteLine($"MP-WO134 chests: joiner ledger for world {tag}: {_w134JoinerLedger.Entries.Count} entries ({(_w134RestoreSnap is null ? "a first join: empty" : json is null ? "the restored snapshot has none" : "from the restored snapshot " + _w134RestoreSnap.Short)})");
-            _w134RestoreSnap = null;
-            _w134ApplyTag = tag;
-            _w134ApplySinceUtc = DateTime.UtcNow;
-            if (_w134RxLedger is not null && !_w206.AdmitWorld(Wo206Cat.Loot, _w134RxStamp))
-            {
-                _w134RxLedger = null;
-                _w134RxParts.Clear();
-            }
-            applyNow = _w134RxLedger is not null;
-        }
-        if (applyNow) _ = Wo134ApplyIfReadyAsync(timeout: false);
-    }
-
-    /// <summary>WO-125: a snapshot was stored -- its chest ledger goes beside it.</summary>
+    /// <summary>WO-125 snapshot stored hook (M2: per-player chest ledger sidecar retired).</summary>
     private void Wo134OnSnapshotStored(HenryStore.Snapshot snap)
     {
-        try
-        {
-            string json;
-            lock (_w134Gate) json = _w134JoinerLedger.ToJson();
-            _henry.StoreChestLedger(snap, json);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            Console.WriteLine($"MP-WO134 chests: the joiner ledger was not stored with snapshot {snap.Short}: {ex.Message}");
-        }
     }
 
-    private async Task Wo134ApplyIfReadyAsync(bool timeout)
-    {
-        List<Wo134Rules.Entry> rows;
-        string tag;
-        bool hostIn;
-        Wo134Rules.Ledger hostLedger, ownLedger;
-        uint stamp;
-        lock (_w134Gate)
-        {
-            if (_w134ApplyTag is not string t) return;
-            hostIn = _w134RxLedger is not null;
-            bool late = (DateTime.UtcNow - _w134ApplySinceUtc).TotalSeconds > 15;
-            if (!hostIn && !late && !timeout) return;
-            tag = t;
-            _w134ApplyTag = null;
-            stamp = _w134RxStamp;
-            // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
-            if (hostIn && !Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; hostIn = false; }
-            hostLedger = _w134RxLedger ?? new Wo134Rules.Ledger();
-            _w134RxLedger = null;
-            ownLedger = _w134JoinerLedger.Clone();
-            rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
-        }
-        if (!hostIn) Console.WriteLine("MP-WO134 chests: the host's ledger did not arrive within 15 s -- only this joiner's own takes are applied");
-        var calls = Wo134Rules.ApplyCalls(rows);
-        foreach (var c in calls) await ExecLuaAsync(c);
-        // WO-206 Part C: one APPLIED record per ledger entry (key = container/class, the ledger's own word for what was done)
-        foreach (var e in hostLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "host-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        foreach (var e in ownLedger.Entries) Wo206NoteApplied("loot", $"{e.C}/{e.Cls}", "own-ledger", null, e.N > 0 ? "took" : "put", stamp);
-        Console.WriteLine($"MP-WO134 chests: world {tag}: {rows.Count} ledger row(s) sent to the mod in {calls.Count} call(s) (host's takes put back, this joiner's own taken out)");
-    }
+    private Task Wo134ApplyIfReadyAsync(bool timeout) => Task.CompletedTask;
 }

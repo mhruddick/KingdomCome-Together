@@ -60,6 +60,7 @@ ItemManager = mkstub()
 ItemManager.GetItem = function(w) return ITEMS[w] end
 ItemManager.GetItemOwner = function(w) return ITEMS[w] and ITEMS[w].owner or nil end
 ItemManager.SetItemOwner = function(w, o, stolen) if ITEMS[w] then ITEMS[w].owner = o; ITEMS[w].stolen = stolen end end
+MERGE_STACKS = {}   -- optional: class GUID -> true to emulate engine stack merging on AddItem
 local function mkInventory()
     local inv = { list = {} }
     INVS[#INVS + 1] = inv
@@ -70,11 +71,28 @@ local function mkInventory()
         for _, other in ipairs(INVS) do
             for i, x in ipairs(other.list) do if x == w then table.remove(other.list, i); break end end
         end
+        if MERGE_STACKS[ITEMS[w].class] then
+            for _, x in ipairs(self.list) do
+                if x ~= w and ITEMS[x] and ITEMS[x].class == ITEMS[w].class and math.abs((ITEMS[x].health or 1) - (ITEMS[w].health or 1)) <= 0.01 then
+                    ITEMS[x].amount = ITEMS[x].amount + ITEMS[w].amount
+                    ITEMS[w] = nil
+                    return
+                end
+            end
+        end
         self.list[#self.list + 1] = w
     end
     inv.HasItem = function(self, w) for _, x in ipairs(self.list) do if x == w then return true end end; return false end
     inv.DeleteItem = function(self, w, n)
-        for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); ITEMS[w] = nil; return true end end
+        for i, x in ipairs(self.list) do
+            if x == w then
+                if n and n > 0 and ITEMS[w] and ITEMS[w].amount > n then
+                    ITEMS[w].amount = ITEMS[w].amount - n
+                    return true
+                end
+                table.remove(self.list, i); ITEMS[w] = nil; return true
+            end
+        end
         return false
     end
     inv.RemoveItem = function(self, w) for i, x in ipairs(self.list) do if x == w then table.remove(self.list, i); return w end end end
@@ -309,6 +327,448 @@ tb.inventory:CreateItem(SWORD, 1, 1)
 LOG = {}
 check("T1 loot_live off: the host makes no live session", KCD2MP_W217HostOpen(1, "bandit_3") == false and #events("w217_blist") == 0)
 KCD2MP_W217Set("loot_live", "on")
+
+-- ================= M2.1: coordinate-tagged world chest addressing =================
+world()
+local function mkWorldChest(slotKey, rawName, cls, x, y, z)
+    NEXTID = NEXTID + 1
+    local e = { class = cls or "Stash", id = NEXTID, px = x, py = y, pz = z, inventory = mkInventory(), hidden = false }
+    e.GetName = function() return rawName end
+    e.GetWorldPos = function(self) return { x = self.px, y = self.py, z = self.pz } end
+    ENTS[slotKey] = e
+    return e
+end
+local stA = mkWorldChest("stash19_near", "Stash19", "Stash", 2176.15, -1450.25, 31.75)
+local stB = mkWorldChest("stash19_far", "Stash19", "Stash", 3107.15, -1450.25, 31.75)
+local stOther = mkWorldChest("chest_adjacent", "stash[Chest/chest3_c1d92081]", "Stash", 2176.60, -1450.25, 31.75)
+local ckA = KCD2MP_W217ChestKey(stA)
+local ckB = KCD2MP_W217ChestKey(stB)
+local ckOther = KCD2MP_W217ChestKey(stOther)
+check("M2.1 duplicate-named chests at different spots have distinct wire-safe keys", ckA ~= nil and ckB ~= nil and ckA ~= ckB and string.match(ckA, "^[A-Za-z0-9_]+$") ~= nil and #ckA <= 80, ckA)
+check("M2.1 sphere lookup resolves each Stash19 to its own coordinates, never the 931 m namesake", KCD2MP_W217ResolveChestKey(ckA) == stA and KCD2MP_W217ResolveChestKey(ckB) == stB)
+check("M2.1 adjacent chest with different name hash never cross-matches", KCD2MP_W217ResolveChestKey(ckOther) == stOther)
+check("M2.1 System.GetEntityByName resolves wc_ chest keys while NPC names stay unchanged", System.GetEntityByName(ckA) == stA and not KCD2MP_W217IsChestKey("bandit_1"))
+
+-- ================= M2.2: personal stash exclusion, shared chest live open, and lazy host init =================
+CHEST_OPENS = {}
+Stash = {
+    Open = function(self, user) self.bOpened = 1; CHEST_OPENS[#CHEST_OPENS + 1] = self:GetName() .. "@" .. self.px end,
+    OnUsed = function(self, user, slot)
+        if self.bLocked == true then return false end
+        return self:Open(user)
+    end,
+    GetInventoryToOpen = function(self) return self.openInvId or self.inventory:GetId() end,
+}
+CartStash = {
+    OnUsed = function(self, user, slot) self.bOpened = 1; CHEST_OPENS[#CHEST_OPENS + 1] = "cart:" .. self:GetName() end,
+}
+
+world(); asJoiner()
+CHEST_OPENS = {}
+local function attachStash(e, tbl)
+    setmetatable(e, { __index = tbl or Stash })
+    return e
+end
+-- Personal stashes (3 rules) + escrow/grave must NEVER be treated as shared chests
+local pByName = attachStash(mkWorldChest("pm1", "stash[playerMasterChest_inn1]", "Stash", 101, 100, 10))
+local pByMaster = attachStash(mkWorldChest("pm2", "stash[Chest/bedside_1]", "Stash", 101.5, 100, 10))
+pByMaster.stash = { GetMasterInventory = function() return "userdata: 0200000000009999" end }
+local pByRedirect = attachStash(mkWorldChest("pm3", "stash[Chest/bedside_2]", "Stash", 102, 100, 10))
+pByRedirect.openInvId = "master_inv_wuid"
+local sharedNullMaster = attachStash(mkWorldChest("sh_null", "Stash19", "Stash", 101, 101, 10))
+sharedNullMaster.stash = { GetMasterInventory = function() return "userdata: 0000000000000000" end }
+local farStash19 = attachStash(mkWorldChest("sh_far", "Stash19", "Stash", 900, 101, 10))
+farStash19.inventory:CreateItem(COAT, 1, 1)
+
+check("M2.2 personal stashes (name / GetMasterInventory / GetInventoryToOpen) are excluded; null master WUID stays shared",
+    KCD2MP_W217IsPersonalStash(pByName) == true
+    and KCD2MP_W217IsPersonalStash(pByMaster) == true
+    and KCD2MP_W217IsPersonalStash(pByRedirect) == true
+    and KCD2MP_W217IsSharedChest(pByName) == false
+    and KCD2MP_W217IsSharedChest(pByMaster) == false
+    and KCD2MP_W217IsSharedChest(pByRedirect) == false
+    and KCD2MP_W217IsSharedChest(sharedNullMaster) == true)
+
+-- Opening a personal stash on Joiner opens locally without asking Host
+LOG = {}
+pByName:OnUsed(player, 1)
+check("M2.2 personal stash opens locally and sends no w134_open", #events("w134_open") == 0 and #CHEST_OPENS == 1)
+
+-- Locked shared chest does not send w134_open until unlocked
+sharedNullMaster.bLocked = true
+LOG = {}; CHEST_OPENS = {}
+sharedNullMaster:OnUsed(player, 1)
+check("M2.2 locked world chest does not request open", #events("w134_open") == 0 and #CHEST_OPENS == 0)
+
+-- Unlocked shared Stash19 intercepts Open -> w134_open <wc_key>, applies Host list, opens screen without touching far Stash19
+sharedNullMaster.bLocked = false
+sharedNullMaster.inventory:CreateItem(EGG, 1, 1)   -- Joiner's stale local egg
+local shKey = KCD2MP_W217ChestKey(sharedNullMaster)
+LOG = {}; CHEST_OPENS = {}
+sharedNullMaster:OnUsed(player, 1)
+check("M2.2 unlocked world chest asks Host using coordinate-tagged key before opening UI", events("w134_open")[1] == shKey and #CHEST_OPENS == 0, events("w134_open")[1])
+KCD2MP_W217BodyList(shKey, 1, 1, 1, { { id = "hc1", cls = SWORD, amt = 1, hp = 0.9, worn = 0, stolen = 0, owner = "-" } })
+check("M2.2 Host's chest list syncs near Stash19, opens UI, and leaves far Stash19 untouched",
+    #CHEST_OPENS == 1 and count(sharedNullMaster.inventory, SWORD) == 1 and count(sharedNullMaster.inventory, EGG) == 0
+    and count(farStash19.inventory, COAT) == 1)
+
+-- CartStash without :Open intercepts via OnUsed
+local cart = attachStash(mkWorldChest("cart1", "CartStash[wagon_1]", "CartStash", 102, 101, 10), CartStash)
+local cartKey = KCD2MP_W217ChestKey(cart)
+LOG = {}; CHEST_OPENS = {}
+cart:OnUsed(player, 1)
+check("M2.2 CartStash intercepts OnUsed and opens once Host chest list arrives", events("w134_open")[1] == cartKey and #CHEST_OPENS == 0)
+KCD2MP_W217BodyList(cartKey, 1, 1, 1, { { id = "hc2", cls = APPLE, amt = 2, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.2 CartStash synced and opened", CHEST_OPENS[1] == "cart:CartStash[wagon_1]" and count(cart.inventory, APPLE) == 2)
+
+-- Lazy loot generation + ReportOpened on Host
+world(); asHost(1)
+local lazyReported = 0
+local lazyAssigned = 0
+local hostLazy = attachStash(mkWorldChest("hlazy", "stash[Chest/untouched_1]", "Stash", 200, 200, 10))
+hostLazy.stash = {
+    opened = false,
+    IsOpened = function(self) return self.opened end,
+    ReportOpened = function(self) self.opened = true; lazyReported = lazyReported + 1 end,
+}
+hostLazy.AssignInventory = function(self)
+    lazyAssigned = lazyAssigned + 1
+    self.inventory:CreateItem(SWORD, 0.75, 1)
+end
+local hlKey = KCD2MP_W217ChestKey(hostLazy)
+LOG = {}
+KCD2MP_W134HostOpen(1, 0, hlKey)
+local hlBlist = events("w217_blist")[1] or ""
+check("M2.2 Host initializes untouched chest via AssignInventory and marks ReportOpened before sending w217_blist",
+    lazyAssigned == 1 and lazyReported >= 1 and count(hostLazy.inventory, SWORD) == 1 and hlBlist:find(SWORD, 1, true) ~= nil
+    and #events("w134_bstate") == 0, hlBlist)
+-- Emptying the chest and opening again must NOT regenerate loot
+local hswId = key(hostLazy.inventory.list[1])
+KCD2MP_W217HostTakeReq(1, "901", hlKey, hswId, SWORD, 1)
+KCD2MP_W217HostAck(1, "901", "applied")
+hostLazy.__w217ChestInit = nil   -- simulate reload where stash:IsOpened() is true in .whs
+KCD2MP_W134HostOpen(1, 0, hlKey)
+check("M2.2 an already-opened empty chest stays empty on re-open (never refilled)", lazyAssigned == 1 and count(hostLazy.inventory, SWORD) == 0)
+
+-- ================= M2.3: partial stack takes, stack merges, live stack updates, and escrow puts =================
+local ARROW = "11111111-2222-3333-4444-555555555555"
+MERGE_STACKS = { [ARROW] = true, [APPLE] = true }
+
+-- (a) Joiner partial stack take (5 of 20 arrows) into empty pack, then merged partial take (4 of 15) into existing 5-arrow stack
+world(); asJoiner()
+local sc = attachStash(mkWorldChest("stack_chest", "Stash45", "Stash", 101, 100, 10))
+local scKey = KCD2MP_W217ChestKey(sc)
+sc:OnUsed(player, 1)
+KCD2MP_W217BodyList(scKey, 1, 1, 1, { { id = "ha1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a chest opened with 20 arrows", count(sc.inventory, ARROW) == 20)
+
+-- Simulate UI transferring 5 of 20 arrows from sc into player.inventory
+local scArrowW = sc.inventory.list[1]
+ITEMS[scArrowW].amount = 15
+player.inventory:CreateItem(ARROW, 1, 5)
+LOG = {}
+KCD2MP_W217LootPoll()
+local prq = events("w217_treq")[1] or ""
+local ptok = string.match(prq, "^(%S+)")
+check("M2.3a partial take of 5/20 arrows requests amt=5 with hostId ha1 and escrows the 5 arrows",
+    prq:find(" " .. scKey .. " ha1 " .. ARROW .. " 5", 1, true) ~= nil
+    and count(player.inventory, ARROW) == 0 and count(esc().inventory, ARROW) == 5 and count(sc.inventory, ARROW) == 15, prq)
+-- Stale in-flight w217_blist with amt=20 before Host processes tok must NOT snap Joiner's chest back to 20
+KCD2MP_W217BodyList(scKey, 2, 1, 1, { { id = "ha1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a stale pre-take list does not revert Joiner's 15 remaining arrows to 20", count(sc.inventory, ARROW) == 15)
+-- Host grants + pushes rev 3 (amt=15)
+KCD2MP_W217TakeResult(ptok, "grant", scKey, "ha1", "-", 0)
+KCD2MP_W217BodyList(scKey, 3, 1, 1, { { id = "ha1", cls = ARROW, amt = 15, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3a granted partial take gives Henry 5 arrows and keeps 15 in chest",
+    count(player.inventory, ARROW) == 5 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 15)
+
+-- Second partial take: Henry ALREADY has 5 arrows; UI merges 4 more onto Henry's existing stack (5 -> 9), chest 15 -> 11
+local pArrowW = player.inventory.list[1]
+ITEMS[sc.inventory.list[1]].amount = 11
+ITEMS[pArrowW].amount = 9
+LOG = {}
+KCD2MP_W217LootPoll()
+prq = events("w217_treq")[1] or ""
+ptok = string.match(prq, "^(%S+)")
+check("M2.3b merged partial take splits 4 into escrow while Henry keeps his prior 5",
+    prq:find(" ha1 " .. ARROW .. " 4", 1, true) ~= nil
+    and count(player.inventory, ARROW) == 5 and count(esc().inventory, ARROW) == 4 and count(sc.inventory, ARROW) == 11, prq)
+KCD2MP_W217TakeResult(ptok, "grant", scKey, "ha1", "-", 0)
+KCD2MP_W217BodyList(scKey, 4, 1, 1, { { id = "ha1", cls = ARROW, amt = 11, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3b granted merged partial take merges 4 back onto Henry's 5 -> 9 arrows",
+    count(player.inventory, ARROW) == 9 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 11)
+
+-- Refused partial take reconciles Joiner's displayed stack back to Host's count
+ITEMS[sc.inventory.list[1]].amount = 6
+ITEMS[player.inventory.list[1]].amount = 14
+LOG = {}
+KCD2MP_W217LootPoll()
+ptok = string.match(events("w217_treq")[1] or "", "^(%S+)")
+KCD2MP_W217BodyList(scKey, 5, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+KCD2MP_W217TakeResult(ptok, "refuse", scKey, "ha1", "gone", 0)
+check("M2.3c refused partial take leaves Henry at 9 and reconciles chest stack to Host's 3",
+    count(player.inventory, ARROW) == 9 and count(esc().inventory, ARROW) == 0 and count(sc.inventory, ARROW) == 3)
+
+-- Live Joiner -> Host put: (1) partial put of 2 apples into chest with 0 apples, (2) put of 3 more onto existing 2-apple stack
+player.inventory:CreateItem(APPLE, 1, 10)
+KCD2MP_W217LootPoll()   -- snapshot Henry's 10 apples
+ITEMS[player.inventory.list[#player.inventory.list]].amount = 8
+sc.inventory:CreateItem(APPLE, 1, 2)
+LOG = {}
+KCD2MP_W217LootPoll()
+local putEvt1 = events("w134_put")[1] or ""
+check("M2.3d splitting 2 apples from Henry's 10-apple stack into empty chest slot sends w134_put amt=2",
+    putEvt1:find(" " .. scKey .. " " .. APPLE .. " 2 ", 1, true) ~= nil, putEvt1)
+KCD2MP_W217BodyList(scKey, 6, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 2, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3d Host echo binds hap1 to Joiner's 2 apples cleanly", count(sc.inventory, APPLE) == 2)
+
+-- Now merge 3 more apples from Henry's pack onto the existing 2-apple stack in chest (2 -> 5)
+ITEMS[player.inventory.list[#player.inventory.list]].amount = 5
+for _, w in ipairs(sc.inventory.list) do if ITEMS[w] and ITEMS[w].class == APPLE then ITEMS[w].amount = 5 end end
+LOG = {}
+KCD2MP_W217LootPoll()
+local putEvt2 = events("w134_put")[1] or ""
+check("M2.3e putting 3 more apples onto existing 2-apple chest stack sends w134_put amt=3",
+    putEvt2:find(" " .. scKey .. " " .. APPLE .. " 3 ", 1, true) ~= nil, putEvt2)
+-- Stale rev before Host processed the +3 put keeps chest at 5 (never snaps back to 2)
+KCD2MP_W217BodyList(scKey, 7, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 2, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3e stale pre-put list does not revert merged 5-apple stack to 2", count(sc.inventory, APPLE) == 5)
+KCD2MP_W217BodyList(scKey, 8, 1, 1, { { id = "ha1", cls = ARROW, amt = 3, hp = 1, worn = 0, stolen = 0, owner = "-" },
+                                       { id = "hap1", cls = APPLE, amt = 5, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("M2.3e Host echo of 5-apple stack settles cleanly", count(sc.inventory, APPLE) == 5)
+
+-- (f) Host side: partial stack deduction via escrow AND live Joiner put while Host ALSO has UI screen open!
+world(); asHost(1)
+local hsc = attachStash(mkWorldChest("host_stack_chest", "Stash45", "Stash", 101, 100, 10))
+hsc.inventory:CreateItem(ARROW, 1, 20)
+local hscKey = KCD2MP_W217ChestKey(hsc)
+local hArrId = key(hsc.inventory.list[1])
+KCD2MP_W217HostOpen(1, hscKey)
+-- Host ALSO opens its inventory UI on this chest right now!
+KCD2MP_W201InvIntent(hscKey, "ours")
+KCD2MP_W201InvScreen("in", "element")
+LOG = {}
+KCD2MP_W217HostTakeReq(1, "501", hscKey, hArrId, ARROW, 5)
+local htres = events("w217_tres")[1] or ""
+local hblist = events("w217_blist")[1] or ""
+check("M2.3f Host deducts 5/20 arrows via escrow (15 remain in chest, 5 in escrow) and pushes updated w217_blist immediately",
+    htres:find("^1 501 grant ") ~= nil and count(hsc.inventory, ARROW) == 15 and count(esc().inventory, ARROW) == 5
+    and hblist:find(ARROW .. ":15:", 1, true) ~= nil, hblist)
+KCD2MP_W217HostAck(1, "501", "applied")
+check("M2.3f Ack deletes escrowed 5 arrows on Host", count(esc().inventory, ARROW) == 0 and count(hsc.inventory, ARROW) == 15)
+
+-- Joiner puts 1 apple into empty slot of chest WHILE Host's UI screen is STILL open!
+LOG = {}
+KCD2MP_W134HostPut(1, "502", hscKey, APPLE, 1, 1.0)
+hblist = events("w217_blist")[1] or ""
+check("M2.3g Joiner put while Host UI is open is NOT blocked by WO-201 defer: created via escrow and broadcast immediately",
+    count(hsc.inventory, APPLE) == 1 and count(esc().inventory, APPLE) == 0 and hblist:find(APPLE .. ":1:", 1, true) ~= nil, hblist)
+-- Joiner puts 3 more apples onto that 1-apple stack while Host UI is still open -> merges to 4 and broadcasts immediately!
+LOG = {}
+KCD2MP_W134HostPut(1, "503", hscKey, APPLE, 3, 1.0)
+hblist = events("w217_blist")[1] or ""
+check("M2.3g Joiner stack-merge put while Host UI is open updates Host chest to 4 apples and broadcasts w217_blist immediately",
+    count(hsc.inventory, APPLE) == 4 and hblist:find(APPLE .. ":4:", 1, true) ~= nil, hblist)
+KCD2MP_W201InvScreen("out", "element")
+
+-- ================= R1: overlapping stack transfers never merge in escrow or duplicate items =================
+-- (a) Joiner takes 5 arrows and then 4 arrows from a 20-arrow stack BEFORE replies arrive (with MERGE_STACKS on)
+world(); asJoiner()
+W217.L.hostQueue = {}; W217.L.splitRemap = {}
+local ovChest = attachStash(mkWorldChest("ov_joiner_chest", "Stash45", "Stash", 101, 100, 10))
+local ovKey = KCD2MP_W217ChestKey(ovChest)
+ovChest:OnUsed(player, 1)
+KCD2MP_W217BodyList(ovKey, 1, 1, 1, { { id = "hoa1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+
+-- First partial take: 5 of 20 arrows
+ITEMS[ovChest.inventory.list[1]].amount = 15
+player.inventory:CreateItem(ARROW, 1, 5)
+LOG = {}
+KCD2MP_W217LootPoll()
+local ovReq1 = events("w217_treq")[1] or ""
+local ovTok1 = string.match(ovReq1, "^(%S+)")
+check("R1a first take (5/20) emits w217_treq amt=5 and holds 5 in escrow",
+    ovTok1 ~= nil and ovReq1:find(" hoa1 " .. ARROW .. " 5", 1, true) ~= nil and count(player.inventory, ARROW) == 0 and count(ovChest.inventory, ARROW) == 15, ovReq1)
+
+-- Second partial take BEFORE first reply arrives: 4 more arrows (15 -> 11)
+ITEMS[ovChest.inventory.list[1]].amount = 11
+player.inventory:CreateItem(ARROW, 1, 4)
+LOG = {}
+KCD2MP_W217LootPoll()
+check("R1a overlapping second take (4/15) stages in isolated escrow queue without merging onto tok1 or sending early treq",
+    #events("w217_treq") == 0 and count(player.inventory, ARROW) == 0 and count(esc().inventory, ARROW) == 5 and count(ovChest.inventory, ARROW) == 11)
+
+-- Stale BodyList (amt=20) while tok1 is pending and take #2 is queued keeps chest at 11
+KCD2MP_W217BodyList(ovKey, 2, 1, 1, { { id = "hoa1", cls = ARROW, amt = 20, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("R1a stale BodyList (20) accounts for both pending (5) and queued (4) takes -> chest stays at 11", count(ovChest.inventory, ARROW) == 11)
+
+-- First grant arrives: Joiner pack gets ONLY 5 arrows (NOT 9!), and second take promotes and emits w217_treq amt=4
+LOG = {}
+KCD2MP_W217TakeResult(ovTok1, "grant", ovKey, "hoa1", "-", 0)
+local ovReq2 = events("w217_treq")[1] or ""
+local ovTok2 = string.match(ovReq2, "^(%S+)")
+check("R1a first grant gives Henry exactly 5 arrows (not 9) and promotes queued 4-arrow take",
+    count(player.inventory, ARROW) == 5 and ovTok2 ~= nil and ovReq2:find(" " .. ARROW .. " 4", 1, true) ~= nil,
+    string.format("pack=%d req2=%s", count(player.inventory, ARROW), ovReq2))
+
+-- Second grant arrives: Henry pack now has 9 arrows and chest has 11
+KCD2MP_W217TakeResult(ovTok2, "grant", ovKey, "hoa1", "-", 0)
+KCD2MP_W217BodyList(ovKey, 3, 1, 1, { { id = "hoa1", cls = ARROW, amt = 11, hp = 1, worn = 0, stolen = 0, owner = "-" } })
+check("R1a second grant gives Henry 9 total arrows and chest keeps 11",
+    count(player.inventory, ARROW) == 9 and count(ovChest.inventory, ARROW) == 11 and count(esc().inventory, ARROW) == 0)
+
+-- (b) Host receives two overlapping partial take requests (5 and 4 from 20-stack) before acks -> both cancelled -> chest is 20 (NOT 35!)
+world(); asHost(2)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}
+local hovChest = attachStash(mkWorldChest("ov_host_chest", "Stash45", "Stash", 101, 100, 10))
+hovChest.inventory:CreateItem(ARROW, 1, 20)
+local hovKey = KCD2MP_W217ChestKey(hovChest)
+local hovArrId = key(hovChest.inventory.list[1])
+KCD2MP_W217HostOpen(1, hovKey)
+KCD2MP_W217HostOpen(2, hovKey)
+KCD2MP_W217HostTakeReq(1, "601", hovKey, hovArrId, ARROW, 5)
+KCD2MP_W217HostTakeReq(2, "602", hovKey, hovArrId, ARROW, 4)
+KCD2MP_W217HostAck(1, "601", "cancel")
+KCD2MP_W217HostAck(2, "602", "cancel")
+check("R1b two overlapping partial takes on Host both cancelled -> chest stack is 20 (never 35)",
+    count(hovChest.inventory, ARROW) == 20 and count(esc().inventory, ARROW) == 0, count(hovChest.inventory, ARROW))
+
+-- Also verify cancelling queued request first (604 then 603) -> chest stack is 20
+local hovArrId2 = key(hovChest.inventory.list[1])
+KCD2MP_W217HostTakeReq(1, "603", hovKey, hovArrId2, ARROW, 5)
+KCD2MP_W217HostTakeReq(2, "604", hovKey, hovArrId2, ARROW, 4)
+KCD2MP_W217HostAck(2, "604", "cancel")
+KCD2MP_W217HostAck(1, "603", "cancel")
+check("R1b cancelling queued request before active request also restores chest stack to 20",
+    count(hovChest.inventory, ARROW) == 20 and count(esc().inventory, ARROW) == 0, count(hovChest.inventory, ARROW))
+
+-- (c) First overlapping partial take granted+applied (5), second cancelled (4) -> chest has 15
+local hovArrId3 = key(hovChest.inventory.list[1])
+LOG = {}
+KCD2MP_W217HostTakeReq(1, "605", hovKey, hovArrId3, ARROW, 5)
+KCD2MP_W217HostTakeReq(2, "606", hovKey, hovArrId3, ARROW, 4)
+KCD2MP_W217HostAck(1, "605", "applied")
+check("R1c applying first take (5) promotes queued second take (4) cleanly",
+    (events("w217_tres")[2] or ""):find("^2 606 grant ") ~= nil and count(hovChest.inventory, ARROW) == 11, events("w217_tres")[2])
+KCD2MP_W217HostAck(2, "606", "cancel")
+check("R1c cancelling second take restores its 4 arrows -> chest has 15",
+    count(hovChest.inventory, ARROW) == 15 and count(esc().inventory, ARROW) == 0, count(hovChest.inventory, ARROW))
+
+MERGE_STACKS = {}
+
+-- ================= R3: unloaded host chest is never reported as empty =================
+-- Host side: chest entity is absent (unstreamed on Host)
+world(); asHost(1)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}
+local missingKey = KCD2MP_W217EncodeChestKey("Stash", "Stash_far_castle", 2500.00, -1800.00, 45.00)
+LOG = {}
+KCD2MP_W134HostOpen(1, 0, missingKey)
+check("R3a unloaded chest on Host creates no hostLive session, emits no empty w217_blist, and emits flags=2 open refusal",
+    W217.L.hostLive[missingKey] == nil and #events("w217_blist") == 0
+    and (events("w134_bstate")[1] or "") == ("1 0 " .. missingKey .. " open 2 1 1 -"),
+    events("w134_bstate")[1])
+
+-- Joiner side: local chest has 1 sword + 3 apples; Host replies flags=2
+world(); asJoiner()
+CHEST_OPENS = {}; TOASTS = {}
+local farChestJ = attachStash(mkWorldChest("far_castle_j", "Stash_far_castle", "Stash", 101.00, 100.00, 10.00))
+farChestJ.inventory:CreateItem(SWORD, 0.9, 1)
+farChestJ.inventory:CreateItem(APPLE, 1.0, 3)
+local farKeyJ = KCD2MP_W217ChestKey(farChestJ)
+farChestJ:OnUsed(player, 1)
+check("R3b Joiner chest open awaits Host response", KCD2MP.w134.pendingOpen[farKeyJ] ~= nil and #CHEST_OPENS == 0)
+KCD2MP_W134BodyState(farKeyJ, "open", 2, 1, 1, {})
+check("R3b flags=2 refusal leaves Joiner chest contents untouched, opens no empty screen, creates no live session, and toasts player",
+    KCD2MP.w134.pendingOpen[farKeyJ] == nil and W217.L.sess[farKeyJ] == nil and #CHEST_OPENS == 0
+    and count(farChestJ.inventory, SWORD) == 1 and count(farChestJ.inventory, APPLE) == 3
+    and (TOASTS[#TOASTS] or ""):find("Move closer to your host", 1, true) ~= nil, TOASTS[#TOASTS])
+
+-- Mid-session unstreaming defense: Joiner had chest open, puts 1 coat, Host chest unloads before HostPut -> rolled back to Henry's pack
+farChestJ:OnUsed(player, 1)
+KCD2MP_W217BodyList(farKeyJ, 1, 1, 1, { { id = "fc1", cls = SWORD, amt = 1, hp = 0.9, worn = 0, stolen = 0, owner = "-" } })
+player.inventory:CreateItem(COAT, 0.8, 1)
+KCD2MP_W217LootPoll()
+moveTo(player.inventory, farChestJ.inventory, COAT)
+KCD2MP_W217LootPoll()
+check("R3c Joiner put moved coat into chest awaiting Host confirmation", count(player.inventory, COAT) == 0 and count(farChestJ.inventory, COAT) == 1)
+KCD2MP_W134BodyState(farKeyJ, "update", 2, 1, 1, {})
+check("R3c mid-session flags=2 rolls unconfirmed put back into Henry's pack and closes live session",
+    count(player.inventory, COAT) == 1 and count(farChestJ.inventory, COAT) == 0 and W217.L.sess[farKeyJ] == nil)
+
+-- ================= R4: delayed acks, partial deposit confirmations, and deferred unloaded cancel returns =================
+MERGE_STACKS[ARROW] = true
+MERGE_STACKS[APPLE] = true
+
+-- R4a: Delayed ack (> 10 s) after delivered grant NEVER returns items to Host chest, and late "applied" ack cleans up escrow
+world(); asHost(1)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}; W217.L.pendingReturns = {}
+local dAckChest = attachStash(mkWorldChest("dack_chest", "Stash88", "Stash", 101, 100, 10))
+dAckChest.inventory:CreateItem(ARROW, 1, 20)
+local dAckKey = KCD2MP_W217ChestKey(dAckChest)
+local dAckArrId = key(dAckChest.inventory.list[1])
+KCD2MP_W217HostOpen(1, dAckKey)
+KCD2MP_W217HostTakeReq(1, "701", dAckKey, dAckArrId, ARROW, 5)
+NOW = NOW + 15.0
+KCD2MP_W217LootPoll()
+check("R4a delayed ack (>10s) after grant keeps Host chest at 15 (never auto-returns to 20)",
+    count(dAckChest.inventory, ARROW) == 15 and W217.L.hostEsc["1:701"] ~= nil, count(dAckChest.inventory, ARROW))
+check("R4a late applied ack succeeds and deletes held escrow",
+    KCD2MP_W217HostAck(1, "701", "applied") == true and W217.L.hostEsc["1:701"] == nil and count(dAckChest.inventory, ARROW) == 15)
+
+-- R4b: Overlapping deposits (chest=2, pack=10; deposit 3 then 2; Host accepts 3 -> 5, rejects 2 on unload) -> 5 in chest + 7 in pack = 12 (never 15!)
+world(); asJoiner()
+local depChest = attachStash(mkWorldChest("dep_chest", "Stash89", "Stash", 101, 100, 10))
+depChest.inventory:CreateItem(APPLE, 1, 2)
+player.inventory:CreateItem(APPLE, 1, 10)
+local depKey = KCD2MP_W217ChestKey(depChest)
+depChest:OnUsed(player, 1)
+KCD2MP_W217BodyList(depKey, 1, 1, 1, { { id = "ha1", cls = APPLE, amt = 2, hp = 1.0, worn = 0, stolen = 0, owner = "-" } })
+-- Deposit 3 apples (pack 10 -> 7, chest 2 -> 5)
+do
+    local pw = player.inventory.list[1]
+    player.inventory:DeleteItem(pw, 3)
+    depChest.inventory:CreateItem(APPLE, 1, 1) -- wait: use AddItem so MERGE_STACKS merges 3 onto 2 -> 5
+    depChest.inventory:DeleteItem(depChest.inventory.list[#depChest.inventory.list], -1)
+    local tmp = newItem(APPLE, 1, 3)
+    depChest.inventory:AddItem(tmp)
+end
+KCD2MP_W217LootPoll()
+-- Deposit 2 more apples (pack 7 -> 5, chest 5 -> 7)
+do
+    local pw = player.inventory.list[1]
+    player.inventory:DeleteItem(pw, 2)
+    local tmp = newItem(APPLE, 1, 2)
+    depChest.inventory:AddItem(tmp)
+end
+KCD2MP_W217LootPoll()
+-- Host update confirms first deposit only (chest = 5), then Host unloads (flags = 2) rejecting second deposit
+KCD2MP_W217BodyList(depKey, 2, 1, 1, { { id = "ha1", cls = APPLE, amt = 5, hp = 1.0, worn = 0, stolen = 0, owner = "-" } })
+KCD2MP_W134BodyState(depKey, "update", 2, 1, 1, {})
+check("R4b aborting after first deposit confirmed refunds ONLY unconfirmed 2 apples (chest=5, pack=7, total=12, never 15)",
+    count(depChest.inventory, APPLE) == 5 and count(player.inventory, APPLE) == 7,
+    "chest=" .. count(depChest.inventory, APPLE) .. " pack=" .. count(player.inventory, APPLE))
+
+-- R4c: Cancelling while Host chest is unloaded preserves reserved items and restores 20 when chest streams back in
+world(); asHost(1)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}; W217.L.pendingReturns = {}
+local unlChest = attachStash(mkWorldChest("unl_chest", "Stash90", "Stash", 101, 100, 10))
+unlChest.inventory:CreateItem(ARROW, 1, 20)
+local unlKey = KCD2MP_W217ChestKey(unlChest)
+local unlArrId = key(unlChest.inventory.list[1])
+KCD2MP_W217HostOpen(1, unlKey)
+KCD2MP_W217HostTakeReq(1, "703", unlKey, unlArrId, ARROW, 5)
+ENTS["unl_chest"] = nil   -- chest unloads on Host while 5 arrows are reserved in escrow
+KCD2MP_W217HostAck(1, "703", "cancel")
+check("R4c cancel while chest unloaded keeps 5 reserved arrows in pendingReturns",
+    #(W217.L.pendingReturns or {}) == 1)
+ENTS["unl_chest"] = unlChest   -- chest streams back in on Host
+KCD2MP_W217LootPoll()
+check("R4c once chest streams back in, 5 reserved arrows return -> chest has all 20 arrows",
+    count(unlChest.inventory, ARROW) == 20 and #(W217.L.pendingReturns or {}) == 0, count(unlChest.inventory, ARROW))
+
+MERGE_STACKS = {}
 
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0

@@ -234,6 +234,173 @@ public static class Wo134Rules
         if (n > 0 || o.Count == 0) o.Add(sb.Append(post).ToString());
         return o;
     }
+
+    // ------------------------------------------------------------------ M2: loose world item tombstones
+
+    private static readonly Regex TombByRx = new(@"^[A-Za-z0-9_\-]{1,32}$", RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public sealed class ItemTombstone
+    {
+        public string Cls { get; set; } = "";
+        public float X { get; set; }
+        public float Y { get; set; }
+        public float Z { get; set; }
+        public string By { get; set; } = "";
+        public bool Swept { get; set; }
+    }
+
+    public static bool ValidTombstone(ItemTombstone? t) =>
+        t is not null && TryClass(t.Cls, out _) && TombByRx.IsMatch(t.By ?? "")
+        && float.IsFinite(t.X) && float.IsFinite(t.Y) && float.IsFinite(t.Z)
+        && Math.Abs(t.X) < 100000f && Math.Abs(t.Y) < 100000f && Math.Abs(t.Z) < 100000f;
+
+    /// <summary>M2: per-world tombstone ledger for loose world items picked up while unstreamed on the host.</summary>
+    public sealed class ItemTombstoneLedger
+    {
+        public const int MaxEntries = 1000;
+        public List<ItemTombstone> Items { get; set; } = [];
+
+        public void AddOrUpdate(ItemTombstone t)
+        {
+            if (!ValidTombstone(t)) return;
+            string cls = t.Cls.ToLowerInvariant();
+            foreach (var ex in Items)
+            {
+                float dx = ex.X - t.X, dy = ex.Y - t.Y, dz = ex.Z - t.Z;
+                if (string.Equals(ex.Cls, cls, StringComparison.OrdinalIgnoreCase) && dx * dx + dy * dy + dz * dz <= 0.15f * 0.15f)
+                {
+                    ex.Swept |= t.Swept;
+                    return;
+                }
+            }
+            Items.Add(new ItemTombstone { Cls = cls, X = t.X, Y = t.Y, Z = t.Z, By = t.By, Swept = t.Swept });
+            if (Items.Count > MaxEntries) Items.RemoveRange(0, Items.Count - MaxEntries);
+        }
+
+        public bool MarkSwept(string cls, float x, float y, float z)
+        {
+            ItemTombstone? best = null;
+            float bestD2 = 5.0f * 5.0f;
+            foreach (var it in Items)
+            {
+                if (it.Swept || !string.Equals(it.Cls, cls, StringComparison.OrdinalIgnoreCase)) continue;
+                float dx = it.X - x, dy = it.Y - y, dz = it.Z - z;
+                float d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 < bestD2 || (best is null && d2 <= bestD2)) { best = it; bestD2 = d2; }
+            }
+            if (best is null) return false;
+            best.Swept = true;
+            return true;
+        }
+
+        public string ToJson() => JsonSerializer.Serialize(this);
+
+        public static ItemTombstoneLedger FromJson(string? json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return new ItemTombstoneLedger();
+            try
+            {
+                var l = JsonSerializer.Deserialize<ItemTombstoneLedger>(json) ?? new ItemTombstoneLedger();
+                l.Items.RemoveAll(t => !ValidTombstone(t));
+                foreach (var t in l.Items) t.Cls = t.Cls.ToLowerInvariant();
+                return l;
+            }
+            catch (JsonException) { return new ItemTombstoneLedger(); }
+        }
+
+        public ItemTombstoneLedger Clone() => FromJson(ToJson());
+    }
+
+    /// <summary>KCD2MP_W134HostTombstones calls packed within the console's encoded length ceiling.</summary>
+    public static List<string> TombstoneSyncCalls(IReadOnlyList<ItemTombstone> items, bool reset = true, int maxEncoded = 1800)
+    {
+        const string pre = "if KCD2MP_W134HostTombstones then KCD2MP_W134HostTombstones({", postFirst = "}, true) end", postMore = "}, false) end";
+        var o = new List<string>();
+        if (items.Count == 0 && !reset) return o;
+        var sb = new StringBuilder(pre);
+        int n = 0;
+        bool first = reset;
+        foreach (var t in items)
+        {
+            if (!ValidTombstone(t)) continue;
+            string r = string.Create(CultureInfo.InvariantCulture, $"{{\"{t.Cls.ToLowerInvariant()}\",{F3(t.X)},{F3(t.Y)},{F3(t.Z)},\"{t.By}\",{(t.Swept ? "true" : "false")}}},");
+            string post = first ? postFirst : postMore;
+            if (n > 0 && Uri.EscapeDataString("#" + sb + r + post).Length > maxEncoded)
+            {
+                o.Add(sb.Append(post).ToString());
+                first = false;
+                sb = new StringBuilder(pre);
+                n = 0;
+            }
+            sb.Append(r);
+            n++;
+        }
+        if (n > 0 || (o.Count == 0 && reset)) o.Add(sb.Append(first ? postFirst : postMore).ToString());
+        return o;
+    }
+}
+
+/// <summary>M2: per-world persistence store for loose world item tombstones on the host, paired with every host save.</summary>
+public sealed class WorldItemTombstoneStore
+{
+    public const int KeepPairs = 100;
+    private readonly string _root;
+    private readonly object _gate = new();
+    private static readonly Regex TagRx = new("^[0-9a-f]{6,16}$", RegexOptions.Compiled);
+    private static readonly Regex Md5Rx = new("^[0-9a-f]{32}$", RegexOptions.Compiled);
+
+    public WorldItemTombstoneStore(string root) { _root = root; }
+
+    public static string DefaultRoot() => Path.Combine(Path.GetDirectoryName(HenryStore.DefaultRoot())!, "world-items");
+
+    private string Dir(string tag)
+    {
+        if (!TagRx.IsMatch(tag)) throw new ArgumentException("not a world tag: " + tag);
+        return Path.Combine(_root, tag);
+    }
+
+    public Wo134Rules.ItemTombstoneLedger Current(string tag)
+    {
+        lock (_gate)
+        {
+            var p = Path.Combine(Dir(tag), "current.json");
+            return Wo134Rules.ItemTombstoneLedger.FromJson(File.Exists(p) ? File.ReadAllText(p) : null);
+        }
+    }
+
+    public void SaveCurrent(string tag, Wo134Rules.ItemTombstoneLedger l) => Write(Path.Combine(Dir(tag), "current.json"), l.ToJson());
+
+    public void Pair(string tag, string md5, Wo134Rules.ItemTombstoneLedger l)
+    {
+        md5 = md5.ToLowerInvariant();
+        if (!Md5Rx.IsMatch(md5)) throw new ArgumentException("md5");
+        Write(Path.Combine(Dir(tag), $"pair-{md5}.json"), l.ToJson());
+        lock (_gate)
+        {
+            var old = Directory.EnumerateFiles(Dir(tag), "pair-*.json").Select(f => new FileInfo(f))
+                               .OrderByDescending(f => f.LastWriteTimeUtc).Skip(KeepPairs).ToList();
+            foreach (var f in old) try { f.Delete(); } catch (IOException) { }
+        }
+    }
+
+    public Wo134Rules.ItemTombstoneLedger? Paired(string tag, string md5)
+    {
+        lock (_gate)
+        {
+            var p = Path.Combine(Dir(tag), $"pair-{md5.ToLowerInvariant()}.json");
+            return File.Exists(p) ? Wo134Rules.ItemTombstoneLedger.FromJson(File.ReadAllText(p)) : null;
+        }
+    }
+
+    private void Write(string path, string json)
+    {
+        lock (_gate)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.WriteAllText(path + ".part", json);
+            File.Move(path + ".part", path, overwrite: true);
+        }
+    }
 }
 
 /// <summary>WO-134: the host's chest ledgers, one per world: the running one and a copy paired with every host save.</summary>

@@ -53,9 +53,6 @@ public class M1PostLoadLedgerTests
     private static void InvokeAfterReady(GameBridge b, string tag) =>
         typeof(GameBridge).GetMethod("Wo134AfterReady", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(b, [tag]);
 
-    private static void InvokeOnLedgerPart(GameBridge b, int part, int n, List<Wo134Rules.Entry> rows) =>
-        typeof(GameBridge).GetMethod("Wo134OnLedgerPart", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(b, [part, n, rows]);
-
     private static Task InvokeApplyIfReadyAsync(GameBridge b, bool timeout) =>
         (Task)typeof(GameBridge).GetMethod("Wo134ApplyIfReadyAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(b, [timeout])!;
 
@@ -73,53 +70,14 @@ public class M1PostLoadLedgerTests
     }
 
     [Fact]
-    public async Task Fast_lan_ledger_arrival_after_arm_or_concurrently_before_after_ready_applies_immediately_without_wipe()
+    public async Task Retired_chest_ledger_hooks_clear_state_without_emitting_legacy_ChestApply_calls()
     {
-        var entry = new Wo134Rules.Entry { C = Chest, Cls = Dice, N = 1, Hp = 1f, T = 1000, R = 7 };
+        var (bridge, transport) = CreateBridge();
+        InvokeRestorePick(bridge, null);
+        InvokeAfterReady(bridge, WorldTag);
+        await InvokeApplyIfReadyAsync(bridge, false);
 
-        // Case 1: Armed before SendJoinerReadyAsync, sub-millisecond LAN response arrives right after
-        {
-            var (bridge, transport) = CreateBridge();
-            InvokeRestorePick(bridge, null);
-            InvokeAfterReady(bridge, WorldTag);
-            InvokeOnLedgerPart(bridge, 1, 1, [entry]);
-            await InvokeApplyIfReadyAsync(bridge, false);
-
-            Assert.Contains(transport.LuaCalls, c => c.Contains("KCD2MP_W134ChestApply", StringComparison.Ordinal) && c.Contains(Dice, StringComparison.Ordinal));
-            // Consumed ledger is cleared so a subsequent join never reuses stale host entries
-            Assert.Null(typeof(GameBridge).GetField("_w134RxLedger", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bridge));
-        }
-
-        // Case 2: Packet arrives concurrently BEFORE Wo134AfterReady runs -> preserved and applied immediately!
-        {
-            var (bridge, transport) = CreateBridge();
-            InvokeRestorePick(bridge, null);
-            InvokeOnLedgerPart(bridge, 1, 1, [entry]);
-            InvokeAfterReady(bridge, WorldTag);
-            // Wait briefly for the fire-and-forget Wo134ApplyIfReadyAsync kicked by Wo134AfterReady
-            for (int i = 0; i < 20 && transport.LuaCalls.IsEmpty; i++) await Task.Delay(10);
-
-            Assert.Contains(transport.LuaCalls, c => c.Contains("KCD2MP_W134ChestApply", StringComparison.Ordinal) && c.Contains(Dice, StringComparison.Ordinal));
-        }
-
-        // Case 3: Stale world-epoch packet arriving before Wo134AfterReady IS discarded when world epoch advanced
-        {
-            var (bridge, transport) = CreateBridge();
-            var epochs = (Wo206Epochs)typeof(GameBridge).GetField("_w206", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bridge)!;
-            var frameStampField = typeof(GameBridge).GetField("_w206FrameStamp", BindingFlags.NonPublic | BindingFlags.Instance)!;
-
-            InvokeRestorePick(bridge, null);
-            epochs.LearnWorld(1, 1);
-            frameStampField.SetValue(bridge, 1u);
-            InvokeOnLedgerPart(bridge, 1, 1, [entry]);
-
-            // Host reloads into world epoch 2 before Wo134AfterReady runs
-            epochs.LearnWorld(2, 2);
-            InvokeAfterReady(bridge, WorldTag);
-            await Task.Delay(25);
-
-            Assert.Empty(transport.LuaCalls);
-            Assert.Null(typeof(GameBridge).GetField("_w134RxLedger", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bridge));
-        }
+        Assert.Empty(transport.LuaCalls);
+        Assert.Null(typeof(GameBridge).GetField("_w134RxLedger", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bridge));
     }
 }

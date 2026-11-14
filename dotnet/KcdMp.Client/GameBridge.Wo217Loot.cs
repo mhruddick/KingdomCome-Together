@@ -332,6 +332,81 @@ public static class Wo217LootRules
 
     public static string LuaItems(List<Item> items) =>
         "{" + string.Join(",", items.Select(i => $"{{id=\"{i.Id}\",cls=\"{i.Cls:D}\",amt={i.Amt},hp={Wo134Rules.F(i.Hp)},worn={(i.Worn ? 1 : 0)},stolen={(i.Stolen ? 1 : 0)},owner=\"{i.Owner}\"}}")) + "}";
+
+    /// <summary>M2: coordinate + class + name-hash wire key for shared world containers (fits Wo134Rules.BodyName: [A-Za-z0-9_]{1,80}).</summary>
+    public static readonly Regex ChestKey = new(@"^wc_([SCND])_([pn]\d{1,8})_([pn]\d{1,8})_([pn]\d{1,8})_([0-9a-f]{8})_([A-Za-z0-9_]{1,16})$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public static bool IsChestKey(string? s) => s is not null && ChestKey.IsMatch(s);
+
+    /// <summary>Dual-prime 32-bit hash of the full container entity name (identical to Lua KCD2MP_W217ChestHash).</summary>
+    public static string ChestHash(string name)
+    {
+        int h1 = 0, h2 = 0;
+        foreach (byte b in System.Text.Encoding.UTF8.GetBytes(name ?? ""))
+        {
+            h1 = (h1 * 31 + b) % 65521;
+            h2 = (h2 * 37 + b) % 65519;
+        }
+        return string.Create(CultureInfo.InvariantCulture, $"{h1:x4}{h2:x4}");
+    }
+
+    public static string? EncodeChestKey(string containerClass, string name, float x, float y, float z)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z)
+            || Math.Abs(x) >= 100000f || Math.Abs(y) >= 100000f || Math.Abs(z) >= 100000f) return null;
+        char tag = containerClass switch
+        {
+            "Stash" => 'S',
+            "CartStash" => 'C',
+            "Nest" => 'N',
+            "DestroStash" => 'D',
+            _ => '\0',
+        };
+        if (tag == '\0') return null;
+        string stem = Regex.Replace(name, "[^A-Za-z0-9]+", "_").Trim('_');
+        if (stem.Length == 0) stem = "c";
+        else if (stem.Length > 16) stem = stem[..16].TrimEnd('_');
+        if (stem.Length == 0) stem = "c";
+        return $"wc_{tag}_{EncCm(x)}_{EncCm(y)}_{EncCm(z)}_{ChestHash(name)}_{stem}";
+    }
+
+    public static bool TryDecodeChestKey(string? key, out string containerClass, out float x, out float y, out float z, out string hash8)
+    {
+        containerClass = ""; x = y = z = 0f; hash8 = "";
+        if (key is null) return false;
+        var m = ChestKey.Match(key);
+        if (!m.Success) return false;
+        containerClass = m.Groups[1].Value switch
+        {
+            "S" => "Stash",
+            "C" => "CartStash",
+            "N" => "Nest",
+            "D" => "DestroStash",
+            _ => "",
+        };
+        if (containerClass.Length == 0
+            || !TryDecCm(m.Groups[2].Value, out x)
+            || !TryDecCm(m.Groups[3].Value, out y)
+            || !TryDecCm(m.Groups[4].Value, out z)) return false;
+        hash8 = m.Groups[5].Value;
+        return true;
+    }
+
+    private static string EncCm(float v)
+    {
+        long cm = (long)Math.Floor(Math.Abs((double)v) * 100.0 + 0.5);
+        return cm == 0 ? "p0" : $"{(v < 0 ? 'n' : 'p')}{cm.ToString(CultureInfo.InvariantCulture)}";
+    }
+
+    private static bool TryDecCm(string s, out float v)
+    {
+        v = 0f;
+        if (s.Length < 2 || !long.TryParse(s.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture, out long cm) || cm > 9999999) return false;
+        v = (float)((s[0] == 'n' ? -cm : cm) / 100.0);
+        return true;
+    }
 }
 
 /// <summary>WO-217 F: the host's cart batch on the wire and op 172's body.</summary>
