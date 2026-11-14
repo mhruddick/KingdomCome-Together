@@ -26308,8 +26308,9 @@ function KCD2MP_W160PeerHorse(peer, name, tackCsv)
     return true
 end
 
--- HOST: the joiner whistled (KCD2MP_W151PlayEmote): his horse comes to his avatar.
+-- HOST: the joiner whistled (KCD2MP_W151PlayEmote): his horse comes to his avatar (with >150 m pendingFetch and unloaded NO_SAVE stand-in).
 function KCD2MP_W160Whistle(src)
+    if KCD2MP_M3HostWhistle then return KCD2MP_M3HostWhistle(src) end
     local w = KCD2MP.w160
     if not w.horseFetch then return false end
     src = tostring(src)
@@ -26318,41 +26319,8 @@ function KCD2MP_W160Whistle(src)
     local st = w.horseStats
     local g = KCD2MP.ghosts and (KCD2MP.ghosts[src] or KCD2MP.ghosts[tonumber(src) or -1])
     local av = g and g.entity
-    local e = nil
-    pcall(function() e = System.GetEntityByName(name) end)
-    local function refuse(why)
-        st.refused = st.refused + 1
-        mp_log(string.format("WO160-HORSE refused fetch of %s for ghost %s: %s", name, src, why))
-        return false
-    end
-    if not av then return refuse("his avatar is not here") end
-    if not e then return refuse("the horse is not loaded in the host's world (far from both players)") end
-    if KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(name) then return refuse("someone is riding it") end
-    local rider = false
-    pcall(function() rider = e.human ~= nil and e.human:IsMounted() == true end)
-    pcall(function() if e.horse and e.horse.HasRider then rider = rider or e.horse:HasRider() == true end end)
-    if rider then return refuse("it has a rider") end
-    local ap, hp = nil, nil
-    pcall(function() ap = av:GetWorldPos() end)
-    pcall(function() hp = e:GetWorldPos() end)
-    if not ap or not hp then return refuse("no position") end
-    local d = math.sqrt((ap.x - hp.x) ^ 2 + (ap.y - hp.y) ^ 2)
-    if d <= w.horseNearM then
-        st.near = st.near + 1
-        mp_log(string.format("WO160-HORSE %s is already %.0f m from ghost %s's avatar -- left where it is", name, d, src))
-        return true
-    end
-    -- 7 m beside the avatar, on the side the avatar does not face
-    local yaw = 0
-    pcall(function() local a = av:GetWorldAngles(); yaw = a and a.z or 0 end)
-    local px = ap.x + math.cos(yaw) * w.horseSpotM
-    local py = ap.y + math.sin(yaw) * w.horseSpotM
-    local ok1 = pcall(function() e:SetWorldPos({ x = px, y = py, z = ap.z + 0.3 }) end)
-    pcall(function() e:SetWorldAngles({ x = 0, y = 0, z = yaw }) end)
-    if not ok1 then return refuse("the placement failed") end
-    st.fetched = st.fetched + 1
-    mp_log(string.format("WO160-HORSE fetch %s: was %.0f m away, now %.0f m beside ghost %s's avatar", name, d, w.horseSpotM, src))
-    return true
+    if not av then st.refused = st.refused + 1; return false end
+    return false
 end
 
 function KCD2MP_W160SetHorseFetch(arg)
@@ -26659,7 +26627,8 @@ do
             end
         end
         local loaded, state = m3_syncWorldHorse(peer, name)
-        if loaded and w.peerProxies[peer] and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] and KCD2MP.horseGhosts[peer].isPeerProxy) then
+        if loaded and not w.pendingFetch[peer] and w.peerProxies[peer]
+           and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] and KCD2MP.horseGhosts[peer].isPeerProxy) then
             m3_removePeerProxy(peer, "world-horse-loaded")
         elseif w.peerProxies[peer] and w.peerProxies[peer].entity then
             m3_applyTackToEntity("proxy:" .. peer, w.peerProxies[peer].entity, w.peerProxies[peer].name, true, w.peerHorseTackWanted[peer] or "")
@@ -26669,6 +26638,141 @@ do
             state == "loaded" and "loaded in this world"
             or state == "same-as-host" and "same name as the host's horse -- uses NO_SAVE stand-in"
             or "not loaded here now -- it is fetched when it is"))
+        return true
+    end
+
+    function KCD2MP_M3OnJoinerWhistle(holdS)
+        local name = nil
+        if player and player.player and player.player.GetHorseId then
+            local id = nil
+            pcall(function() id = player.player:GetHorseId() end)
+            if id and id ~= 0 then
+                local e = nil
+                pcall(function() e = System.GetEntity(id) end)
+                if e and tostring(e.class or "") == "Horse" then pcall(function() name = e:GetName() end) end
+            end
+        end
+        if not (name and KCD2MP_M3IsHorseName(name)) then
+            name = w.ownHorse and w.ownHorse.name or nil
+        end
+        if not (name and KCD2MP_M3IsHorseName(name)) then return false end
+        if (KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() == name) or KCD2MP._mountedHorseName == name then return false end
+        local w136 = KCD2MP.w136
+        local hadActive = w136 and w136.ridden and w136.ridden[name] ~= nil and not w136.ridden[name].untilAt
+        if KCD2MP_W136RideTake then pcall(KCD2MP_W136RideTake, name) end
+        local dur = tonumber(holdS) or 15.0
+        if w136 and w136.ridden then
+            local wasTracked = w136.ridden[name] ~= nil
+            if not hadActive then
+                w136.ridden[name] = { at = os.clock(), untilAt = os.clock() + dur }
+            end
+            if not wasTracked then
+                KCD2MP_EmitEvent("w136_ride", name .. " 1")
+            end
+        end
+        pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+        local e = nil
+        pcall(function() e = System.GetEntityByName(name) end)
+        if e and e.Hide then pcall(function() e:Hide(0) end) end
+        mp_log(string.format("WO160-HORSE joiner whistle: %s released from host stream for %.0f s so CallHorse can materialize/gallop it", name, dur))
+        return true
+    end
+
+    function KCD2MP_M3HostWhistle(src)
+        if not w.horseFetch then return false end
+        src = tostring(src)
+        local name = w.peerHorses[src]
+        if not name then return false end
+        local st = w.horseStats
+        local g = KCD2MP.ghosts and (KCD2MP.ghosts[src] or KCD2MP.ghosts[tonumber(src) or -1])
+        local av = g and g.entity
+        local function refuse(why)
+            st.refused = st.refused + 1
+            mp_log(string.format("WO160-HORSE refused fetch of %s for ghost %s: %s", name, src, why))
+            return false
+        end
+        if not av then return refuse("his avatar is not here") end
+        if g.istate and g.istate.isRiding then return refuse("the rider is already mounted") end
+        local ap = nil
+        pcall(function() ap = av:GetWorldPos() end)
+        if not ap then return refuse("no position") end
+
+        local yaw = 0
+        pcall(function() local a = av:GetWorldAngles(); yaw = a and a.z or 0 end)
+        local px = ap.x + math.cos(yaw) * w.horseSpotM
+        local py = ap.y + math.sin(yaw) * w.horseSpotM
+        local pz = ap.z + 0.3
+
+        local maxPhysicsM = KCD2MP.W157_MOUNT_MAX_M or 150.0
+        local distHost = 0
+        pcall(function()
+            local pp = player and player:GetWorldPos()
+            if pp then distHost = math.sqrt((ap.x - pp.x) ^ 2 + (ap.y - pp.y) ^ 2) end
+        end)
+        if distHost > maxPhysicsM then
+            w.pendingFetch[src] = { name = name, x = px, y = py, z = pz, yaw = yaw, at = os.clock() }
+            st.deferred = (st.deferred or 0) + 1
+            mp_log(string.format("WO160-HORSE deferred fetch of %s for ghost %s (%.0f m from host > %.0f m physics range -- queued in pendingFetch)",
+                name, src, distHost, maxPhysicsM))
+            return true
+        end
+
+        local sameAsHost = KCD2MP_M3IsHostOwnHorse(name)
+        local e = nil
+        if not sameAsHost then pcall(function() e = System.GetEntityByName(name) end) end
+        if not (e and tostring(e.class or "") == "Horse") then
+            local prExisting = w.peerProxies[src]
+            if prExisting and prExisting.entity then
+                local pp0 = nil
+                pcall(function() pp0 = prExisting.entity:GetWorldPos() end)
+                if pp0 then
+                    local d0 = math.sqrt((ap.x - pp0.x) ^ 2 + (ap.y - pp0.y) ^ 2)
+                    if d0 <= w.horseNearM then
+                        st.near = st.near + 1
+                        mp_log(string.format("WO160-HORSE stand-in %s is already %.0f m from ghost %s's avatar -- left where it is", prExisting.name, d0, src))
+                        return true
+                    end
+                end
+            end
+            local pr = KCD2MP_M3EnsurePeerProxy(src, px, py, pz, yaw, name)
+            if not (pr and pr.entity) then return refuse("stand-in spawn failed") end
+            if KCD2MP_W172GroundSnap then pcall(KCD2MP_W172GroundSnap, pr.name, pr.entity, "whistle-standin") end
+            if not sameAsHost then
+                w.pendingFetch[src] = { name = name, x = px, y = py, z = pz, yaw = yaw, at = os.clock(), standIn = true }
+            end
+            st.fetched = st.fetched + 1
+            mp_log(string.format("WO160-HORSE stand-in fetch %s for %s: placed %.0f m beside ghost %s's avatar (%s)",
+                pr.name, name, w.horseSpotM, src, sameAsHost and "same name as host horse" or "world layer unstreamed"))
+            return true
+        end
+
+        if KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(name) then return refuse("someone is riding it") end
+        local rider = false
+        pcall(function() rider = e.human ~= nil and e.human:IsMounted() == true end)
+        pcall(function() if e.horse and e.horse.HasRider then rider = rider or e.horse:HasRider() == true end end)
+        if rider then return refuse("it has a rider") end
+
+        local hp = nil
+        pcall(function() hp = e:GetWorldPos() end)
+        if not hp then return refuse("no position") end
+        w.pendingFetch[src] = nil
+        local d = math.sqrt((ap.x - hp.x) ^ 2 + (ap.y - hp.y) ^ 2)
+        if d <= w.horseNearM then
+            KCD2MP_M3ParkPeerHorse(src, name, e)
+            st.near = st.near + 1
+            mp_log(string.format("WO160-HORSE %s is already %.0f m from ghost %s's avatar -- left where it is", name, d, src))
+            return true
+        end
+        local ok1 = pcall(function() e:SetWorldPos({ x = px, y = py, z = pz }) end)
+        pcall(function() e:SetWorldAngles({ x = 0, y = 0, z = yaw }) end)
+        if not ok1 then return refuse("the placement failed") end
+        m3_syncWorldHorse(src, name)
+        KCD2MP_M3ParkPeerHorse(src, name, e)
+        if w.peerProxies[src] and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[src] and KCD2MP.horseGhosts[src].isPeerProxy) then
+            m3_removePeerProxy(src, "world-horse-fetched")
+        end
+        st.fetched = st.fetched + 1
+        mp_log(string.format("WO160-HORSE fetch %s: was %.0f m away, now %.0f m beside ghost %s's avatar", name, d, w.horseSpotM, src))
         return true
     end
 
@@ -26716,8 +26820,51 @@ do
     end
 
     function KCD2MP_M3HostTick()
+        local maxPhysicsM = KCD2MP.W157_MOUNT_MAX_M or 150.0
+        for src, pf in pairs(w.pendingFetch) do
+            if w.peerHorses[src] ~= pf.name or KCD2MP_M3IsHostOwnHorse(pf.name) then
+                w.pendingFetch[src] = nil
+            else
+                local e = nil
+                pcall(function() e = System.GetEntityByName(pf.name) end)
+                local proxyRidden = KCD2MP.horseGhosts and KCD2MP.horseGhosts[src] and KCD2MP.horseGhosts[src].isPeerProxy
+                if e and tostring(e.class or "") == "Horse" and not proxyRidden
+                   and not (KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(pf.name)) then
+                    local tx, ty, tz, tyaw = pf.x, pf.y, pf.z, pf.yaw or 0
+                    local pr = w.peerProxies[src]
+                    if pr and pr.entity then
+                        local ppos = nil
+                        pcall(function() ppos = pr.entity:GetWorldPos() end)
+                        if ppos then tx, ty, tz = ppos.x, ppos.y, ppos.z end
+                    end
+                    local distHost = 0
+                    pcall(function()
+                        local pp = player and player:GetWorldPos()
+                        if pp then distHost = math.sqrt((tx - pp.x) ^ 2 + (ty - pp.y) ^ 2) end
+                    end)
+                    if distHost <= maxPhysicsM then
+                        local okMove = pcall(function() e:SetWorldPos({ x = tx, y = ty, z = tz }) end)
+                        pcall(function() e:SetWorldAngles({ x = 0, y = 0, z = tyaw }) end)
+                        if okMove then
+                            w.pendingFetch[src] = nil
+                            m3_syncWorldHorse(src, pf.name)
+                            KCD2MP_M3ParkPeerHorse(src, pf.name, e)
+                            if pr then m3_removePeerProxy(src, "pending-fetch-fulfilled") end
+                            w.horseStats.fetched = w.horseStats.fetched + 1
+                            mp_log(string.format("WO160-HORSE fulfilled pendingFetch of %s for ghost %s at (%.1f, %.1f, %.1f)",
+                                pf.name, src, tx, ty, tz))
+                        end
+                    end
+                end
+            end
+        end
+
         for peer, name in pairs(w.peerHorses) do
             local loaded = m3_syncWorldHorse(peer, name)
+            if loaded and not w.pendingFetch[peer] and w.peerProxies[peer]
+               and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] and KCD2MP.horseGhosts[peer].isPeerProxy) then
+                m3_removePeerProxy(peer, "world-horse-loaded")
+            end
             if loaded and w.parkedPeerHorses[name] and not (KCD2MP.w123 and KCD2MP.w123.paused)
                and not (KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(name)) then
                 pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)

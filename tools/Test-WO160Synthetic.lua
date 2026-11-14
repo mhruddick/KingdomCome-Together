@@ -523,4 +523,155 @@ do
     noErrs("O")
 end
 
+-- (W) M3 far whistle (>150 m deferred fetch, unloaded-layer NO_SAVE stand-in, and joiner 15 s stream release) ------------------------
+do
+    ERRS = {}
+    local BY_ID = {}
+    local nextSpawnId = 6000
+    local origGetEnt = System.GetEntity
+    local origSpawn = System.SpawnEntity
+    local origRemove = System.RemoveEntity
+    local origPlayerPos = player.GetWorldPos
+    local hostPos = { x = 0, y = 0, z = 0 }
+    local removedIds = {}
+
+    local function mkHorse(name, eid, x, y, z)
+        local invItems, eqItems = {}, {}
+        local h = {
+            id = eid,
+            class = "Horse",
+            px = x or 0, py = y or 0, pz = z or 0,
+            mountIsLegal = false,
+            noSave = false,
+            invItems = invItems,
+            eqItems = eqItems,
+            GetName = function() return name end,
+            GetWorldPos = function(self) return { x = self.px, y = self.py, z = self.pz } end,
+            SetWorldPos = function(self, p) self.px, self.py, self.pz = p.x, p.y, p.z end,
+            GetWorldAngles = function() return { x = 0, y = 0, z = 0 } end,
+            SetWorldAngles = function() end,
+            SetMountIsLegal = function(self, v) self.mountIsLegal = (v == true) end,
+            IsMountLegal = function(self) return self.mountIsLegal == true end,
+            SetMountableByPlayer = function() end,
+            Hide = function() end,
+            SetFlags = function(self) self.noSave = true end,
+            GetFlags = function(self) return self.noSave and 1 or 0 end,
+            soul = { GetId = function() return "userdata: 0500000000000CCC" end },
+            inventory = {
+                CreateItem = function(_, cls) local k = "item:" .. cls; invItems[k] = cls; return k end,
+                FindItem = function(_, cls) for k, v in pairs(invItems) do if v == cls then return k end end return nil end,
+                GetInventoryTable = function() local t = {}; for k in pairs(invItems) do t[#t + 1] = k end return t end,
+                DeleteItem = function(_, k) invItems[k] = nil; eqItems[k] = nil; return true end,
+            },
+            actor = {
+                EquipInventoryItem = function(_, k) eqItems[k] = true; return true end,
+                UnequipInventoryItem = function(_, k) eqItems[k] = nil; return true end,
+            },
+        }
+        ENTS[name] = h
+        BY_ID[eid] = h
+        return h
+    end
+
+    player.GetWorldPos = function() return hostPos end
+    System.GetEntity = function(id) return BY_ID[id] end
+    System.SpawnEntity = function(params)
+        nextSpawnId = nextSpawnId + 1
+        return mkHorse(params.name, nextSpawnId, params.position.x, params.position.y, params.position.z)
+    end
+    System.RemoveEntity = function(eid)
+        local h = BY_ID[eid]
+        if h then ENTS[h:GetName()] = nil; BY_ID[eid] = nil end
+        removedIds[eid] = true
+    end
+
+    -- W1: Joiner whistle releases own horse from Host puppet stream for 15 s
+    local jHorse = mkHorse("nebakovPruzkum_herynk", 901, 50, 50, 0)
+    player.player = { GetHorseId = function() return jHorse.id end }
+    KCD2MP.w131.joiner, KCD2MP.w131.guard, KCD2MP.w131.shared, KCD2MP.w131.aliveAt = true, true, true, NOW
+    KCD2MP.npcPuppets["nebakovPruzkum_herynk"] = {}
+    local mark = #LOG
+    check("W1: joiner whistle releases own horse from puppet stream for 15 s",
+        KCD2MP_M3OnJoinerWhistle(15.0) == true
+        and KCD2MP.npcPuppets["nebakovPruzkum_herynk"] == nil
+        and KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true
+        and countEvt("w136_ride", "nebakovPruzkum_herynk 1", mark) >= 1)
+    NOW = NOW + 10
+    KCD2MP_W136RideTick()
+    check("W1b: after 10 s (< 15 s), joiner's horse is still protected from stale host stream",
+        KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true)
+    NOW = NOW + 6
+    mark = #LOG
+    KCD2MP_W136RideTick()
+    check("W1c: after 16 s (> 15 s) unmounted, stream hold expires cleanly",
+        KCD2MP_W136Ridden("nebakovPruzkum_herynk") == false
+        and countEvt("w136_ride", "nebakovPruzkum_herynk 0", mark) == 1)
+    ENTS["nebakovPruzkum_herynk"] = nil; BY_ID[901] = nil
+    KCD2MP.w131.joiner, KCD2MP.w131.guard, KCD2MP.w131.shared = false, false, false
+    player.player = nil
+
+    -- W2: Host > 150 m from Joiner's avatar -> deferred in pendingFetch, fulfilled when Host comes within 150 m
+    local caparison = "bf06d242-4dcb-48e9-bbf1-b6a36f368a57"
+    local farHorse = mkHorse("tsem_horseForSale_2", 902, 5, 5, 0)
+    KCD2MP_W160PeerHorse(3, "tsem_horseForSale_2", caparison)
+    KCD2MP.ghosts["3"] = {
+        entity = {
+            id = 803,
+            GetWorldPos = function() return { x = 300, y = 0, z = 10 } end,
+            GetWorldAngles = function() return { x = 0, y = 0, z = 0 } end,
+        },
+        istate = { isRiding = false, spawnedAtClock = -100 },
+    }
+    hostPos = { x = 0, y = 0, z = 0 }   -- 300 m away (> 150 m physics bubble)
+    check("W2a: whistle > 150 m from host records pendingFetch instead of refusing or moving into unstreamed terrain",
+        KCD2MP_W160Whistle(3) == true
+        and KCD2MP.w160.pendingFetch["3"] ~= nil
+        and farHorse.px == 5)
+    -- Host walks within 150 m of (307, 0) -> M3HostTick fulfills pendingFetch and parks Horse B there!
+    hostPos = { x = 220, y = 0, z = 10 }
+    KCD2MP_M3HostTick()
+    check("W2b: once within 150 m physics range, M3HostTick places and parks Horse B beside the joiner's whistle spot",
+        KCD2MP.w160.pendingFetch["3"] == nil
+        and math.abs(farHorse.px - 307) < 0.5
+        and KCD2MP.w160.parkedPeerHorses["tsem_horseForSale_2"] ~= nil)
+
+    -- W3: Host <= 150 m from Joiner's avatar, but Horse B's level layer is unstreamed (nil) -> spawns NO_SAVE stand-in 7 m beside avatar!
+    hostPos = { x = 0, y = 0, z = 0 }
+    KCD2MP.ghosts["4"] = {
+        entity = {
+            id = 804,
+            GetWorldPos = function() return { x = 30, y = 40, z = 5 } end,
+            GetWorldAngles = function() return { x = 0, y = 0, z = 0 } end,
+        },
+        istate = { isRiding = false, spawnedAtClock = -100 },
+    }
+    KCD2MP_W160PeerHorse(4, "nebakovPruzkum_herynk", caparison)   -- not in ENTS yet (Nebakov layer unstreamed!)
+    check("W3a: whistle for unstreamed horse within 150 m spawns NO_SAVE kcd2mp_peerhorse_4 stand-in 7 m beside avatar with tack",
+        KCD2MP_W160Whistle(4) == true
+        and KCD2MP.w160.peerProxies["4"] ~= nil
+        and KCD2MP.w160.peerProxies["4"].entity.noSave == true
+        and math.abs(KCD2MP.w160.peerProxies["4"].entity.px - 37) < 0.5
+        and KCD2MP.w160.peerProxies["4"].entity.eqItems["item:" .. caparison] == true
+        and KCD2MP.w160.pendingFetch["4"] ~= nil)
+    local standInId = KCD2MP.w160.peerProxies["4"].entityId
+    -- Later, Nebakov layer streams in -> M3HostTick syncs real Herring to stand-in's spot and retires stand-in!
+    local realHerring = mkHorse("nebakovPruzkum_herynk", 903, 900, 900, 50)
+    KCD2MP_M3HostTick()
+    check("W3b: when unstreamed Herring later streams in, M3HostTick syncs Herring to the stand-in spot and retires the stand-in",
+        KCD2MP.w160.pendingFetch["4"] == nil
+        and math.abs(realHerring.px - 37) < 0.5
+        and realHerring.eqItems["item:" .. caparison] == true
+        and removedIds[standInId] == true)
+
+    -- Cleanup
+    KCD2MP_M3ReleaseAllPeerHorses("test-cleanup")
+    for _, n in ipairs({ "tsem_horseForSale_2", "nebakovPruzkum_herynk", "kcd2mp_peerhorse_4" }) do ENTS[n] = nil end
+    KCD2MP.ghosts["3"] = nil; KCD2MP.ghosts["4"] = nil
+    player.GetWorldPos = origPlayerPos
+    System.GetEntity = origGetEnt
+    System.SpawnEntity = origSpawn
+    System.RemoveEntity = origRemove
+    noErrs("W")
+end
+
 OUT = table.concat(RESULTS, "\n")
