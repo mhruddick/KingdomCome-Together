@@ -92,14 +92,18 @@ public static class Wo140Rules
     public const string WaitingText = "Waiting for other players...";
     public const string NotReadyText = "Other players are not ready to sleep yet!";
 
+    public static string BathToastText(string who, float hours) =>
+        FormattableString.Invariant($"{who} is using the bathhouse ({hours:0.##}h)...");
+
     /// <summary>
     /// The skip the accepter's game runs: the game's own sleep (C_SkipTime id 2,
-    /// the sleep screen and its rest) for a sleep, its own wait (id 1) for a wait.
+    /// the sleep screen and its rest) for a sleep, its own wait (id 1, falling back
+    /// to id 14 forced skip in Wo140StartOwnAsync) for a wait or a partner's bath.
     /// </summary>
-    public static byte AccepterSkipId(string kind) => kind == "wait" ? (byte)1 : (byte)2;
+    public static byte AccepterSkipId(string kind) => kind is "wait" or "bath" ? (byte)1 : (byte)2;
 
-    /// <summary>The asker's own C_SkipTime id -> the vote's kind (1 wait, 2 sleep, anything else: sleep).</summary>
-    public static string KindOfSkipId(int id) => id == 1 ? "wait" : "sleep";
+    /// <summary>The asker's own C_SkipTime id -> the skip's kind (1 wait, 7 bath, anything else: sleep).</summary>
+    public static string KindOfSkipId(int id) => id switch { 1 => "wait", 7 => "bath", _ => "sleep" };
 
     /// <summary>The picker's hours as the wire carries them: 0.25 .. 24, else null (nothing starts).</summary>
     public static float? HoursOk(float h) => float.IsFinite(h) && h >= 0.25f && h <= Wo140Text.MaxHours ? h : null;

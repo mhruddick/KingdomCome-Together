@@ -21,8 +21,8 @@ int wo140_rules_tests(int* passed) {
     // the player's own skips are held; a quest's, jail's, the bath's, fainting are not
     SCHECK(gated_id(1) && gated_id(2) && gated_id(4), "wait, sleep, read are held");
     SCHECK(!gated_id(0) && !gated_id(5) && !gated_id(6) && !gated_id(7) && !gated_id(14) && !gated_id(57), "undefined, jail, unconscious, bath, fake sleep, the punishment's: never held");
-    SCHECK(start_id_ok(2) && start_id_ok(1) && start_id_ok(14) && !start_id_ok(0) && !start_id_ok(5), "op 5 starts the player's own skips and the forced sleep screen only");
-    SCHECK(std::strcmp(id_name(2), "sleep") == 0 && std::strcmp(id_name(1), "wait") == 0 && std::strcmp(id_name(4), "read") == 0, "names");
+    SCHECK(start_id_ok(2) && start_id_ok(1) && start_id_ok(14) && !start_id_ok(0) && !start_id_ok(5) && !start_id_ok(7), "op 5 starts the player's own skips and the forced sleep screen only");
+    SCHECK(std::strcmp(id_name(2), "sleep") == 0 && std::strcmp(id_name(1), "wait") == 0 && std::strcmp(id_name(4), "read") == 0 && std::strcmp(id_name(7), "bath") == 0, "names");
 
     // the picker's edges (the observed sequences)
     {

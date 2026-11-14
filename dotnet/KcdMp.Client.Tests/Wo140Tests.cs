@@ -154,9 +154,12 @@ public class Wo140Tests
     {
         Assert.Equal(2, Wo140Rules.AccepterSkipId("sleep"));   // the game's own sleep: its screen and its rest (observed, no bed)
         Assert.Equal(1, Wo140Rules.AccepterSkipId("wait"));
+        Assert.Equal(1, Wo140Rules.AccepterSkipId("bath"));    // bystander runs wait (never id=7 bathhouse audio)
         Assert.Equal("wait", Wo140Rules.KindOfSkipId(1));
         Assert.Equal("sleep", Wo140Rules.KindOfSkipId(2));
         Assert.Equal("sleep", Wo140Rules.KindOfSkipId(4));      // reading in bed skips time like a sleep
+        Assert.Equal("bath", Wo140Rules.KindOfSkipId(7));       // bathhouse service (1h/2h/3h)
+        Assert.Equal("Moose is using the bathhouse (2h)...", Wo140Rules.BathToastText("Moose", 2f));
         Assert.Equal(2f, Wo140Rules.HoursOk(2f));
         Assert.Null(Wo140Rules.HoursOk(0f));
         Assert.Null(Wo140Rules.HoursOk(24.5f));
