@@ -56,6 +56,8 @@ public partial class GameBridge
     private readonly object _w139StoreGate = new();
     private string? _w139CrimeTag;
     private JoinerCrimeStore.WorldCrimeLedger? _w139CrimeLedger;
+    private long _w139SuppressExpireUntilMs;
+    private DateTime _w139ReloadPollBaselineUtc = DateTime.MinValue;
     private readonly ConcurrentDictionary<byte, (string Guard, uint StopId, long AtMs, string Settlement)> _w139Stops = new();
     private readonly ConcurrentDictionary<string, long> _w139GuardCooldown = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, (byte Peer, uint Avatar, string Settlement, long NearMs)> _w139Pursuits = new(StringComparer.Ordinal);   // NearMs: last seen near the avatar
@@ -253,6 +255,110 @@ public partial class GameBridge
         Wo139PersistNamedPlayerRecord(name, _w139Records.TryGetValue(peer, out var rec) ? rec : null);
     }
 
+    private double Wo139EffectiveWorldS(long nowMs)
+    {
+        long until = Interlocked.Read(ref _w139SuppressExpireUntilMs);
+        if (until != 0)
+        {
+            if (!Wo136Holding && _lastPollUtc > _w139ReloadPollBaselineUtc)
+                Interlocked.Exchange(ref _w139SuppressExpireUntilMs, 0);
+            else if (nowMs < until || Wo136Holding)
+                return 0;
+            else
+                Interlocked.Exchange(ref _w139SuppressExpireUntilMs, 0);
+        }
+        return _lastPolledWorldTime ?? 0;
+    }
+
+    private void Wo139OnHostGameplayStarted()
+    {
+        if (Interlocked.Read(ref _w139SuppressExpireUntilMs) != 0)
+        {
+            _w139ReloadPollBaselineUtc = _lastPollUtc;
+            Interlocked.Exchange(ref _w139SuppressExpireUntilMs, Environment.TickCount64 + 15_000);
+        }
+    }
+
+    private static (long? SaveTime, long? SaveId, DateTime LastWriteUtc) Wo139ReadSaveOrderKey(string path)
+    {
+        long? saveTime = null, saveId = null;
+        DateTime lastWrite = DateTime.MinValue;
+        try
+        {
+            lastWrite = File.GetLastWriteTimeUtc(path);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var head = new byte[8];
+            if (fs.Read(head, 0, 8) == 8 && BitConverter.ToUInt32(head, 0) == 0xFFFFFFFFu)
+            {
+                int n = BitConverter.ToInt32(head, 4);
+                if (n > 0 && n <= 64 * 1024)
+                {
+                    var desc = new byte[n];
+                    int got = 0;
+                    while (got < n) { int r = fs.Read(desc, got, n - got); if (r <= 0) break; got += r; }
+                    if (got == n)
+                    {
+                        string xml = System.Text.Encoding.UTF8.GetString(desc);
+                        var mt = System.Text.RegularExpressions.Regex.Match(xml, @"\bSaveTime=""(\d+)""");
+                        if (mt.Success && long.TryParse(mt.Groups[1].Value, CultureInfo.InvariantCulture, out long st)) saveTime = st;
+                        var mi = System.Text.RegularExpressions.Regex.Match(xml, @"\bSaveId=""(\d+)""");
+                        if (mi.Success && long.TryParse(mi.Groups[1].Value, CultureInfo.InvariantCulture, out long si)) saveId = si;
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+        return (saveTime, saveId, lastWrite);
+    }
+
+    private static bool Wo139HasNewerSaveInPlayline(string loadedFullPath, uint? expectedSeed)
+    {
+        string? dir = Path.GetDirectoryName(loadedFullPath);
+        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return false;
+        var loadedKey = Wo139ReadSaveOrderKey(loadedFullPath);
+        string loadedFull = Path.GetFullPath(loadedFullPath);
+        foreach (string f in Directory.EnumerateFiles(dir, "*.whs"))
+        {
+            string name = Path.GetFileName(f);
+            if (name.StartsWith("mpworld", StringComparison.OrdinalIgnoreCase)) continue;
+            if (WorldSaved.ParsePath(f) is null) continue;
+            if (string.Equals(Path.GetFullPath(f), loadedFull, StringComparison.OrdinalIgnoreCase)) continue;
+            if (expectedSeed is uint es && WhsSave.ReadSeedFromFile(f) is uint fs && fs != es) continue;
+            var otherKey = Wo139ReadSaveOrderKey(f);
+            if (loadedKey.SaveTime is long lt && otherKey.SaveTime is long ot && ot != lt)
+            {
+                if (ot > lt) return true;
+                continue;
+            }
+            if (loadedKey.SaveId is long li && otherKey.SaveId is long oi && oi != li)
+            {
+                if (oi > li) return true;
+                continue;
+            }
+            if (otherKey.LastWriteUtc > loadedKey.LastWriteUtc)
+                return true;
+        }
+        return false;
+    }
+
+    private JoinerCrimeStore.WorldCrimeLedger Wo139ResolveLoadedLedger(string tag, string md5, string? savePath)
+    {
+        if (_crimeStore.Paired(tag, md5) is { } paired)
+            return paired;
+        if (!string.IsNullOrEmpty(savePath) && File.Exists(savePath))
+        {
+            bool predatesLatest = _crimeStore.LatestLastWriteTimeUtc(tag) is DateTime latestUtc
+                                  && File.GetLastWriteTimeUtc(savePath) < latestUtc;
+            if (!predatesLatest && !Wo139HasNewerSaveInPlayline(savePath, _hostWorldSeed))
+            {
+                var latest = _crimeStore.Latest(tag);
+                _crimeStore.Pair(tag, md5, latest);
+                return latest;
+            }
+        }
+        return new JoinerCrimeStore.WorldCrimeLedger();
+    }
+
     private void Wo139PersistNamedPlayerRecord(string? name, JoinerCrimeRecord? rec)
     {
         if (!(_isDamageAuthority && _sharedWorld) || JoinerCrimeStore.NormalizePlayerKey(name) is null) return;
@@ -265,7 +371,7 @@ public partial class GameBridge
                 ledger.SetPlayerRecord(name, rec, Environment.TickCount64);
                 _crimeStore.SaveLatest(tag, ledger);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            catch (Exception ex)
             {
                 Console.WriteLine($"MP-W139 store: crime snapshot not written: {ex.Message}");
             }
@@ -289,7 +395,7 @@ public partial class GameBridge
                         ledger.SetPlayerRecord(pname, rec, now);
                 _crimeStore.SaveLatest(tag, ledger);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            catch (Exception ex)
             {
                 Console.WriteLine($"MP-W139 store: live crime flush failed: {ex.Message}");
             }
@@ -305,9 +411,10 @@ public partial class GameBridge
             if (Wo139CurrentWorldTag() is not string tag) return false;
             try
             {
-                return Wo139HostCrimeLedgerFor(tag).TryBuildRecord(name, Environment.TickCount64, _lastPolledWorldTime ?? 0, out rec);
+                long now = Environment.TickCount64;
+                return Wo139HostCrimeLedgerFor(tag).TryBuildRecord(name, now, Wo139EffectiveWorldS(now), out rec);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            catch (Exception ex)
             {
                 Console.WriteLine($"MP-W139 store: crime restore failed: {ex.Message}");
                 return false;
@@ -316,18 +423,18 @@ public partial class GameBridge
     }
 
     /// <summary>M4: pairs/restores per-world joiner crime snapshots alongside each host save or reload.</summary>
-    private void Wo139OnHostWorld(string tag, string md5, bool loaded)
+    private void Wo139OnHostWorld(string tag, string md5, bool loaded, string? savePath = null)
     {
-        long now = Environment.TickCount64;
-        double worldS = _lastPolledWorldTime ?? 0;
-        var recordsToSend = new List<(byte Peer, JoinerCrimeRecord Rec)>();
-        var clearedPeers = new List<byte>();
-
-        if (!loaded)
+        try
         {
-            lock (_w139StoreGate)
+            long now = Environment.TickCount64;
+            var recordsToSend = new List<(byte Peer, JoinerCrimeRecord Rec)>();
+            var clearedPeers = new List<byte>();
+
+            if (!loaded)
             {
-                try
+                double worldS = Wo139EffectiveWorldS(now);
+                lock (_w139StoreGate)
                 {
                     var ledger = Wo139HostCrimeLedgerFor(tag);
                     // If a peer connected before _hostWorldSeed was identified, hydrate their persisted record first.
@@ -352,30 +459,27 @@ public partial class GameBridge
                     _crimeStore.Pair(tag, md5, ledger);
                     _crimeStore.SaveLatest(tag, ledger);
                 }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-                {
-                    Console.WriteLine($"MP-W139 store: host crime pairing failed: {ex.Message}");
-                }
+                foreach (var (peer, rec) in recordsToSend)
+                    _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0,
+                        Wo139Rules.RecordText(rec.Count, rec.Open.Select(c => c.Kind), rec.Settlements));
+                return;
             }
-            foreach (var (peer, rec) in recordsToSend)
-                _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0,
-                    Wo139Rules.RecordText(rec.Count, rec.Open.Select(c => c.Kind), rec.Settlements));
-            return;
-        }
 
-        // Host loaded a save: roll back in-memory crimes, stops, and pursuits to that save's paired snapshot.
-        foreach (var (peer, st) in _w139Stops.ToArray())
-            if (_w139Stops.TryRemove(peer, out _))
-                _ = ExecLuaAsync($"if KCD2MP_W137HostHold then KCD2MP_W137HostHold(false, \"{st.Guard}\", {peer}, \"w139-reload\") end");
-        foreach (var (guard, _) in _w139Pursuits.ToArray())
-            _ = Wo139EndPursuitAsync(guard, "the host reloaded a save");
-        _w144ParkedCrime.Clear();
+            // Host loaded a save: suppress stale pre-reload _lastPolledWorldTime expiration until post-load clock arrives,
+            // and roll back in-memory crimes, stops, and pursuits to that save's paired snapshot.
+            _w139ReloadPollBaselineUtc = _lastPollUtc;
+            Interlocked.Exchange(ref _w139SuppressExpireUntilMs, now + 15_000);
 
-        lock (_w139StoreGate)
-        {
-            try
+            foreach (var (peer, st) in _w139Stops.ToArray())
+                if (_w139Stops.TryRemove(peer, out _))
+                    _ = ExecLuaAsync($"if KCD2MP_W137HostHold then KCD2MP_W137HostHold(false, \"{st.Guard}\", {peer}, \"w139-reload\") end");
+            foreach (var (guard, _) in _w139Pursuits.ToArray())
+                _ = Wo139EndPursuitAsync(guard, "the host reloaded a save");
+            _w144ParkedCrime.Clear();
+
+            lock (_w139StoreGate)
             {
-                var restored = _crimeStore.Paired(tag, md5) ?? new JoinerCrimeStore.WorldCrimeLedger();
+                var restored = Wo139ResolveLoadedLedger(tag, md5, savePath);
                 _w139CrimeTag = tag;
                 _w139CrimeLedger = restored;
                 _crimeStore.SaveLatest(tag, restored);
@@ -387,7 +491,7 @@ public partial class GameBridge
                 foreach (byte peer in liveSet)
                 {
                     string? pname = Wo139PlayerNameOf(peer);
-                    if (pname is not null && restored.TryBuildRecord(pname, now, worldS, out var rec))
+                    if (pname is not null && restored.TryBuildRecord(pname, now, currentWorldS: 0, out var rec))
                     {
                         rec.DropReportedTrespasses();
                         if (rec.Count > 0)
@@ -401,21 +505,21 @@ public partial class GameBridge
                     clearedPeers.Add(peer);
                 }
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+
+            foreach (byte peer in clearedPeers)
             {
-                Console.WriteLine($"MP-W139 store: host crime reload failed: {ex.Message}");
+                _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostCleared, 0, Wo139Rules.ClearedText("reload", null));
+                _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0, Wo139Rules.RecordText(0, [], []));
+            }
+            foreach (var (peer, rec) in recordsToSend)
+            {
+                _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0,
+                    Wo139Rules.RecordText(rec.Count, rec.Open.Select(c => c.Kind), rec.Settlements));
             }
         }
-
-        foreach (byte peer in clearedPeers)
+        catch (Exception ex)
         {
-            _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostCleared, 0, Wo139Rules.ClearedText("reload", null));
-            _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0, Wo139Rules.RecordText(0, [], []));
-        }
-        foreach (var (peer, rec) in recordsToSend)
-        {
-            _ = Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostRecord, 0,
-                Wo139Rules.RecordText(rec.Count, rec.Open.Select(c => c.Kind), rec.Settlements));
+            Console.WriteLine($"MP-W139 store: host crime world sync failed: {ex.Message}");
         }
     }
 
@@ -436,7 +540,7 @@ public partial class GameBridge
 
     private async Task Wo139HostTickAsync(long now)
     {
-        double worldS = _lastPolledWorldTime ?? 0;
+        double worldS = Wo139EffectiveWorldS(now);
         foreach (var (peer, rec) in _w139Records.ToArray())
         {
             if (!IsLivePeer(peer)) { _w139Records.TryRemove(peer, out _); continue; }   // WO-144 (a reconnect gets it back: GameBridge.Wo144)
@@ -635,8 +739,27 @@ public partial class GameBridge
         _where = GameWhere.World;
     }
 
-    internal void Wo139SetWorldTimeForTest(uint worldTime) => _lastPolledWorldTime = worldTime;
-    internal void Wo139HostWorldForTest(string tag, string md5, bool loaded) => Wo139OnHostWorld(tag, md5, loaded);
+    internal void Wo139SetWorldTimeForTest(uint worldTime, bool postLoadSample = true)
+    {
+        _lastPolledWorldTime = worldTime;
+        if (postLoadSample)
+        {
+            var nowUtc = DateTime.UtcNow;
+            _lastPollUtc = nowUtc > _w139ReloadPollBaselineUtc ? nowUtc : _w139ReloadPollBaselineUtc.AddTicks(1);
+            Interlocked.Exchange(ref _w139SuppressExpireUntilMs, 0);
+        }
+    }
+
+    internal void Wo139SetPreConnectLoadForTest(string savesDir, string relLoaded)
+    {
+        _testSavesDirOverride = savesDir;
+        _w175LastLoaded = relLoaded;
+        _w125PreloadedHandled = null;
+    }
+
+    internal void Wo125HostTickForTest() => Wo125HostTick();
+    internal void Wo125HostIdentifyForTest(string path, bool loaded, string why = "test") => Wo125HostIdentify(path, loaded, why);
+    internal void Wo139HostWorldForTest(string tag, string md5, bool loaded, string? savePath = null) => Wo139OnHostWorld(tag, md5, loaded, savePath);
     internal void Wo139PeerConnectForTest(byte id, string name) => Wo144OnPeerConnected(id, name);
     internal void Wo139PeerDisconnectForTest(byte id) => Wo144OnPeerDisconnected(id);
     internal Task Wo139JudgedForTestAsync(string arg) => Wo139OnJudgedAsync(arg.Split(' ', StringSplitOptions.RemoveEmptyEntries));

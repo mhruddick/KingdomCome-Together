@@ -105,6 +105,9 @@ public static class Wo140Rules
     /// <summary>The asker's own C_SkipTime id -> the skip's kind (1 wait, 7 bath, anything else: sleep).</summary>
     public static string KindOfSkipId(int id) => id switch { 1 => "wait", 7 => "bath", _ => "sleep" };
 
+    /// <summary>Wire TimeSkipKind reported when a shared skip ends: wait and bath report "passed time to", sleep reports "slept till".</summary>
+    public static byte SharedTimeSkipKind(string? kind) => kind is "wait" or "bath" ? Protocol.TimeSkipKindWait : Protocol.TimeSkipKindSleep;
+
     /// <summary>The picker's hours as the wire carries them: 0.25 .. 24, else null (nothing starts).</summary>
     public static float? HoursOk(float h) => float.IsFinite(h) && h >= 0.25f && h <= Wo140Text.MaxHours ? h : null;
 

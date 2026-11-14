@@ -85,11 +85,12 @@ public class M4CrimePersistenceTests
     }
 
     [Fact]
-    public void Store_caps_paired_checkpoints_at_32_preserves_latest_and_drops_corrupt_entries()
+    public void Store_caps_paired_checkpoints_at_100_preserves_latest_and_drops_corrupt_entries()
     {
         string root = Path.Combine(Path.GetTempPath(), "m4-crimes-" + Guid.NewGuid().ToString("N"));
         try
         {
+            Assert.Equal(100, JoinerCrimeStore.KeepPairs);
             var store = new JoinerCrimeStore(root);
             string tag = WhsSave.SeedTag(0x99887766u);
             var rec = new JoinerCrimeRecord();
@@ -98,7 +99,7 @@ public class M4CrimePersistenceTests
             ledger.SetPlayerRecord("PartnerA", rec, 1000);
             store.SaveLatest(tag, ledger);
 
-            for (int i = 0; i < 38; i++)
+            for (int i = 0; i < 108; i++)
             {
                 string md5 = i.ToString("x32");
                 store.Pair(tag, md5, ledger);
@@ -210,6 +211,169 @@ public class M4CrimePersistenceTests
             Assert.Equal(["theft"], host3.Wo139RecordOfPeerForTest(4)!.Open.Select(c => c.Kind).ToArray());
         }
         finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task Reload_several_days_earlier_never_expires_crimes_against_stale_clock_and_boundary_violent_crime_keeps_fresh_window()
+    {
+        // 1. Low #13: civilian-witnessed violent crime snapshotted right at ReportDelayMs (before Tick flipped Known) keeps full 120s FreshMs!
+        long t0 = 500_000L;
+        var rec = new JoinerCrimeRecord();
+        Assert.True(rec.Add(new JoinerCrimeRecord.Crime
+        {
+            Id = 1, Kind = "murder", Settlement = Zelejov, Witnesses = 1, Guards = 0,
+            AtWorldS = 172_800, AtMs = t0,
+        }));
+        var ledger = new JoinerCrimeStore.WorldCrimeLedger();
+        ledger.SetPlayerRecord("Moose", rec, t0 + JoinerCrimeRecord.ReportDelayMs);   // exact 20,000 ms boundary!
+        Assert.True(ledger.TryBuildRecord("Moose", 10_000L, currentWorldS: 172_800, out var boundaryRestored));
+        Assert.True(boundaryRestored.AnyHostileKnownIn(Zelejov, 10_000L + JoinerCrimeRecord.FreshMs - 1L));
+        Assert.False(boundaryRestored.AnyHostileKnownIn(Zelejov, 10_000L + JoinerCrimeRecord.FreshMs));
+
+        // 2. High #3: Host at Day 10 (864,000 s) reloads a Day 2 (172,800 s) save carrying a 4-day theft
+        string root = Path.Combine(Path.GetTempPath(), "m4-stale-clock-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            const uint seed = 0x77771234u;
+            string tag = WhsSave.SeedTag(seed);
+            string md5Day2 = new('d', 32);
+            var store = new JoinerCrimeStore(root);
+            var tx = new NoopTransport();
+            var outMs = new MemoryStream();
+            var host = new GameBridge(new ClientConfig());
+            host.Wo139ConfigureTestHost(store, outMs, tx, seed, worldTime: 172_800);   // Day 2
+            host.Wo139PeerConnectForTest(1, "Moose");
+            await host.Wo139JudgedForTestAsync($"1 10 theft 1 1 {Zelejov} g1");
+            host.Wo139HostWorldForTest(tag, md5Day2, loaded: false);
+
+            // Advance Host clock to Day 10 (8 days later -> theft expired in Day 10 timeline)
+            host.Wo139SetWorldTimeForTest(864_000);
+            await host.Wo139HostTickForTestAsync(Environment.TickCount64 + 1_000);
+            Assert.Null(host.Wo139RecordOfPeerForTest(1));
+
+            // Host reloads Day 2 save while _lastPolledWorldTime is STILL 864,000 (Day 10)!
+            host.Wo139HostWorldForTest(tag, md5Day2, loaded: true);
+            Assert.NotNull(host.Wo139RecordOfPeerForTest(1));
+            Assert.Equal(["theft"], host.Wo139RecordOfPeerForTest(1)!.Open.Select(c => c.Kind).ToArray());
+
+            // Even if 1s host tick fires BEFORE the loaded world's first WORLDTIME reading arrives, theft is NOT expired!
+            await host.Wo139HostTickForTestAsync(Environment.TickCount64 + 1_000);
+            Assert.NotNull(host.Wo139RecordOfPeerForTest(1));
+            Assert.Equal(["theft"], host.Wo139RecordOfPeerForTest(1)!.Open.Select(c => c.Kind).ToArray());
+
+            // Post-load Day 2 WORLDTIME reading lands -> crime stays active on Day 2, and expires normally if clock later reaches Day 7
+            host.Wo139SetWorldTimeForTest(173_000, postLoadSample: true);
+            await host.Wo139HostTickForTestAsync(Environment.TickCount64 + 2_000);
+            Assert.NotNull(host.Wo139RecordOfPeerForTest(1));
+            host.Wo139SetWorldTimeForTest(172_800 + 5 * 86_400, postLoadSample: true);
+            await host.Wo139HostTickForTestAsync(Environment.TickCount64 + 3_000);
+            Assert.Null(host.Wo139RecordOfPeerForTest(1));
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task Pre_connect_continue_newest_save_preserves_crimes_while_pre_connect_older_save_rolls_back_and_parked_keys_ignore_case()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "m4-preconnect-" + Guid.NewGuid().ToString("N"));
+        string savesDir = Path.Combine(root, "saves");
+        string playline0 = Path.Combine(savesDir, "playline0");
+        Directory.CreateDirectory(playline0);
+        try
+        {
+            const uint seed = 0x1234ABCDu;
+            string tag = WhsSave.SeedTag(seed);
+            var store = new JoinerCrimeStore(Path.Combine(root, "crimes"));
+            var tx = new NoopTransport();
+
+            // 1. Write an older pre-coop save001.whs (SaveTime=1000, unpaired)
+            string save001Path = Path.Combine(playline0, "save001.whs");
+            File.WriteAllBytes(save001Path, WhsSaveTests.File(new WhsSaveTests.Spec { Seed = seed, SaveTime = 1000, Story = 100 }));
+            File.SetLastWriteTimeUtc(save001Path, new DateTime(2026, 11, 13, 18, 0, 0, DateTimeKind.Utc));
+
+            // 2. Session 1: Moose commits lockpick -> Save 002 paired; then Moose commits theft, disconnects & reconnects with different casing ("  mOoSe "), then disconnects
+            string save002Path = Path.Combine(playline0, "save002.whs");
+            var save002Bytes = WhsSaveTests.File(new WhsSaveTests.Spec { Seed = seed, SaveTime = 2000, Story = 200 });
+            File.WriteAllBytes(save002Path, save002Bytes);
+            string save002Md5 = WhsSave.Verify(save002Bytes).Md5.ToLowerInvariant();
+
+            var hostSession1 = new GameBridge(new ClientConfig());
+            hostSession1.Wo139ConfigureTestHost(store, new MemoryStream(), tx, seed, worldTime: 20_000);
+            hostSession1.Wo139PeerConnectForTest(1, "Moose");
+            await hostSession1.Wo139JudgedForTestAsync($"1 1 lockpick 1 1 {Zelejov} g1");
+            hostSession1.Wo139HostWorldForTest(tag, save002Md5, loaded: false, save002Path);
+
+            await hostSession1.Wo139JudgedForTestAsync($"1 2 theft 1 1 {Zelejov} g1");
+            hostSession1.Wo139PeerDisconnectForTest(1);
+            // Reconnect with different case/whitespace -> hits _w144ParkedCrime case-insensitively!
+            hostSession1.Wo139PeerConnectForTest(2, "  mOoSe ");
+            Assert.Equal(["lockpick", "theft"], hostSession1.Wo139RecordOfPeerForTest(2)!.Open.Select(c => c.Kind).ToArray());
+            hostSession1.Wo139PeerDisconnectForTest(2);
+
+            // 3. Host saves & quits solo AFTER disconnect -> exit_save.whs (SaveTime=3000, newest in playline, written AFTER latest.json, unpaired!)
+            string exitSavePath = Path.Combine(playline0, "exit_save.whs");
+            File.WriteAllBytes(exitSavePath, WhsSaveTests.File(new WhsSaveTests.Spec { Seed = seed, SaveTime = 3000, Story = 300 }));
+            File.SetLastWriteTimeUtc(exitSavePath, DateTime.UtcNow.AddSeconds(5));
+
+            // 4. "Continue newest save" before connecting: Host loaded playline0/exit_save.whs at main menu, THEN connected!
+            var hostContinue = new GameBridge(new ClientConfig());
+            hostContinue.Wo139ConfigureTestHost(store, new MemoryStream(), tx, seed: null, worldTime: 25_000);
+            hostContinue.Wo139SetPreConnectLoadForTest(savesDir, "playline0/exit_save.whs");
+            hostContinue.Wo125HostTickForTest();
+            hostContinue.Wo139PeerConnectForTest(1, "Moose");
+            Assert.NotNull(hostContinue.Wo139RecordOfPeerForTest(1));
+            Assert.Equal(["lockpick", "theft"], hostContinue.Wo139RecordOfPeerForTest(1)!.Open.Select(c => c.Kind).ToArray());
+
+            // 5. "Load older paired save before connecting": Host loaded playline0/save002.whs at main menu, THEN connected -> rolls back theft, keeps lockpick!
+            var hostLoadPaired = new GameBridge(new ClientConfig());
+            hostLoadPaired.Wo139ConfigureTestHost(store, new MemoryStream(), tx, seed: null, worldTime: 20_000);
+            hostLoadPaired.Wo139SetPreConnectLoadForTest(savesDir, "playline0/save002.whs");
+            hostLoadPaired.Wo139PeerConnectForTest(1, "Moose");
+            Assert.NotNull(hostLoadPaired.Wo139RecordOfPeerForTest(1));
+            Assert.Equal(["lockpick"], hostLoadPaired.Wo139RecordOfPeerForTest(1)!.Open.Select(c => c.Kind).ToArray());
+
+            // 6. "Load older unpaired save before connecting": Host loaded playline0/save001.whs at main menu, THEN connected -> rolls back ALL crimes to empty!
+            var hostLoadOlder = new GameBridge(new ClientConfig());
+            hostLoadOlder.Wo139ConfigureTestHost(store, new MemoryStream(), tx, seed: null, worldTime: 10_000);
+            hostLoadOlder.Wo139SetPreConnectLoadForTest(savesDir, "playline0/save001.whs");
+            hostLoadOlder.Wo139PeerConnectForTest(1, "Moose");
+            Assert.Null(hostLoadOlder.Wo139RecordOfPeerForTest(1));
+            Assert.Empty(store.Latest(tag).Players);
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
+
+    [Fact]
+    public async Task JoinerCrimeRecord_is_thread_safe_under_concurrent_mutation_and_enumeration()
+    {
+        var rec = new JoinerCrimeRecord();
+        var tasks = Enumerable.Range(0, 8).Select(worker => Task.Run(() =>
+        {
+            for (int i = 0; i < 200; i++)
+            {
+                rec.Add(new JoinerCrimeRecord.Crime
+                {
+                    Id = (uint)(worker * 1000 + i),
+                    Kind = (i % 3 == 0) ? "trespass" : (i % 2 == 0 ? "theft" : "assault"),
+                    Settlement = Zelejov,
+                    Witnesses = 1,
+                    Guards = i % 2,
+                    AtWorldS = 10_000 + i,
+                    AtMs = 1_000 + i,
+                });
+                _ = rec.Open.Count;
+                _ = rec.Settlements.Count;
+                _ = rec.AnyHostileKnownIn(Zelejov, 2_000 + i);
+                _ = rec.ArrestableIn(Zelejov, 2_000 + i);
+                _ = rec.Tick(25_000 + i, 10_500);
+                if (i % 25 == 0) rec.DropReportedTrespasses();
+                if (i % 40 == 0) rec.MarkResisted(Zelejov, 25_000 + i);
+                if (i % 60 == 0) rec.Calm(Zelejov);
+            }
+        })).ToArray();
+
+        await Task.WhenAll(tasks);
+        Assert.True(rec.Count >= 0);
     }
 
     private sealed class NoopTransport : IGameTransport

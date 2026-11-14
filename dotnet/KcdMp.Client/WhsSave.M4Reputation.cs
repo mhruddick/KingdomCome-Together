@@ -2,6 +2,7 @@
 // GPLv3 section 7 additional terms: NOTICE. This project's own code only; Kingdom Come: Deliverance II and its
 // content belong to Warhorse Studios and PLAION. Unofficial, free, not affiliated with or endorsed by them.
 using System.Buffers.Binary;
+using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 
 namespace KcdMp.Client;
@@ -14,7 +15,7 @@ public static partial class WhsSave
 
     internal static readonly ushort[] FactionTreeBlock = [0x01F4, 0x01F8, 0x7308, 0x352C];
 
-    private static readonly ConditionalWeakTable<byte[], Dictionary<string, byte[]>> DecodedNpcOpinionsCache = new();
+    private static readonly ConditionalWeakTable<byte[], IReadOnlyDictionary<string, byte[]>> DecodedNpcOpinionsCache = new();
 
     /// <summary>Real KCD2 0x352C FactionTree payloads parse as a non-empty TLV list (synthetic test strings do not).</summary>
     public static bool IsValidFactionTreePayload(byte[]? payload) =>
@@ -25,12 +26,12 @@ public static partial class WhsSave
         payload is { Length: > 0 } && Children(payload, 0, payload.Length) is { Count: > 0 } kids && kids[0].Tag == 0x1D2C;
 
     /// <summary>
-    /// Cross-playthrough import guard: if both host and joiner carry playthrough seeds and they differ,
-    /// the joiner is importing an external solo character into this campaign for the first time, so the
-    /// host world's faction tree and reputation stay intact until the joiner snapshots in this world.
+    /// Fail-closed playthrough guard: reputation, renown, and NPC opinions splice only when both host and joiner
+    /// carry matching playthrough seeds (same campaign). Cross-playthrough character imports and seedless fresh
+    /// defaults leave the host world's faction tree and NPC opinions intact until the joiner snapshots in this world.
     /// </summary>
     public static bool ShouldSpliceReputation(byte[] hostRaw, HenryParts parts) =>
-        !(parts.Seed is uint js && ReadSeed(hostRaw) is uint hs && js != hs);
+        parts.Seed is uint js && ReadSeed(hostRaw) is uint hs && js == hs;
 
     public static byte[] EncodeNpcOpinions(IReadOnlyList<(byte[] Guid16, byte[] Payload)> entries)
     {
@@ -56,14 +57,15 @@ public static partial class WhsSave
         return buf;
     }
 
-    public static Dictionary<string, byte[]> DecodeNpcOpinions(byte[] blob)
+    public static IReadOnlyDictionary<string, byte[]> DecodeNpcOpinions(byte[] blob)
     {
-        if (blob.Length == 0) return new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        if (blob.Length == 0) return new ReadOnlyDictionary<string, byte[]>(new Dictionary<string, byte[]>(StringComparer.Ordinal));
         if (DecodedNpcOpinionsCache.TryGetValue(blob, out var cached)) return cached;
 
         if (blob.Length < 4) throw new InvalidDataException("reputation_npc_opinions header truncated");
         int count = BinaryPrimitives.ReadInt32LittleEndian(blob);
-        if (count < 0 || count > 100_000) throw new InvalidDataException($"reputation_npc_opinions count {count} out of range");
+        if (count < 0 || count > 100_000 || count > (blob.Length - 4) / 20)
+            throw new InvalidDataException($"reputation_npc_opinions count {count} out of range");
 
         var map = new Dictionary<string, byte[]>(count, StringComparer.Ordinal);
         int pos = 4;
@@ -79,12 +81,14 @@ public static partial class WhsSave
             pos += len;
             if (!IsValidReputationPayload(pay))
                 throw new InvalidDataException($"reputation_npc_opinions payload for {guid} is not a valid 0x1D2C TLV");
-            map[guid] = pay;
+            if (!map.TryAdd(guid, pay))
+                throw new InvalidDataException($"reputation_npc_opinions contains duplicate soul GUID {guid}");
         }
         if (pos != blob.Length) throw new InvalidDataException("reputation_npc_opinions has trailing bytes");
 
-        DecodedNpcOpinionsCache.AddOrUpdate(blob, map);
-        return map;
+        var ro = new ReadOnlyDictionary<string, byte[]>(map);
+        DecodedNpcOpinionsCache.AddOrUpdate(blob, ro);
+        return ro;
     }
 
     private sealed class M4ReputationSaveExtension : ISaveExtension
@@ -154,8 +158,11 @@ public static partial class WhsSave
                 return currentSoulNodeBytes;
 
             var opinions = DecodeNpcOpinions(blob);
-            if (currentSoulNodeBytes.Length < 6 || RecordNode(currentSoulNodeBytes).Tag != 0x115E)
-                return currentSoulNodeBytes;   // short 0x115D soul record in host world: leave untouched
+            if (currentSoulNodeBytes.Length < 38)
+                return currentSoulNodeBytes;   // short 0x115D or truncated soul record in host world: leave untouched
+            var rn = RecordNode(currentSoulNodeBytes);
+            if (rn.Tag != 0x115E || rn.Len < 32 || 6 + rn.Len > currentSoulNodeBytes.Length)
+                return currentSoulNodeBytes;
             if (!opinions.TryGetValue(soulGuid, out var payNpc))
                 return currentSoulNodeBytes;
 

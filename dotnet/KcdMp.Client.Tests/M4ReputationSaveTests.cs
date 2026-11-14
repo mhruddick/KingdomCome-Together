@@ -246,12 +246,17 @@ public class M4ReputationSaveTests
     }
 
     [Fact]
-    public void Malformed_reputation_extension_blobs_are_rejected()
+    public void Malformed_reputation_extension_blobs_and_seedless_or_truncated_records_are_handled_safely()
     {
         Assert.Throws<InvalidDataException>(() => WhsSave.DecodeNpcOpinions([1, 2, 3]));
         var badCount = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(badCount, -5);
         Assert.Throws<InvalidDataException>(() => WhsSave.DecodeNpcOpinions(badCount));
+
+        // Oversized count on tiny blob is rejected before dictionary allocation
+        var amplifiedCount = new byte[8];
+        BinaryPrimitives.WriteInt32LittleEndian(amplifiedCount, 99_999);
+        Assert.Throws<InvalidDataException>(() => WhsSave.DecodeNpcOpinions(amplifiedCount));
 
         var non1D2C = new byte[4 + 16 + 4 + 8];
         BinaryPrimitives.WriteInt32LittleEndian(non1D2C, 1);
@@ -259,6 +264,33 @@ public class M4ReputationSaveTests
         BinaryPrimitives.WriteInt32LittleEndian(non1D2C.AsSpan(20), 8);
         Tlv(0x9999, [1, 2]).CopyTo(non1D2C.AsSpan(24));
         Assert.Throws<InvalidDataException>(() => WhsSave.DecodeNpcOpinions(non1D2C));
+
+        // Duplicate soul GUIDs in reputation_npc_opinions are rejected
+        var validPay = Reputation12FF(55f);
+        var dupBlob = WhsSave.EncodeNpcOpinions([(G(MerchantSoul), validPay), (G(MerchantSoul), validPay)]);
+        Assert.Throws<InvalidDataException>(() => WhsSave.DecodeNpcOpinions(dupBlob));
+
+        // ShouldSpliceReputation fails closed when either seed is null
+        var hostFile = BuildRealisticSave(
+            seed: 0xCAFE1234u, story: 5000, strength: 100,
+            henryRenown: 85f, troskyFactionRep: 90f, kuttenbergFactionRep: 75f,
+            merchantOpinion: 95f, horseOpinion: null, horseSaddleAmount: 7,
+            unmetNpcFullInThisSave: false, unmetNpcOpinion: 0f, sideStamp: 1);
+        var hostRaw = WhsSave.Inflate(hostFile).Raw;
+        var seedlessParts = WhsSave.PartsFromFile(hostFile, WhsSave.HenryParts.OriginFreshDefault);
+        seedlessParts.Seed = null;
+        Assert.False(WhsSave.ShouldSpliceReputation(hostRaw, seedlessParts));
+        Assert.False(WhsSave.ShouldSpliceReputation(new byte[16], WhsSave.PartsFromFile(hostFile, WhsSave.HenryParts.OriginSnapshot)));
+
+        // Truncated (< 38 byte) 0x115E soul node in host SoulList is left untouched without throwing
+        var sameSeedParts = WhsSave.PartsFromFile(hostFile, WhsSave.HenryParts.OriginSnapshot);
+        sameSeedParts.Extensions[WhsSave.ReputationNpcOpinionsExtensionKey] =
+            WhsSave.EncodeNpcOpinions([(G(UnmetNpcSoul), Reputation12FF(44f))]);
+        var truncatedNode = Tlv(0x115E, G(UnmetNpcSoul));   // 22 bytes (< 38)
+        var ext = typeof(WhsSave).GetNestedType("M4ReputationSaveExtension", System.Reflection.BindingFlags.NonPublic)!;
+        var inst = (WhsSave.ISaveExtension)ext.GetField("Instance")!.GetValue(null)!;
+        var unchanged = inst.TransformSoulRecord(UnmetNpcSoul, hostRaw, truncatedNode, sameSeedParts, new(), WhsSave.QuestItemMode.Strip, new());
+        Assert.Same(truncatedNode, unchanged);
     }
 
     [Fact]

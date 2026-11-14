@@ -16,7 +16,7 @@ namespace KcdMp.Client;
 /// </summary>
 public sealed class JoinerCrimeStore
 {
-    public const int KeepPairs = 32;
+    public const int KeepPairs = 100;
     public const int MaxPlayers = 64;
     public const int MaxCrimesPerPlayer = 200;
 
@@ -58,11 +58,17 @@ public sealed class JoinerCrimeStore
 
         public static SavedCrime FromRuntime(JoinerCrimeRecord.Crime c, long nowMs)
         {
-            long remReport = c.Known
+            long elapsedSinceAt = Math.Max(0L, nowMs - c.AtMs);
+            bool effectiveKnown = c.Known || c.Guards > 0 || elapsedSinceAt >= JoinerCrimeRecord.ReportDelayMs;
+            long effectiveKnownAtMs = c.Known
+                ? c.KnownAtMs
+                : c.Guards > 0 ? c.AtMs : c.AtMs + JoinerCrimeRecord.ReportDelayMs;
+
+            long remReport = effectiveKnown
                 ? 0L
-                : Math.Clamp(JoinerCrimeRecord.ReportDelayMs - Math.Max(0L, nowMs - c.AtMs), 0L, JoinerCrimeRecord.ReportDelayMs);
-            long remFresh = c.Known && !c.Calmed && Wo139Rules.IsViolent(c.Kind)
-                ? Math.Clamp(JoinerCrimeRecord.FreshMs - Math.Max(0L, nowMs - c.KnownAtMs), 0L, JoinerCrimeRecord.FreshMs)
+                : Math.Clamp(JoinerCrimeRecord.ReportDelayMs - elapsedSinceAt, 1L, JoinerCrimeRecord.ReportDelayMs);
+            long remFresh = effectiveKnown && !c.Calmed && Wo139Rules.IsViolent(c.Kind)
+                ? Math.Clamp(JoinerCrimeRecord.FreshMs - Math.Max(0L, nowMs - effectiveKnownAtMs), 0L, JoinerCrimeRecord.FreshMs)
                 : 0L;
             long remEsc = c.Resisted && !c.Calmed
                 ? Math.Clamp(JoinerCrimeRecord.EscalationMs - Math.Max(0L, nowMs - c.ResistedAtMs), 0L, JoinerCrimeRecord.EscalationMs)
@@ -79,7 +85,7 @@ public sealed class JoinerCrimeStore
                 Victim = c.Victim ?? "",
                 Witnesses = c.Witnesses,
                 Guards = c.Guards,
-                Known = c.Known,
+                Known = effectiveKnown,
                 Calmed = c.Calmed,
                 Resisted = c.Resisted && !c.Calmed,
                 AtWorldS = c.AtWorldS,
@@ -146,13 +152,14 @@ public sealed class JoinerCrimeStore
         public void SetPlayerRecord(string? playerName, JoinerCrimeRecord? rec, long nowMs)
         {
             if (NormalizePlayerKey(playerName) is not string key) return;
-            if (rec is null || rec.Count == 0)
+            var snap = rec?.Open;
+            if (snap is null || snap.Count == 0)
             {
                 Players.Remove(key);
                 return;
             }
-            var list = new List<SavedCrime>(Math.Min(rec.Count, MaxCrimesPerPlayer));
-            foreach (var c in rec.Open.TakeLast(MaxCrimesPerPlayer))
+            var list = new List<SavedCrime>(Math.Min(snap.Count, MaxCrimesPerPlayer));
+            foreach (var c in snap.TakeLast(MaxCrimesPerPlayer))
             {
                 var sc = SavedCrime.FromRuntime(c, nowMs);
                 if (SavedCrime.IsValid(sc)) list.Add(sc);
@@ -232,6 +239,15 @@ public sealed class JoinerCrimeStore
         {
             var p = Path.Combine(Dir(worldKey), "latest.json");
             return WorldCrimeLedger.FromJson(File.Exists(p) ? File.ReadAllText(p) : null);
+        }
+    }
+
+    public DateTime? LatestLastWriteTimeUtc(string worldKey)
+    {
+        lock (_gate)
+        {
+            var p = Path.Combine(Dir(worldKey), "latest.json");
+            return File.Exists(p) ? File.GetLastWriteTimeUtc(p) : null;
         }
     }
 

@@ -238,9 +238,27 @@ public partial class GameBridge
     /// <summary>True when a partner currently listens to this player's conversation, or was listening when it ended within 3 s.</summary>
     private bool Wo200HasTalkListeners(string path)
     {
+        int? activeCid = null;
+        string activeForcedPath = "";
         lock (_w3cLock)
         {
-            if (_w3cTalk is { Listeners.Count: > 0 }) return true;
+            if (_w3cTalk is { Listeners.Count: > 0 } cur)
+            {
+                activeCid = cur.Cid;
+                activeForcedPath = cur.ForcedPath;
+            }
+        }
+        if (activeCid is int lcid)
+        {
+            if (_w200Talks.TryGetValue(lcid, out var activeTalk))
+            {
+                foreach (var n in activeTalk.Names)
+                    if (Wo200Rules.PathMatchesTalk(path, n)) return true;
+            }
+            else if (activeForcedPath.Length > 0 && Wo200Rules.PathMatchesTalk(path, activeForcedPath))
+            {
+                return true;
+            }
         }
         long now = W200Now();
         foreach (var (cid, t) in _w200Talks)

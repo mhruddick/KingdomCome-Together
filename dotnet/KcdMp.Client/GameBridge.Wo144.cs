@@ -20,7 +20,7 @@ public partial class GameBridge
 {
     private readonly PeerSet _peers = new();
     private readonly ConcurrentDictionary<byte, bool> _w144DropTold = new();
-    private readonly ConcurrentDictionary<string, (JoinerCrimeRecord Rec, DateTime At)> _w144ParkedCrime = new();
+    private readonly ConcurrentDictionary<string, (JoinerCrimeRecord Rec, DateTime At)> _w144ParkedCrime = new(StringComparer.OrdinalIgnoreCase);
     private long _w144Dropped;
 
     private bool IsLivePeer(byte id) => _peers.IsLive(id);
@@ -63,11 +63,14 @@ public partial class GameBridge
         var twins = _peers.SameName(id, name);
         if (fresh)
             Console.WriteLine($"MP-PEERS ghost {id} connected ({LivePartners().Count} partner(s) now){(twins.Count > 0 ? $" -- the same player as ghost {string.Join(",", twins)}: the relay replaces the old connection" : "")}");
-        if (_w144ParkedCrime.TryRemove(name, out var parked) && (DateTime.UtcNow - parked.At).TotalHours < 2)
+        if (_combatRoleApplied && _isDamageAuthority && _sharedWorld && _hostWorldSeed is null && _where != GameWhere.Menu)
+            Wo125EnsurePreloadedIdentified();
+        string? pkey = JoinerCrimeStore.NormalizePlayerKey(name);
+        if (pkey is not null && _w144ParkedCrime.TryRemove(pkey, out var parked) && (DateTime.UtcNow - parked.At).TotalHours < 2)
         {
             int dropped = parked.Rec.DropReportedTrespasses();   // WO-157 1.2: his own machine's trespass reports are not trusted
             if (parked.Rec.Count > 0) _w139Records[id] = parked.Rec;
-            Wo139PersistNamedPlayerRecord(name, parked.Rec);
+            Wo139PersistNamedPlayerRecord(pkey, parked.Rec);
             Console.WriteLine($"MP-W139 host: ghost {id} is back -- the crime record kept for that player is his again ({parked.Rec.Count} crime(s)){(dropped > 0 ? $"; {dropped} trespass(es) his own game reported were dropped (WO-157)" : "")}");
         }
         else if (Wo139TryRestoreFromStore(name, out var stored))
@@ -88,11 +91,11 @@ public partial class GameBridge
         string? name = _peers.Disconnected(id);
         Wo191ForgetSender(id, "disconnected");   // WO-191 1a
         Wo203CamOnPeerGone(id);                  // WO-203B: his conversation's view ends here; he no longer listens to ours
-        if (name is not null && _w139Records.TryRemove(id, out var rec))
+        if (JoinerCrimeStore.NormalizePlayerKey(name) is string pkey && _w139Records.TryRemove(id, out var rec))
         {
-            if (rec.Count > 0) _w144ParkedCrime[name] = (rec, DateTime.UtcNow);
-            else _w144ParkedCrime.TryRemove(name, out _);
-            Wo139PersistNamedPlayerRecord(name, rec);
+            if (rec.Count > 0) _w144ParkedCrime[pkey] = (rec, DateTime.UtcNow);
+            else _w144ParkedCrime.TryRemove(pkey, out _);
+            Wo139PersistNamedPlayerRecord(pkey, rec);
         }
         Console.WriteLine($"MP-PEERS ghost {id} disconnected ({LivePartners().Count} partner(s) now) -- it stays removed until the relay names that id again");
         // WO-151 3.6: a partner who left holds nothing here any more (his talks and stops ended with him)

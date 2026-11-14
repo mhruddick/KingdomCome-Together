@@ -38,6 +38,9 @@ public class M4BathhouseSkipTests
         Assert.Equal(("bath", (byte)2, 3f, true), (kind, asker, hours, save));
         Assert.Equal("bath", Wo140Rules.KindOfSkipId(7));
         Assert.Equal((byte)1, Wo140Rules.AccepterSkipId("bath"));
+        Assert.Equal(Protocol.TimeSkipKindWait, Wo140Rules.SharedTimeSkipKind("bath"));
+        Assert.Equal(Protocol.TimeSkipKindWait, Wo140Rules.SharedTimeSkipKind("wait"));
+        Assert.Equal(Protocol.TimeSkipKindSleep, Wo140Rules.SharedTimeSkipKind("sleep"));
     }
 
     [Fact]
@@ -135,6 +138,88 @@ public class M4BathhouseSkipTests
         Assert.True(joiner.Wo140SharedSkipForTest);
         Assert.False(joiner.Wo140SaveAfterForTest);
         Assert.Contains(joinerTx.LuaCalls, c => c.Contains("HostHenry is using the bathhouse (3h)...", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Host_unable_to_start_bath_skip_cancels_wake_hold_clears_save_after_and_validates_asker_and_hours()
+    {
+        var joinerOut = new MemoryStream();
+        var joinerTx = new RecordingTransport();
+        var joiner = new GameBridge(new ClientConfig());
+        joiner.Wo140ConfigureTestPeer(isHost: false, myId: 1, joinerOut, joinerTx);
+        joiner.Wo139PeerConnectForTest(0, "HostHenry");
+
+        await joiner.Wo140DllFrameForTestAsync(new Wo140Frame(Wo140Frame.KindState, Wo140Frame.EdgeBegan, 7, 2f, 2));
+        Assert.False(joiner.Wo140HostWokeNotedForTest);
+        var joinerSent = ReadSleepVoteMessages(joinerOut);
+        Assert.Single(joinerSent);
+
+        var hostOut = new MemoryStream();
+        var hostTx = new RecordingTransport();
+        var host = new GameBridge(new ClientConfig());
+        host.Wo140ConfigureTestPeer(isHost: true, myId: 0, hostOut, hostTx);
+        host.Wo139PeerConnectForTest(1, "Moose");
+        host.Wo139PeerConnectForTest(2, "Partner2");
+
+        // 1. Spoofed asker != src (src=1 claiming asker=2) is rejected immediately
+        var spoofedBody = new LootMsg(Protocol.SleepBegin, 0x00020001u, "bath 2 2 1")
+            .BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost)
+            .AsSpan(3 + Protocol.JoinHeaderLen).ToArray();
+        await host.Wo140InboundFrameForTestAsync(1, spoofedBody);
+        Assert.False(host.Wo140SharedSkipForTest);
+        Assert.False(host.Wo140SaveAfterForTest);
+        Assert.Empty(ReadSleepVoteMessages(hostOut));
+
+        // 2. Host is in a cutscene / fader dialogue / downed so both id=1 and fallback id=14 return 0 (cannot start C_SkipTime)
+        host.Wo140SetStartForTest(static (_, _) => (byte)0);
+        var validBathBody = new LootMsg(Protocol.SleepBegin, joinerSent[0].Msg.Tok, joinerSent[0].Msg.Text)
+            .BuildUp(Protocol.SleepVoteUp, Protocol.JoinTargetHost)
+            .AsSpan(3 + Protocol.JoinHeaderLen).ToArray();
+        await host.Wo140InboundFrameForTestAsync(1, validBathBody);
+
+        // Host did NOT arm shared skip, did NOT leak _w140SaveAfter, did NOT relay to Partner2, and sent SleepCancel("woke") to Moose!
+        Assert.False(host.Wo140SharedSkipForTest);
+        Assert.False(host.Wo140SaveAfterForTest);
+        var hostReplies = ReadSleepVoteMessages(hostOut);
+        Assert.Single(hostReplies);
+        Assert.Equal((byte)1, hostReplies[0].Target);
+        Assert.Equal(Protocol.SleepCancel, hostReplies[0].Msg.Kind);
+        Assert.True(Wo140Text.TryCancel(hostReplies[0].Msg.Text, out string why, out byte cAsker) && why == "woke" && cAsker == 1);
+
+        // Delivering SleepCancel("woke") to Joiner marks host woke so Joiner NEVER sits behind WO-192's 15s black fader screen!
+        var cancelBody = new LootMsg(Protocol.SleepCancel, hostReplies[0].Msg.Tok, hostReplies[0].Msg.Text)
+            .BuildUp(Protocol.SleepVoteUp, 1)
+            .AsSpan(3 + Protocol.JoinHeaderLen).ToArray();
+        await joiner.Wo140InboundFrameForTestAsync(0, cancelBody);
+        Assert.True(joiner.Wo140HostWokeNotedForTest);
+
+        // 3. Host loading (Wo136Holding) also immediately sends SleepCancel("woke") without arming _w140SaveAfter
+        hostOut.SetLength(0);
+        host.Wo140SetStartForTest(static (_, _) => (byte)1);
+        host.Wo140SetLoadingForTest(true);
+        await host.Wo140InboundFrameForTestAsync(1, validBathBody);
+        Assert.False(host.Wo140SharedSkipForTest);
+        Assert.False(host.Wo140SaveAfterForTest);
+        var loadingReplies = ReadSleepVoteMessages(hostOut);
+        Assert.Single(loadingReplies);
+        Assert.Equal(Protocol.SleepCancel, loadingReplies[0].Msg.Kind);
+
+        // 4. Host in trespass/combat where id=1 returns 0 but fallback id=14 returns 1 DOES start and arm shared skip + saveAfter
+        hostOut.SetLength(0);
+        host.Wo140SetLoadingForTest(false);
+        host.Wo140SetStartForTest(static (id, _) => id == 14 ? (byte)1 : (byte)0);
+        await host.Wo140InboundFrameForTestAsync(1, validBathBody);
+        Assert.True(host.Wo140SharedSkipForTest);
+        Assert.True(host.Wo140SaveAfterForTest);
+
+        // 5. Even while W140SharedSkip is in its post-wake tail, a new local bathhouse skip (id=7) is NOT swallowed!
+        await host.Wo140DllFrameForTestAsync(new Wo140Frame(Wo140Frame.KindState, Wo140Frame.EdgeEnded, 0, 0f, 0));
+        Assert.True(host.Wo140SharedSkipForTest);   // 15s post-wake window
+        hostOut.SetLength(0);
+        await host.Wo140DllFrameForTestAsync(new Wo140Frame(Wo140Frame.KindState, Wo140Frame.EdgeBegan, 7, 1f, 2));
+        var postWakeSent = ReadSleepVoteMessages(hostOut);
+        Assert.Equal(2, postWakeSent.Count);   // sent to both Moose (1) and Partner2 (2)
+        Assert.All(postWakeSent, m => Assert.Equal(Protocol.SleepBegin, m.Msg.Kind));
     }
 
     private sealed class RecordingTransport : IGameTransport

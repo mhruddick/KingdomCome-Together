@@ -1902,7 +1902,7 @@ public partial class GameBridge(ClientConfig config)
                 // via the clock-jump watcher as an instant skip).
                 // (This event only ever fires on the log-tail transport, so
                 // there is no third case to consider here.)
-                _localSkipKind = W140SharedSkip ? (_w140SharedKind == "wait" ? Protocol.TimeSkipKindWait : Protocol.TimeSkipKindSleep)   // WO-140: the shared sleep's kind
+                _localSkipKind = W140SharedSkip ? Wo140Rules.SharedTimeSkipKind(_w140SharedKind)   // WO-140: the shared skip's kind (sleep vs wait/bath)
                     : _nearBed ? Protocol.TimeSkipKindSleep : Protocol.TimeSkipKindWait;
                 _ = _sendTimeSkip?.Invoke(Protocol.TimeSkipPhaseStart, _localSkipKind, 0);
             }

@@ -205,20 +205,29 @@ public static class Wo200Rules
             || q.Contains("add_haggle_denial", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Bathhouse service dialogues (Barbora.open_world.lazne_a_lazebnice.*): personal service payment/buffs; time-skip rides WO-140.</summary>
+    private static bool HasDialogueSegment(string path, string segment) =>
+        path.Contains(segment + ".", StringComparison.OrdinalIgnoreCase)
+        || path.EndsWith(segment, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Bathhouse service dialogues (instantiated .bathhouse.abbess_dialog / .abbess_dialog.objednani_sluzeb and library .lazne_a_lazebnice): personal service payment/buffs; time-skip rides WO-140.</summary>
     public static bool IsBathhouseServiceDialogue(string? path)
     {
         string p = path ?? "";
-        return p.Contains(".lazne_a_lazebnice.", StringComparison.OrdinalIgnoreCase)
-            || p.EndsWith(".lazne_a_lazebnice", StringComparison.OrdinalIgnoreCase);
+        return HasDialogueSegment(p, ".lazne_a_lazebnice")
+            || HasDialogueSegment(p, ".bathhouse.abbess_dialog")
+            || HasDialogueSegment(p, ".abbess_dialog.objednani_sluzeb");
     }
 
-    /// <summary>Guard arrest and crime punishment dialogues: handled per-player by WO-139, never replayed onto the host's Henry.</summary>
+    /// <summary>Guard arrest, frisk, and crime punishment dialogues: handled per-player by WO-139, never replayed onto the host's Henry.</summary>
     public static bool IsCrimePunishmentDialogue(string? path)
     {
         string p = path ?? "";
         return p.Contains(".nextnextgenpunishment", StringComparison.OrdinalIgnoreCase)
-            || p.Contains(".utils.crime.punishment", StringComparison.OrdinalIgnoreCase);
+            || p.Contains(".utils.crime.punishment", StringComparison.OrdinalIgnoreCase)
+            || p.StartsWith("Barbora.open_world.frisk.", StringComparison.OrdinalIgnoreCase)
+            || p.Equals("Barbora.open_world.frisk", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("zatykani_v_zikmundove_tabore", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("klaster__zatykaci_dialog__", StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsAlwaysLocalDialogue(string? path, string? port = null) =>

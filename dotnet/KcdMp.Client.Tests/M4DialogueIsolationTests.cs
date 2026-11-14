@@ -14,14 +14,24 @@ public class M4DialogueIsolationTests
     [InlineData("Barbora.open_world.shop.bribeHaggleNegotiation.adapter", "out_fail", true, false, "haggle-local")]
     [InlineData("Barbora.open_world.lazne_a_lazebnice.bathhouse.abbess_dialog", "zaplaceni_sluzby", false, false, "bathhouse-local")]
     [InlineData("Barbora.open_world.lazne_a_lazebnice.bathhouse.abbess_dialog", "zaplaceni_sluzby", true, false, "bathhouse-local")]
+    [InlineData("Barbora.trosecko.bathhouse.abbess_dialog.objednani_sluzeb", "zaplaceni_sluzby", false, false, "bathhouse-local")]
+    [InlineData("Barbora.trosecko.bathhouse.abbess_dialog.objednani_sluzeb", "zaplaceni_sluzby", true, false, "bathhouse-local")]
+    [InlineData("Barbora.kutnohorsko.bathhouse.abbess_dialog.objednani_sluzeb", "zaplaceni_sluzby", false, false, "bathhouse-local")]
+    [InlineData("Barbora.kutnohorsko.bathhouse.abbess_dialog.objednani_sluzeb", "zaplaceni_sluzby", true, false, "bathhouse-local")]
     [InlineData("Barbora.open_world.nextnextgenpunishment.svepomoc.svepomoc__dialog_civilista_muz", "fine_paid", true, false, "punishment-local")]
     [InlineData("Barbora.utils.crime.punishment.arrestdialogue.straze__zatykaci_dialog", "punish", false, false, "punishment-local")]
+    [InlineData("Barbora.open_world.frisk.frisk_guard_dialog", "frisk_clean", true, false, "punishment-local")]
+    [InlineData("Barbora.kutnohorsko.zikmunduvTabor.zatykani_v_zikmundove_tabore.arrest_node", "surrender", true, false, "punishment-local")]
+    [InlineData("Barbora.klaster.crime.klaster__zatykaci_dialog__straz", "confiscate", true, false, "punishment-local")]
     [InlineData("Barbora.open_world.shop.nakupovani_z_dialogu_muz", "reputation_up", false, false, "open-world-solo")]
     [InlineData("Barbora.open_world.shop.nakupovani_z_dialogu_muz", "reputation_up", true, true, "open-world-listened")]
     [InlineData("Barbora.open_world.reakce_na_stav_hrace.npc_zdravi_hrace_chatem__straz", "rep_down", false, false, "open-world-solo")]
     [InlineData("Barbora.open_world.reakce_na_stav_hrace.npc_zdravi_hrace_chatem__straz", "rep_down", true, true, "open-world-listened")]
     [InlineData("Barbora.trosecko.zbranePanaSemina.h.na_semine.odjezd_ze_semina", "jindra_ma_nasledovat", false, true, "quest")]
     [InlineData("Barbora.trosecko.lazne__zelejov.hlavni_dialog", "step_done", false, true, "quest")]
+    [InlineData("Barbora.kutnohorsko.budovaniLazni.otevreni_lazni", "quest_advance", false, true, "quest")]
+    [InlineData("Barbora.kutnohorsko.sabotazLazni.hlavni_dialog", "sabotaz_hotova", false, true, "quest")]
+    [InlineData("Barbora.kutnohorsko.hledaniLichtenstejna.lazebnice_dialog", "stopa_nalezena", false, true, "quest")]
     [InlineData("Barbora.kutnohorsko.brushes_with_death_kutnohorsko.maliruvLek.objective_ziskej_ricni_perlu.s_vudcem_dezerteru__haggle", "smlouvani_uspesne", false, true, "quest")]
     [InlineData("Barbora.klaster.tajemstviKlastera.rozmluva", "opat_souhlasi", false, true, "quest")]
     public void ShouldReplayDialogueOutPort_classifies_haggle_bathhouse_punishment_open_world_and_story_dialogues(
@@ -104,6 +114,51 @@ public class M4DialogueIsolationTests
         var allReplays = ReadSentJoinMessages(outMs).Where(x => x.Type == Protocol.QuestAskUp && x.Msg.Kind == Protocol.QuestAskOutPortReplay).ToList();
         Assert.Equal(2, allReplays.Count);
         Assert.Contains(questPath, allReplays[1].Msg.Text);
+    }
+
+    [Fact]
+    public async Task Runtime_bathhouse_frisk_and_unrelated_subsequent_listened_talk_never_leak_solo_out_ports()
+    {
+        var outMs = new MemoryStream();
+        var tx = new NoopTransport();
+        var gb = new GameBridge(new ClientConfig());
+        gb.Wo200ConfigureTestJoiner(outMs, tx);
+
+        // 1. Runtime instantiated Kuttenberg bathhouse path with active listener -> stays local
+        const string runtimeBath = "Barbora.kutnohorsko.bathhouse.abbess_dialog.objednani_sluzeb";
+        gb.Wo200EngineLineForTest($"New dialogue '{runtimeBath} (normal - Id: 201) (Actor::RequestDialog)' is starting. Params: souls = 'Ex: Dude; Ex: kh_bathmaid_2' forced = false");
+        gb.Wo200SetActiveListenersForTest(201, 0);
+        await gb.Wo200CaptureForTestAsync(0x80000201u, runtimeBath, "zaplaceni_sluzby");
+        Assert.Empty(ReadSentJoinMessages(outMs));
+        gb.Wo200EngineLineForTest("[ID: 201] Dialog ending [Ex0: Dude Ex1: kh_bathmaid_2 state: CLEANUP flags: 1]");
+
+        // 2. Auto-joined guard frisk dialogue -> stays local
+        const string friskPath = "Barbora.open_world.frisk.frisk_guard_dialog";
+        gb.Wo200EngineLineForTest($"New dialogue '{friskPath} (normal - Id: 202) (ForceDialogNode)' is starting. Params: souls = 'Ex: Dude; Ex: kh_guard_3' forced = true");
+        gb.Wo200SetActiveListenersForTest(202, 0);
+        await gb.Wo200CaptureForTestAsync(0x80000202u, friskPath, "frisk_surrender");
+        Assert.Empty(ReadSentJoinMessages(outMs));
+        gb.Wo200EngineLineForTest("[ID: 202] Dialog ending [Ex0: Dude Ex1: kh_guard_3 state: CLEANUP flags: 1]");
+
+        // 3. Solo open_world dialogue 203 ends WITHOUT listeners, then unrelated open_world dialogue 204 starts WITH a listener,
+        //    and THEN delayed out-port capture from solo dialogue 203 arrives -> must NOT misclassify 203 as listened!
+        const string soloShopPath = "Barbora.open_world.shop.nakupovani_z_dialogu_muz";
+        const string otherListenedPath = "Barbora.open_world.reakce_na_stav_hrace.npc_zdravi_hrace_chatem__straz";
+        gb.Wo200EngineLineForTest($"New dialogue '{soloShopPath} (normal - Id: 203) (Actor::RequestDialog)' is starting. Params: souls = 'Ex: Dude; Ex: ttac_man_4' forced = false");
+        gb.Wo200EngineLineForTest("[ID: 203] Dialog ending [Ex0: Dude Ex1: ttac_man_4 state: CLEANUP flags: 1]");
+
+        gb.Wo200EngineLineForTest($"New dialogue '{otherListenedPath} (normal - Id: 204) (ForceDialogNode)' is starting. Params: souls = 'Ex: Dude; Ex: ttac_guard_1' forced = true");
+        gb.Wo200SetActiveListenersForTest(204, 0);
+
+        // Delayed out-port from solo talk 203 -> stays local!
+        await gb.Wo200CaptureForTestAsync(0x80000203u, soloShopPath, "reputation_up");
+        Assert.Empty(ReadSentJoinMessages(outMs));
+
+        // Out-port from actually-listened talk 204 -> replays!
+        await gb.Wo200CaptureForTestAsync(0x80000204u, otherListenedPath, "rep_down");
+        var sent = ReadSentJoinMessages(outMs).Where(x => x.Type == Protocol.QuestAskUp && x.Msg.Kind == Protocol.QuestAskOutPortReplay).ToList();
+        Assert.Single(sent);
+        Assert.Contains(otherListenedPath, sent[0].Msg.Text);
     }
 
     private sealed class NoopTransport : IGameTransport
