@@ -38,7 +38,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 
-if (-not $env:DOTNET_ROOT) {
+if (-not $env:DOTNET_ROOT -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     $env:DOTNET_ROOT = "$env:USERPROFILE\.dotnet-sdk8"
     $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
 }

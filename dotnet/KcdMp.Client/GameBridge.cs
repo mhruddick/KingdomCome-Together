@@ -1515,6 +1515,7 @@ public partial class GameBridge(ClientConfig config)
         // WO-48: dropIds are minted per connection; a stale heartbeat after a
         // reconnect would re-broadcast drops the peers may already hold.
         _myOpenDrops.Clear();
+        _henry.ClearPendingOutgoingDrops();
 
         _hasPushed = false;
         _staleRun = 0;                              // WO-99 Phase 1
@@ -2396,6 +2397,7 @@ public partial class GameBridge(ClientConfig config)
             await Wo143OnDisconnectAsync();   // WO-143: nothing captured or applied, the temporary tools taken back
             await Wo148OnDisconnectAsync();   // WO-148: every partner's carry set down here
             _myOpenDrops.Clear();
+            _henry.ClearPendingOutgoingDrops();
             // WO-113: no relay, no session -- the DLL's guard stands down
             // (vanilla death), and every peer's mirror gravestone goes.
             _combat.OnLocalRespawned = null;
@@ -5567,8 +5569,13 @@ public partial class GameBridge(ClientConfig config)
                         // drop from our own heartbeat set, whoever won it.
                         byte icClaimer = payload[0];
                         uint icDropId  = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(1));
-                        _myOpenDrops.TryRemove(icDropId, out _);
+                        bool wasMyDrop = _myOpenDrops.TryRemove(icDropId, out var myDropPayload);
                         bool claimIsMine = icClaimer == _myGhostId;
+                        if (wasMyDrop)
+                        {
+                            if (claimIsMine) Wo125OnJoinerDropSelfClaimWon(icDropId);
+                            else if (myDropPayload is not null) Wo125OnJoinerDropClaimedByPeer(icDropId, icClaimer, myDropPayload);
+                        }
                         Console.WriteLine($"[itemsync] drop {icDropId} claimed by {(claimIsMine ? "us" : $"ghost {icClaimer}")}");
                         await ExecLuaAsync($"if KCD2MP_ItemDropClaimed then KCD2MP_ItemDropClaimed(\"{icDropId}\",\"{icClaimer}\",{(claimIsMine ? "true" : "false")}) end");
                     }
@@ -6615,6 +6622,7 @@ public partial class GameBridge(ClientConfig config)
                 do { dropId = (uint)Random.Shared.Next(1, int.MaxValue); }
                 while (!_myOpenDrops.TryAdd(dropId, dropPayload));
                 BinaryPrimitives.WriteUInt32LittleEndian(dropPayload, dropId);
+                Wo125OnJoinerDropStarted(dropId);
                 Console.WriteLine($"[itemsync] local drop {dropId}: {dropClass} x{dropAmount} at {dropX:F1},{dropY:F1},{dropZ:F1}");
                 _ = sendDrop(dropPayload);
                 // The dropId travels to Lua as a STRING: the stripped Lua 5.1
@@ -6635,6 +6643,8 @@ public partial class GameBridge(ClientConfig config)
                     Console.WriteLine($"[itemsync] malformed item_claim '{arg}'");
                     break;
                 }
+                if (_myOpenDrops.ContainsKey(claimDropId))
+                    Wo125OnJoinerDropSelfClaim(claimDropId);
                 var sendClaim = _sendItemClaim;
                 if (sendClaim is null) break;
                 _ = sendClaim(claimDropId);

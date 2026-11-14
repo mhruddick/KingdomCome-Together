@@ -5499,6 +5499,7 @@ KCD2MP.w125 = { snaps = 0, snapRefused = 0 }
 -- A snapshot of this game's copy of the host's world, for the agent. The hitch
 -- is measured the WO-122 way (the longest frame gap in the next 6 s).
 function KCD2MP_Wo125Snapshot(tok)
+    if KCD2MP_ItemFlushDetect then pcall(KCD2MP_ItemFlushDetect) end
     local w = KCD2MP.w125
     local ok, r = false, nil
     if Game and Game.QuickSave then
@@ -16393,13 +16394,95 @@ local function mp_item_world_reloaded()
     return false
 end
 
+local mp_item_finalize
+local mp_item_install_pickup
+
+local function mp_item_adopted_by_other(name, key)
+    -- WO-177 B1: two same-class drops placed within 3 m in one tick used to adopt ONE engine entity (a pre-existing WO-48 edge case):
+    -- the first pickup then removed both items for the other player. An entity another tracked drop already holds is never adopted again.
+    for k2, d2 in pairs(KCD2MP.itemDrops) do
+        if k2 ~= key and d2.entName == name then return true end
+    end
+    return false
+end
+
+-- Match an unbound "placing" drop against a PickableItem within 3.0 m of d's target spot,
+-- adopt it immediately, and return (key, d) if matched.
+local function mp_item_bind_placing_entity(e, name)
+    if not e or e.class ~= "PickableItem" then return nil, nil end
+    pcall(function() if not name then name = e:GetName() end end)
+    if not name or name == "" then return nil, nil end
+    local cls, ep, ewuid = nil, nil, nil
+    pcall(function()
+        cls = e.Properties and e.Properties.sItemClassId
+        ep = e:GetWorldPos()
+        ewuid = e.item and e.item:GetId() or nil
+    end)
+    if not cls or cls == "" or not ep then return nil, nil end
+    local eidStr = tostring(e.id)
+    for key, d in pairs(KCD2MP.itemDrops) do
+        if d.state == "placing" and not d.entName and d.cls == cls and name ~= d.anchorName
+           and not mp_item_adopted_by_other(name, key)
+           and not (d.preIds and d.preIds[eidStr])
+           and (d.createdWuid == nil or ewuid == nil or tostring(ewuid) == tostring(d.createdWuid)) then
+            local dx = ep.x - (d.x or ep.x)
+            local dy = ep.y - (d.y or ep.y)
+            local dz = ep.z - (d.z or ep.z)
+            if dx * dx + dy * dy + dz * dz <= 9.0 then
+                KCD2MP._itemSeen[eidStr] = true
+                d.entName = name
+                pcall(function() d.wuid = e.item and e.item:GetId() or nil end)
+                pcall(function()
+                    local a = d.anchorName and System.GetEntityByName(d.anchorName)
+                    if a then System.RemoveEntity(a.id) end
+                end)
+                if d.pendingRemove then
+                    d.removedByUs = true
+                    pcall(function() System.RemoveEntity(e.id) end)
+                    d.state = "resolved"
+                else
+                    d.state = "ground"
+                    mp_log("ITEM-SYNC drop " .. key .. " materialized -> " .. d.entName)
+                end
+                return key, d
+            end
+        end
+    end
+    return nil, nil
+end
+
+function KCD2MP_ItemTryBindPlacingByName(name)
+    if not name or name == "" then return false end
+    local e = nil
+    pcall(function() e = System.GetEntityByName(name) end)
+    if not e then return false end
+    local key, d = mp_item_bind_placing_entity(e, name)
+    if not key then return false end
+    if d and d.state == "ground" and not d.removedByUs and d.entName then
+        Script.SetTimer(60, function()
+            if KCD2MP.itemDrops[key] == d and d.state == "ground" and not d.removedByUs and d.entName then
+                local cur = nil
+                pcall(function() cur = System.GetEntityByName(d.entName) end)
+                if not cur then
+                    d.state = "claimed_local"
+                    KCD2MP_EmitEvent("item_claim", key)
+                    mp_log("ITEM-SYNC drop " .. key .. " taken locally -> claim sent")
+                end
+            end
+        end)
+    end
+    return true
+end
+
 local function mp_item_detect(pp)
+    pcall(mp_item_install_pickup)
     local counts = mp_item_inv_counts()
     local prev = KCD2MP._itemInvCounts
     if counts then KCD2MP._itemInvCounts = counts end
     local ents = System.GetEntitiesInSphere(pp, KCD2MP.itemSync.dropRadius) or {}
     for _, e in ipairs(ents) do
         if e.class == "PickableItem" then
+            mp_item_bind_placing_entity(e)
             local key = tostring(e.id)
             if not KCD2MP._itemSeen[key] then
                 KCD2MP._itemSeen[key] = true
@@ -16427,6 +16510,13 @@ local function mp_item_detect(pp)
     end
 end
 
+function KCD2MP_ItemFlushDetect()
+    if not (KCD2MP.itemSync and KCD2MP.itemSync.enabled and player) then return end
+    local pp = nil
+    pcall(function() pp = player:GetWorldPos() end)
+    if pp then pcall(mp_item_detect, pp) end
+end
+
 -- The agent minted a dropId for the drop this world just detected; from here
 -- the local ground entity is tracked so its pickup (by us or by a peer's
 -- claim) resolves like any other synced drop.
@@ -16452,6 +16542,7 @@ end
 -- local player is near enough to materialize it safely. Heartbeats repeat
 -- this call for late joiners; the dropId dedupe makes them free.
 function KCD2MP_ItemDropAdd(dropId, cls, amount, health, x, y, z, srcGhostId)
+    pcall(mp_item_install_pickup)
     local key = tostring(dropId)
     if KCD2MP.itemDrops[key] then return end
     if mp_item_tracked_count() >= KCD2MP.itemSync.maxTracked then return end
@@ -16468,10 +16559,10 @@ end
 -- Spawn one pending drop: throwaway PickableItem shell as the position
 -- anchor, the item created in a ghost's inventory (never the player's -- a
 -- failure must not leave a stray item where a save could keep it), placed by
--- that ghost's human. The engine mints the real bound pickup entity; it is
--- located on the NEXT tick because entity creation and removal were both
--- observed to be deferred by a frame.
+-- that ghost's human. The engine mints the real bound pickup entity; we try
+-- finalizing immediately, follow up in 60 ms, and fall back to tick checks.
 local function mp_item_spawn(key, d)
+    pcall(mp_item_install_pickup)
     local g = KCD2MP.ghosts[d.src] or KCD2MP.ghosts[tonumber(d.src) or -1]
     local ge = g and g.entity
     if not (ge and ge.inventory and ge.human) then
@@ -16527,6 +16618,8 @@ local function mp_item_spawn(key, d)
         mp_log("ITEM-SYNC drop " .. key .. " FAILED: CreateItem bound nothing for " .. d.cls)
         return
     end
+    d.createdWuid = created
+    pcall(function() d.ghostName = ge:GetName() end)
 
     local okPlace = false
     pcall(function() ge.human:PlaceItem(created, anchor.id, false); okPlace = true end)
@@ -16540,21 +16633,19 @@ local function mp_item_spawn(key, d)
     d.anchorName = anchorName
     d.placeTries = 0
     d.state = "placing"
-end
-
--- Second half of the spawn, one tick later: find the entity the engine
--- minted (same class, at the anchor, not yet accounted for), adopt it, and
--- only then discard the anchor.
-local function mp_item_adopted_by_other(name, key)
-    -- WO-177 B1: two same-class drops placed within 3 m in one tick used to adopt ONE engine entity (a pre-existing WO-48 edge case):
-    -- the first pickup then removed both items for the other player. An entity another tracked drop already holds is never adopted again.
-    for k2, d2 in pairs(KCD2MP.itemDrops) do
-        if k2 ~= key and d2.entName == name then return true end
+    mp_item_finalize(key, d, "sync")
+    if d.state == "placing" then
+        Script.SetTimer(60, function()
+            if KCD2MP.itemDrops[key] == d and d.state == "placing" then
+                mp_item_finalize(key, d, "fast")
+            end
+        end)
     end
-    return false
 end
 
-local function mp_item_finalize(key, d)
+-- Second half of the spawn: find the entity the engine minted (same class, at
+-- the anchor, not yet accounted for), adopt it, and discard the anchor.
+mp_item_finalize = function(key, d, mode)
     local placed = nil
     pcall(function()
         local ents = System.GetEntitiesInSphere({x = d.x, y = d.y, z = d.z}, 3) or {}
@@ -16564,8 +16655,12 @@ local function mp_item_finalize(key, d)
                and e:GetName() ~= d.anchorName
                and not mp_item_adopted_by_other(e:GetName(), key)
                and not (d.preIds and d.preIds[tostring(e.id)]) then
-                placed = e
-                break
+                local ewuid = nil
+                pcall(function() ewuid = e.item and e.item:GetId() or nil end)
+                if d.createdWuid == nil or ewuid == nil or tostring(ewuid) == tostring(d.createdWuid) then
+                    placed = e
+                    break
+                end
             end
         end
     end)
@@ -16588,6 +16683,62 @@ local function mp_item_finalize(key, d)
         end
         return
     end
+    if mode == "sync" then return end
+
+    -- Only claim without a ground entity when the specific created item instance
+    -- (d.createdWuid) has left the placing ghost and entered player.inventory.
+    -- Never guess from a class-wide count increase: acquiring an unrelated item
+    -- of the same class during placement would falsely claim d and delete the
+    -- unrelated item if a peer won the claim race.
+    local foundCreated = nil
+    if d.createdWuid ~= nil then
+        local wantId = tostring(d.createdWuid)
+        local stillOnGhost = false
+        pcall(function()
+            local ge = d.ghostName and System.GetEntityByName(d.ghostName)
+            if ge and ge.inventory then
+                local gt = ge.inventory:GetInventoryTable()
+                for i = 1, #gt do
+                    if tostring(gt[i]) == wantId then stillOnGhost = true; break end
+                end
+            end
+        end)
+        if not stillOnGhost then
+            pcall(function()
+                if player and player.inventory then
+                    local pt = player.inventory:GetInventoryTable()
+                    for i = 1, #pt do
+                        if tostring(pt[i]) == wantId then
+                            foundCreated = pt[i]
+                            break
+                        end
+                    end
+                end
+            end)
+        end
+    end
+    if foundCreated ~= nil then
+        pcall(function()
+            local a = d.anchorName and System.GetEntityByName(d.anchorName)
+            if a then System.RemoveEntity(a.id) end
+        end)
+        d.wuid = d.wuid or foundCreated
+        if d.pendingRemove then
+            if d.pendingClaimIsMine then
+                d.state = "resolved"
+            else
+                d.state = "claimed_local"
+                KCD2MP_ItemDropClaimed(key, d.pendingClaimer or "0", false)
+            end
+        else
+            d.state = "claimed_local"
+            KCD2MP_EmitEvent("item_claim", key)
+            mp_log("ITEM-SYNC drop " .. key .. " picked up while placing -> claim sent")
+        end
+        return
+    end
+
+    if mode == "fast" then return end
     d.placeTries = (d.placeTries or 0) + 1
     if d.placeTries >= 4 then
         pcall(function()
@@ -16618,7 +16769,7 @@ local function mp_item_materialize(pp)
             local dx, dy = d.x - pp.x, d.y - pp.y
             if dx * dx + dy * dy <= r2 then
                 mp_item_spawn(key, d)
-                if d.state == "placing" then return end   -- one in flight: the next waits for the next tick
+                if d.state == "placing" or d.state == "ground" then return end   -- one placement per tick (WO-177 B1)
             end
         end
     end
@@ -16670,6 +16821,8 @@ function KCD2MP_ItemDropClaimed(dropId, claimer, isMine)
 
     if d.state == "placing" then
         d.pendingRemove = true   -- mp_item_finalize removes it once it appears
+        d.pendingClaimer = claimer
+        d.pendingClaimIsMine = isMine
         return
     end
 
@@ -16683,6 +16836,75 @@ function KCD2MP_ItemDropClaimed(dropId, claimer, isMine)
     end
     d.state = "resolved"
 end
+
+local function mp_item_wrap_pickup_fn(orig)
+    return function(self, user, slot)
+        local boundKey, boundDrop = nil, nil
+        if user == player and KCD2MP.itemSync and KCD2MP.itemSync.enabled then
+            pcall(function()
+                local nm = self and self.GetName and self:GetName()
+                if nm and nm ~= "" then
+                    for k, d in pairs(KCD2MP.itemDrops) do
+                        if d.entName == nm and d.state == "ground" and not d.removedByUs then
+                            boundKey, boundDrop = k, d
+                            break
+                        end
+                    end
+                    if not boundDrop then
+                        boundKey, boundDrop = mp_item_bind_placing_entity(self, nm)
+                    end
+                end
+            end)
+        end
+        local res = orig(self, user, slot)
+        if boundKey and boundDrop and boundDrop.state == "ground" and not boundDrop.removedByUs and boundDrop.entName then
+            local stillThere = true
+            pcall(function() stillThere = System.GetEntityByName(boundDrop.entName) ~= nil end)
+            if not stillThere then
+                boundDrop.state = "claimed_local"
+                KCD2MP_EmitEvent("item_claim", boundKey)
+                mp_log("ITEM-SYNC drop " .. boundKey .. " taken locally -> claim sent")
+            else
+                Script.SetTimer(60, function()
+                    if KCD2MP.itemDrops[boundKey] == boundDrop and boundDrop.state == "ground" and not boundDrop.removedByUs and boundDrop.entName then
+                        local e2 = nil
+                        pcall(function() e2 = System.GetEntityByName(boundDrop.entName) end)
+                        if not e2 then
+                            boundDrop.state = "claimed_local"
+                            KCD2MP_EmitEvent("item_claim", boundKey)
+                            mp_log("ITEM-SYNC drop " .. boundKey .. " taken locally -> claim sent")
+                        end
+                    end
+                end)
+            end
+        end
+        return res
+    end
+end
+
+mp_item_install_pickup = function()
+    if KCD2MP._itemPickupWrapped or type(PickableItem) ~= "table" then return end
+    local w = KCD2MP.w134
+    local w134WasInstalled = w and w.useWrap and PickableItem.OnUsed == w.useWrap
+    if w134WasInstalled then
+        if w.useOrig then PickableItem.OnUsed = w.useOrig end
+        if w.holdOrig then PickableItem.OnUsedHold = w.holdOrig end
+    end
+    if type(PickableItem.OnUsed) == "function" then
+        KCD2MP._itemUseWrap = mp_item_wrap_pickup_fn(PickableItem.OnUsed)
+        PickableItem.OnUsed = KCD2MP._itemUseWrap
+        KCD2MP._itemPickupWrapped = true
+    end
+    if type(PickableItem.OnUsedHold) == "function" then
+        KCD2MP._itemHoldWrap = mp_item_wrap_pickup_fn(PickableItem.OnUsedHold)
+        PickableItem.OnUsedHold = KCD2MP._itemHoldWrap
+        KCD2MP._itemPickupWrapped = true
+    end
+    if w134WasInstalled and W134 and W134.installPickup then
+        pcall(W134.installPickup)
+    end
+end
+pcall(mp_item_install_pickup)
 
 function KCD2MP_ItemSyncTick()
     if not KCD2MP.itemSyncRunning then return end
@@ -16875,8 +17097,13 @@ end
 function W134.isDrop(name)
     if not name then return false end
     if string.find(name, "^kcd2mp_") or string.find(name, "^kcdmp_") then return true end
+    local hasPlacing = false
     for _, d in pairs(KCD2MP.itemDrops or {}) do
         if d.entName == name or d.anchorName == name then return true end
+        if d.state == "placing" and not d.entName then hasPlacing = true end
+    end
+    if hasPlacing and KCD2MP_ItemTryBindPlacingByName and KCD2MP_ItemTryBindPlacingByName(name) then
+        return true
     end
     return false
 end

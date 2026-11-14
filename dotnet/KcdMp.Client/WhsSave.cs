@@ -50,6 +50,9 @@ namespace KcdMp.Client;
 public static partial class WhsSave
 {
     public const string HenrySoul = "4c2dcffb-dea1-6263-72d7-b39f4db2d8b5";   // soul__player.xml player_henry
+    public const string PersonalStashExtensionKey = "personal_stash";
+    public static readonly (ulong Lo, ulong Hi) PersonalStashId = (0UL, 0x04BAAE5F204857B4UL);   // playerMasterChest (204857b4-ae5f-04ba)
+    public static readonly HashSet<(ulong Lo, ulong Hi)> PersonalStashIds = [PersonalStashId];
     public const int StatStory = 8;
     public const int ChunkRaw = 32768;   // every game-written block inflates to 32 KB (last one shorter)
     public const int BlockBuffer = 0x8000;   // the engine's per-block buffer: compressed, stored and inflated sizes all fit in it
@@ -676,6 +679,8 @@ public static partial class WhsSave
         public uint? StoryJoiner, StoryHost;
         public int RenownJoinerBytes, RenownHostBytes;
         public List<string> QuestItemsRemoved = [], QuestItemsAdded = [];
+        public int PersonalStashItemsJoiner;
+        public List<string> PersonalStashQuestItemsRemoved = [];
         public int KeysHostKept, KeysHostDropped, KeysJoinerAdded;
         public List<string> Blocks = [];
     }
@@ -768,9 +773,167 @@ public static partial class WhsSave
         [0x01F4, 0x01F8, 0x7309, 0x0000], [0x01F4, 0x01F8, 0x7309, 0x0001],
         [0x01F4, 0x01F8, 0x7301], [0x01F4, 0x01F9, 0x7302, 0x0002],
     ];
+    internal static readonly ushort[] StashBlock = [0x01F4, 0x01F8, 0x7302, 0x0006];
     private static readonly ushort[] KeyBlock = [0x01F4, 0x01F8, 0x7302, 0x000B];
 
-    private static HashSet<string> HenryItemSet(byte[] raw) => RecordItemSet(NodeBytes(raw, HenryChain(raw)[^1]));
+    private static (ulong Lo, ulong Hi) StashNodeId(ReadOnlySpan<byte> buf, Node n) =>
+        (BinaryPrimitives.ReadUInt64LittleEndian(buf.Slice(n.PayloadOff, 8)),
+         BinaryPrimitives.ReadUInt64LittleEndian(buf.Slice(n.PayloadOff + 8, 8)));
+
+    private static bool IsPersonalStash((ulong Lo, ulong Hi) id)
+    {
+        lock (PersonalStashIds) return PersonalStashIds.Contains(id);
+    }
+
+    private static List<Node> StashNodes(byte[] stashPayload)
+    {
+        if (stashPayload.Length == 0) return [];
+        var kids = Children(stashPayload, 0, stashPayload.Length) ?? throw new InvalidDataException("EntityModule 0006 does not parse");
+        foreach (var k in kids)
+            if (k.Tag != 0x0000 || k.Len < 16) throw new InvalidDataException($"unexpected 0006 stash entry {k.Tag:x4}/{k.Len}");
+        return kids;
+    }
+
+    /// <summary>Extract the serialized 0x0000 personal stash TLV node(s) from 01f4/01f8/7302/0006 (empty byte[] when absent).</summary>
+    public static byte[] ExtractPersonalStash(byte[] raw)
+    {
+        if (PathGet(raw, StashBlock) is not Node n0006 || n0006.Len == 0) return [];
+        var pay = Payload(raw, n0006);
+        using var ms = new MemoryStream();
+        foreach (var k in StashNodes(pay))
+            if (IsPersonalStash(StashNodeId(pay, k))) ms.Write(pay, k.Off, 6 + k.Len);
+        return ms.Length == 0 ? [] : ms.ToArray();
+    }
+
+    /// <summary>Every 0x0001 item instance GUID inside serialized personal stash 0x0000 node(s).</summary>
+    public static HashSet<string> PersonalStashItemSet(byte[] psBytes)
+    {
+        var set = new HashSet<string>(StringComparer.Ordinal);
+        if (psBytes.Length == 0) return set;
+        foreach (var st in StashNodes(psBytes))
+        {
+            var stKids = st.Len == 16 ? [] : (Children(psBytes, st.PayloadOff + 16, st.End) ?? throw new InvalidDataException("personal stash record body does not parse"));
+            foreach (var sk in stKids)
+            {
+                if (sk.Tag != 0x0005 || sk.Len == 0) continue;
+                var invKids = Children(psBytes, sk.PayloadOff, sk.End) ?? throw new InvalidDataException("personal stash 0x0005 inventory does not parse");
+                foreach (var ik in invKids)
+                {
+                    if (ik.Tag != 0x0001) continue;
+                    if (ik.Len < 36) throw new InvalidDataException("personal stash item 0x0001 too short");
+                    set.Add(GuidStr(psBytes.AsSpan(ik.PayloadOff, 16)));
+                }
+            }
+        }
+        return set;
+    }
+
+    /// <summary>Decode all 0x0001 items stored in the personal master stash(es) of a save stream.</summary>
+    public static List<InvItem> DecodePersonalStashItems(byte[] raw)
+    {
+        var items = new List<InvItem>();
+        var psBytes = ExtractPersonalStash(raw);
+        if (psBytes.Length == 0) return items;
+        foreach (var st in StashNodes(psBytes))
+        {
+            var stKids = st.Len == 16 ? [] : (Children(psBytes, st.PayloadOff + 16, st.End) ?? []);
+            foreach (var sk in stKids)
+            {
+                if (sk.Tag != 0x0005 || sk.Len == 0) continue;
+                foreach (var node in Children(psBytes, sk.PayloadOff, sk.End) ?? [])
+                {
+                    if (node.Tag != 0x0001 || node.Len < 36) continue;
+                    var b = Payload(psBytes, node);
+                    var ps = new List<string>();
+                    foreach (var pn in Children(b, 36, b.Length) ?? [])
+                    {
+                        var v = b.AsSpan(pn.PayloadOff, pn.Len);
+                        if (pn.Tag == 0 && pn.Len == 4) ps.Add($"amount={BinaryPrimitives.ReadUInt32LittleEndian(v) + 1}");
+                        else ps.Add($"p{pn.Tag:x}={Convert.ToHexString(v).ToLowerInvariant()}");
+                    }
+                    items.Add(new InvItem(GuidStr(b), BinaryPrimitives.ReadUInt32LittleEndian(b.AsSpan(16)), GuidStr(b.AsSpan(20)), string.Join(";", ps)));
+                }
+            }
+        }
+        return items;
+    }
+
+    private static byte[] CleanPersonalStash(byte[] psBytes, Dictionary<string, string> qclasses, SpliceReport? rep)
+    {
+        if (psBytes.Length == 0) return [];
+        using var outMs = new MemoryStream();
+        Span<byte> hdr = stackalloc byte[6];
+        foreach (var st in StashNodes(psBytes))
+        {
+            var id = StashNodeId(psBytes, st);
+            if (!IsPersonalStash(id)) throw new InvalidDataException("personal_stash extension holds a non-personal stash record");
+            var stKids = st.Len == 16 ? [] : (Children(psBytes, st.PayloadOff + 16, st.End) ?? throw new InvalidDataException("personal stash record body does not parse"));
+            int invIdx = stKids.FindIndex(k => k.Tag == 0x0005);
+            if (invIdx < 0) continue;
+            var invNode = stKids[invIdx];
+            var invKids = invNode.Len == 0 ? [] : (Children(psBytes, invNode.PayloadOff, invNode.End) ?? throw new InvalidDataException("personal stash 0x0005 inventory does not parse"));
+            using var invMs = new MemoryStream();
+            int keptItems = 0;
+            foreach (var ik in invKids)
+            {
+                if (ik.Tag == 0x0001)
+                {
+                    if (ik.Len < 36) throw new InvalidDataException("personal stash item 0x0001 too short");
+                    string cls = GuidStr(psBytes.AsSpan(ik.PayloadOff + 20));
+                    if (qclasses.TryGetValue(cls, out var qname))
+                    {
+                        rep?.PersonalStashQuestItemsRemoved.Add(qname);
+                        continue;
+                    }
+                    keptItems++;
+                    invMs.Write(psBytes, ik.Off, 6 + ik.Len);
+                }
+                else invMs.Write(psBytes, ik.Off, 6 + ik.Len);
+            }
+            if (keptItems == 0) continue;   // KCD2 omits the 0x0000 node when the personal stash is empty
+            if (rep is not null) rep.PersonalStashItemsJoiner += keptItems;
+
+            var newInvPay = invMs.ToArray();
+            using var stPayMs = new MemoryStream();
+            stPayMs.Write(psBytes, st.PayloadOff, 16);
+            for (int i = 0; i < stKids.Count; i++)
+            {
+                if (i == invIdx)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0005);
+                    BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], (uint)newInvPay.Length);
+                    stPayMs.Write(hdr);
+                    stPayMs.Write(newInvPay);
+                }
+                else stPayMs.Write(psBytes, stKids[i].Off, 6 + stKids[i].Len);
+            }
+            var newStPay = stPayMs.ToArray();
+            BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0000);
+            BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], (uint)newStPay.Length);
+            outMs.Write(hdr);
+            outMs.Write(newStPay);
+        }
+        return outMs.ToArray();
+    }
+
+    private static byte[] MergePersonalStash(byte[] hostRaw, HenryParts parts, Dictionary<string, string> qclasses, SpliceReport? rep)
+    {
+        var hNode = PathNodes(hostRaw, StashBlock)[^1];
+        var hPay = Payload(hostRaw, hNode);
+        using var ms = new MemoryStream();
+        foreach (var k in StashNodes(hPay))
+            if (!IsPersonalStash(StashNodeId(hPay, k))) ms.Write(hPay, k.Off, 6 + k.Len);
+        if (parts.Extensions.TryGetValue(PersonalStashExtensionKey, out var psBytes) && psBytes.Length > 0)
+            ms.Write(CleanPersonalStash(psBytes, qclasses, rep));
+        return ms.ToArray();
+    }
+
+    private static HashSet<string> HenryItemSet(byte[] raw)
+    {
+        var set = RecordItemSet(NodeBytes(raw, HenryChain(raw)[^1]));
+        set.UnionWith(PersonalStashItemSet(ExtractPersonalStash(raw)));
+        return set;
+    }
 
     private static HashSet<string> RecordItemSet(byte[] rec) =>
         HasItemList(rec) ? InventoryItems(rec).Items.Select(i => i.Inst).ToHashSet() : [];
@@ -786,6 +949,8 @@ public static partial class WhsSave
         var jobs = new List<(ushort[]? Tags, byte[] Payload)>();
         for (int i = 0; i < SideBlocks.Length; i++)
             if (parts.Side[i] is byte[] sp) jobs.Add((SideBlocks[i], sp));
+        if (PathGet(hostRaw, StashBlock) is not null)
+            jobs.Add((StashBlock, MergePersonalStash(hostRaw, parts, qclasses, rep)));
         jobs.Add((KeyBlock, MergeKeys(hostRaw, HenryItemSet(hostRaw), parts.KeyEntries, rep)));
         var henry = BuildHenry(hostRaw, parts, qclasses, mode, rep);
         jobs.Add((null, henry.AsSpan(6).ToArray()));
@@ -850,7 +1015,7 @@ public static partial class WhsSave
         byte[] h = hc.Raw, o = oc.Raw;
         if (!hc.DescBytes.AsSpan().SequenceEqual(oc.DescBytes)) fails.Add("description header differs from the host");
 
-        var spliced = new List<string> { "01f4/01f8/7302/000b", "01f4/01f8/7308/3529/1161" };
+        var spliced = new List<string> { "01f4/01f8/7302/0006", "01f4/01f8/7302/000b", "01f4/01f8/7308/3529/1161" };
         for (int i = 0; i < SideBlocks.Length; i++)
             if (parts.Side[i] is not null) spliced.Add(PathText(SideBlocks[i]));
         bool Under(string k) => spliced.Any(s => k == s || k.StartsWith(s + "/", StringComparison.Ordinal));
@@ -866,6 +1031,37 @@ public static partial class WhsSave
             if (parts.Side[i] is not byte[] want) continue;
             if (PathGet(o, SideBlocks[i]) is not Node n || !Payload(o, n).AsSpan().SequenceEqual(want))
                 fails.Add("spliced block is not the joiner's: " + PathText(SideBlocks[i]));
+        }
+
+        if (PathGet(h, StashBlock) is Node hs0)
+        {
+            if (PathGet(o, StashBlock) is not Node os0)
+                fails.Add("EntityModule 0006 stash block missing in output");
+            else
+            {
+                try
+                {
+                    var hPay = Payload(h, hs0);
+                    var oPay = Payload(o, os0);
+                    var hWorld = StashNodes(hPay).Where(k => !IsPersonalStash(StashNodeId(hPay, k))).Select(k => NodeBytes(hPay, k)).ToList();
+                    var oNodes = StashNodes(oPay);
+                    var oWorld = oNodes.Where(k => !IsPersonalStash(StashNodeId(oPay, k))).Select(k => NodeBytes(oPay, k)).ToList();
+                    if (hWorld.Count != oWorld.Count || hWorld.Zip(oWorld).Any(p => !p.First.AsSpan().SequenceEqual(p.Second)))
+                        fails.Add("EntityModule 0006 non-personal stashes differ from the host");
+                    var oPersonal = oNodes.Where(k => IsPersonalStash(StashNodeId(oPay, k))).SelectMany(k => NodeBytes(oPay, k)).ToArray();
+                    var expPersonal = parts.Extensions.TryGetValue(PersonalStashExtensionKey, out var psExt) && psExt.Length > 0
+                        ? CleanPersonalStash(psExt, qclasses, null)
+                        : [];
+                    if (!oPersonal.AsSpan().SequenceEqual(expPersonal))
+                        fails.Add("EntityModule 0006 personal stash is not the expected joiner stash");
+                    else if (!oPay.AsSpan().SequenceEqual(MergePersonalStash(h, parts, qclasses, null)))
+                        fails.Add("EntityModule 0006 stash order differs from expected");
+                }
+                catch (InvalidDataException ex)
+                {
+                    fails.Add("EntityModule 0006 invalid: " + ex.Message);
+                }
+            }
         }
 
         var k0 = PathNodes(o, KeyBlock)[^1];

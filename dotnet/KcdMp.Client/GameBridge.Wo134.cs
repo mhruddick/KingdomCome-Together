@@ -396,11 +396,21 @@ public partial class GameBridge
     }
 
     /// <summary>WO-125: the restore picked this snapshot (null = a first join): its chest ledger is the joiner's again.</summary>
-    private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = s;
+    private void Wo134OnRestorePick(HenryStore.Snapshot? s)
+    {
+        lock (_w134Gate)
+        {
+            _w134RestoreSnap = s;
+            _w134ApplyTag = null;
+            _w134RxLedger = null;
+            _w134RxParts.Clear();
+        }
+    }
 
-    /// <summary>After the join's Ready: the joiner's ledger is the restored one; wait for the host's, then apply both.</summary>
+    /// <summary>Before the join's Ready goes out: the joiner's ledger is the restored one; wait for the host's, then apply both.</summary>
     private void Wo134AfterReady(string tag)
     {
+        bool applyNow;
         lock (_w134Gate)
         {
             string? json = _w134RestoreSnap is { } s && s.Tag == tag ? _henry.LoadChestLedger(s) : null;
@@ -409,9 +419,14 @@ public partial class GameBridge
             _w134RestoreSnap = null;
             _w134ApplyTag = tag;
             _w134ApplySinceUtc = DateTime.UtcNow;
-            _w134RxLedger = null;
-            _w134RxParts.Clear();
+            if (_w134RxLedger is not null && !_w206.AdmitWorld(Wo206Cat.Loot, _w134RxStamp))
+            {
+                _w134RxLedger = null;
+                _w134RxParts.Clear();
+            }
+            applyNow = _w134RxLedger is not null;
         }
+        if (applyNow) _ = Wo134ApplyIfReadyAsync(timeout: false);
     }
 
     /// <summary>WO-125: a snapshot was stored -- its chest ledger goes beside it.</summary>
@@ -448,6 +463,7 @@ public partial class GameBridge
             // WO-206 E: a host ledger of a world the host has since left (it loaded after sending it) is not applied
             if (hostIn && !Wo206Admit(Wo206Cat.Loot, stamp, $"the host's chest ledger ({_w134RxLedger!.Entries.Count} entries)")) { _w134RxLedger = null; hostIn = false; }
             hostLedger = _w134RxLedger ?? new Wo134Rules.Ledger();
+            _w134RxLedger = null;
             ownLedger = _w134JoinerLedger.Clone();
             rows = Wo134Rules.JoinRows(hostLedger, ownLedger);
         }
