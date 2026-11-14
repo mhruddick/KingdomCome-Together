@@ -1401,11 +1401,10 @@ public static partial class Protocol
     // ---- Horse identity layer (WO-38 Phase 5) ----
 
     /// <summary>
-    /// Upper bound on a horse entity name in a HorseInfo packet. Same cap and
-    /// same reasoning as <see cref="MaxNpcNameLen"/> -- it is the same kind of
-    /// authored entity name.
+    /// Upper bound on a horse entity name in a HorseInfo packet. Raised to 120 in Milestone 3
+    /// to accommodate bracketed Trosky horse names (e.g. horse[animalcare/horseCare6_&lt;guid&gt;]).
     /// </summary>
-    public const int MaxHorseNameLen = MaxNpcNameLen;
+    public const int MaxHorseNameLen = 120;
 
     /// <summary>
     /// How often the mod re-emits the mounted-horse identity while mounted,

@@ -182,6 +182,7 @@ public partial class GameBridge
         }
         try
         {
+            await M3BeforeHostSaveAsync();
             string? dir = _savesDir ??= ResolveSavesDir();
             DateTime since = DateTime.UtcNow.AddSeconds(-1);
             byte[] w = Encoding.ASCII.GetBytes(why);
@@ -214,7 +215,11 @@ public partial class GameBridge
             if (why == Wo192Rules.AutosaveWhy) Wo192OnSaveResult("saved", file);
             await ExecLuaAsync($"if KCD2MP_W178SaveDone then KCD2MP_W178SaveDone(\"saved\", \"{EscapeLua(file)}\", \"{why}\") end");
         }
-        finally { Volatile.Write(ref _w178SaveBusy, 0); }
+        finally
+        {
+            try { await M3AfterHostSaveAsync(); } catch { }
+            Volatile.Write(ref _w178SaveBusy, 0);
+        }
     }
 
     /// <summary>The first engine-named save written after <paramref name="since"/> that verifies, as playlineN/x.whs; null when none in time.</summary>

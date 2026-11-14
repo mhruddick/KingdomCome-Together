@@ -334,10 +334,10 @@ uint8_t handle(const uint8_t* body, size_t len, uint8_t* out, size_t cap, size_t
             char ctx[64]{};
             std::memcpy(ctx, body + 3, cl);
             const size_t nl = body[3 + cl];
-            if (nl < 1 || nl > 63 || len != 3 + cl + 1 + nl) return kRBadRequest;
-            char name[64]{};
+            if (nl < 1 || nl > 120 || len != 3 + cl + 1 + nl) return kRBadRequest;
+            char name[128]{};
             std::memcpy(name, body + 4 + cl, nl);
-            if (!wo139rules::is_engine_name(name, nl)) return kRBadRequest;
+            if (!wo139rules::is_entity_name(name, nl)) return kRBadRequest;
             *outLen = 1;
             if (!wo139rules::context_allowed(ctx)) { out[0] = 4; logf("WO139-CONTEXT %s on %s REFUSED -- not an allowed context", ctx, name); return kROk; }
             const uint32_t eid = hits::eid_of_name(name);

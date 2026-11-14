@@ -761,8 +761,8 @@ do
     mark = #LOG
     KCD2MP_W139HostHorses()
     ev = emitted("w139_horses", mark)
-    check("H: the horses the host's Henry may ride: his own and a legal one, not a townsperson's",
-        #ev == 1 and ev[1]:find("host_horse", 1, true) and ev[1]:find("lent_horse", 1, true) and not ev[1]:find("tzel_horse_1", 1, true), ev[1])
+    check("H: free world horses are shared with joiners, while the host's personal horse and a townsperson's stay private",
+        #ev == 1 and not ev[1]:find("host_horse", 1, true) and ev[1]:find("lent_horse", 1, true) and not ev[1]:find("tzel_horse_1", 1, true), ev[1])
     -- the keepers ready to sell (field 0.45.8: the joiner had no Trade option)
     local keeper = mkNpc("tzel_trader", 108, 104, 10, ZEL, { ctx = { shop_sellerReadyToSell = true } })
     local closed = mkNpc("tzel_baker", 109, 104, 10, ZEL, { ctx = { activity_seller = true } })
