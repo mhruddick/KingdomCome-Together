@@ -175,7 +175,7 @@ def relay(plan_file=None):
     st = state()
     if procs.matches(st.get('relay')): rig.say('relay already up'); return 0
     exe = os.path.join(mirror.BUILD, 'relay', 'KcdMpServer.exe')
-    argv = [exe, '--port', str(RELAY_PORT), '--urls', 'http://127.0.0.1:%d' % RELAY_HTTP]
+    argv = [exe, '--bind', '127.0.0.1', '--port', str(RELAY_PORT), '--urls', 'http://127.0.0.1:%d' % RELAY_HTTP]
     env = rig.clean_env(test_env())
     if plan_file:
         env['KCDMP_TEST_RELAY_FAULTS'] = '1'

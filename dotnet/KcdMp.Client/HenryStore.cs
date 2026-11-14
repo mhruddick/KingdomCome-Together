@@ -4,6 +4,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace KcdMp.Client;
@@ -52,9 +53,53 @@ public sealed class HenryStore
 
     public const string SourceBring = "bring", SourceFresh = "fresh", SourceSnapshot = "snapshot", SourceJoin = "join", SourceRestore = "restore";
 
+    public sealed record TransferOutEntry(
+        uint DropId,
+        string Class,
+        int Amount,
+        float Health,
+        DateTime ClaimedUtc,
+        long Seq,
+        long RemovedSeq = 0,
+        DateTime? RemovedUtc = null,
+        long SelfPickupSeq = 0,
+        DateTime? SelfPickupUtc = null)
+    {
+        [JsonIgnore]
+        public long EffectiveRemovedSeq => RemovedSeq > 0 ? RemovedSeq : Seq;
+        [JsonIgnore]
+        public DateTime EffectiveRemovedUtc => RemovedUtc ?? ClaimedUtc;
+
+        /// <summary>
+        /// True iff this peer-claimed outgoing drop was present in Henry's saved inventory at the moment
+        /// the snapshot was captured: either before the drop left Henry's inventory (<c>sq &lt; EffectiveRemovedSeq</c>),
+        /// or during an in-flight local self-pickup race before a peer won <c>ItemClaimDown</c>
+        /// (<c>SelfPickupSeq &lt;= sq &lt; Seq</c>).
+        /// </summary>
+        public bool AppliesToSnapshot(long? snapSeq, DateTime snapTakenUtc)
+        {
+            if (snapSeq is long sq && sq > 0 && EffectiveRemovedSeq > 0)
+            {
+                return sq < EffectiveRemovedSeq
+                    || (SelfPickupSeq > 0 && sq >= SelfPickupSeq && Seq > SelfPickupSeq && sq < Seq);
+            }
+            return snapTakenUtc < EffectiveRemovedUtc
+                || (SelfPickupUtc is DateTime spUtc && snapTakenUtc >= spUtc && ClaimedUtc > spUtc && snapTakenUtc < ClaimedUtc);
+        }
+    }
+
+    public sealed record SnapshotCapture(
+        string Tag,
+        long CaptureSeq,
+        DateTime CapturedUtc,
+        long TokenId = 0);
+
     private readonly Func<DateTime> _now;
     private readonly Action<string> _log;
     private readonly object _gate = new();
+    private readonly Dictionary<(string Tag, uint DropId), (long RemovedSeq, DateTime RemovedUtc, long SelfPickupSeq, DateTime? SelfPickupUtc)> _pendingOutDrops = new();
+    private readonly List<(SnapshotCapture Capture, DateTime CreatedRealtimeUtc)> _activeCaptures = [];
+    private long _nextCaptureTokenId;
 
     public string Root { get; }
 
@@ -142,6 +187,8 @@ public sealed class HenryStore
     /// WO-125 Phase 5: the snapshot paired with the newest save of the host's
     /// current branch that has one (<paramref name="branchNewestFirst"/>: md5s),
     /// else the newest snapshot of the world. A broken snapshot is skipped.
+    /// Any peer-claimed drops recorded after the chosen snapshot was taken are
+    /// deducted automatically so an unpaired disconnect never duplicates items.
     /// </summary>
     public Pick? PickFor(string tag, IReadOnlyList<string> branchNewestFirst)
     {
@@ -150,12 +197,269 @@ public sealed class HenryStore
         foreach (var md5 in branchNewestFirst)
         {
             foreach (var s in all.Where(x => x.Md5 == md5))
-                if (Load(s) is { } p) return new Pick(s, p, pos == 0 ? "paired with the host's newest save" : $"paired with the host's branch save #{pos} (newest = 0)");
+                if (Load(s) is { } p) return ApplyPendingTransfers(tag, s, p, pos == 0 ? "paired with the host's newest save" : $"paired with the host's branch save #{pos} (newest = 0)");
             pos++;
         }
         foreach (var s in all)
-            if (Load(s) is { } p) return new Pick(s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
+            if (Load(s) is { } p) return ApplyPendingTransfers(tag, s, p, branchNewestFirst.Count == 0 ? "newest (the host sent no branch)" : "newest (no snapshot pairs with any save of the host's branch)");
         return null;
+    }
+
+    private string TransfersPath(string tag) => Path.Combine(WorldDir(tag), "transfers.json");
+
+    /// <summary>Peer-claimed outgoing drops recorded for world <paramref name="tag"/>, oldest first.</summary>
+    public List<TransferOutEntry> TransfersOut(string tag)
+    {
+        CheckTag(tag);
+        lock (_gate)
+        {
+            var p = TransfersPath(tag);
+            try
+            {
+                if (!File.Exists(p)) return [];
+                var raw = JsonSerializer.Deserialize<List<TransferOutEntry>>(File.ReadAllText(p));
+                return raw?.Where(e => e.DropId != 0 && e.Amount > 0 && Guid.TryParse(e.Class, out _)).ToList() ?? [];
+            }
+            catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+            {
+                _log($"MP-HENRY world {tag}: transfers.json unreadable ({ex.Message}) -- ignored");
+                return [];
+            }
+        }
+    }
+
+    private DateTime NextMonotonicUtcUnlocked(string tag, DateTime candidate, List<TransferOutEntry>? knownTransfers = null)
+    {
+        if (ReadWorld(tag).LastEventUtc is DateTime lastEvt && candidate <= lastEvt)
+            candidate = lastEvt.AddMilliseconds(1);
+        if (Snapshots(tag).FirstOrDefault()?.TakenUtc is DateTime newestSnapUtc && candidate <= newestSnapUtc)
+            candidate = newestSnapUtc.AddMilliseconds(1);
+        foreach (var kv in _pendingOutDrops)
+        {
+            if (kv.Key.Tag != tag) continue;
+            if (candidate <= kv.Value.RemovedUtc) candidate = kv.Value.RemovedUtc.AddMilliseconds(1);
+            if (kv.Value.SelfPickupUtc is DateTime spUtc && candidate <= spUtc) candidate = spUtc.AddMilliseconds(1);
+        }
+        if (knownTransfers is not null)
+        {
+            foreach (var tr in knownTransfers)
+            {
+                if (candidate <= tr.EffectiveRemovedUtc) candidate = tr.EffectiveRemovedUtc.AddMilliseconds(1);
+                if (tr.SelfPickupUtc is DateTime trSpUtc && candidate <= trSpUtc) candidate = trSpUtc.AddMilliseconds(1);
+                if (candidate <= tr.ClaimedUtc) candidate = tr.ClaimedUtc.AddMilliseconds(1);
+            }
+        }
+        return candidate;
+    }
+
+    private void PruneExpiredActiveCapturesUnlocked()
+    {
+        var cutoff = DateTime.UtcNow.AddMinutes(-10);
+        _activeCaptures.RemoveAll(x => x.CreatedRealtimeUtc < cutoff);
+    }
+
+    /// <summary>
+    /// Record the inventory-removal boundary of an outgoing drop when the item leaves Henry's inventory,
+    /// before any peer claim arrives. Snapshots captured after this boundary already exclude <paramref name="dropId"/>.
+    /// </summary>
+    public long NoteOutgoingDrop(string tag, uint dropId)
+    {
+        CheckTag(tag);
+        if (dropId == 0) return 0;
+        lock (_gate)
+        {
+            Directory.CreateDirectory(WorldDir(tag));
+            var removedUtc = NextMonotonicUtcUnlocked(tag, _now());
+            long seq = 0;
+            UpdateWorld(tag, w =>
+            {
+                seq = ++w.NextSeq;
+                if (w.LastEventUtc is null || removedUtc > w.LastEventUtc.Value) w.LastEventUtc = removedUtc;
+            });
+            _pendingOutDrops[(tag, dropId)] = (seq, removedUtc, 0, null);
+            return seq;
+        }
+    }
+
+    /// <summary>
+    /// Record when the player tentatively picks their own outgoing drop back up locally (before the relay's
+    /// ItemClaimDown settles who won), preserving the original <c>RemovedSeq</c> while opening a tentative
+    /// self-pickup window <c>[SelfPickupSeq, Seq)</c> in case a peer wins the claim race.
+    /// </summary>
+    public long NoteSelfPickupAttempt(string tag, uint dropId)
+    {
+        CheckTag(tag);
+        if (dropId == 0) return 0;
+        lock (_gate)
+        {
+            if (!_pendingOutDrops.TryGetValue((tag, dropId), out var pending)) return 0;
+            if (pending.SelfPickupSeq > 0) return pending.SelfPickupSeq;
+            Directory.CreateDirectory(WorldDir(tag));
+            var pickupUtc = NextMonotonicUtcUnlocked(tag, _now());
+            long seq = 0;
+            UpdateWorld(tag, w =>
+            {
+                seq = ++w.NextSeq;
+                if (w.LastEventUtc is null || pickupUtc > w.LastEventUtc.Value) w.LastEventUtc = pickupUtc;
+            });
+            _pendingOutDrops[(tag, dropId)] = (pending.RemovedSeq, pending.RemovedUtc, seq, pickupUtc);
+            return seq;
+        }
+    }
+
+    /// <summary>Clear an outgoing drop's early removal boundary once ItemClaimDown confirms the player won their own drop back.</summary>
+    public void ClearOutgoingDrop(string tag, uint dropId)
+    {
+        CheckTag(tag);
+        lock (_gate) _pendingOutDrops.Remove((tag, dropId));
+    }
+
+    /// <summary>Clear all session-scoped pending outgoing drop boundaries on disconnect/reconnect.</summary>
+    public void ClearPendingOutgoingDrops()
+    {
+        lock (_gate) _pendingOutDrops.Clear();
+    }
+
+    /// <summary>
+    /// Capture the game-state boundary for a snapshot at the moment Henry's state is sampled in-game,
+    /// decoupled from when the .hblk file finishes writing/storing to disk.
+    /// </summary>
+    public SnapshotCapture CaptureBoundary(string tag)
+    {
+        CheckTag(tag);
+        lock (_gate)
+        {
+            Directory.CreateDirectory(WorldDir(tag));
+            PruneExpiredActiveCapturesUnlocked();
+            var capturedUtc = NextMonotonicUtcUnlocked(tag, _now());
+            long seq = 0;
+            UpdateWorld(tag, w =>
+            {
+                seq = ++w.NextSeq;
+                if (w.LastEventUtc is null || capturedUtc > w.LastEventUtc.Value) w.LastEventUtc = capturedUtc;
+            });
+            var cap = new SnapshotCapture(tag, seq, capturedUtc, ++_nextCaptureTokenId);
+            _activeCaptures.Add((cap, DateTime.UtcNow));
+            return cap;
+        }
+    }
+
+    /// <summary>Release an unstored <see cref="SnapshotCapture"/> when a snapshot attempt aborts without storing.</summary>
+    public void ReleaseCapture(SnapshotCapture? capture)
+    {
+        if (capture is null) return;
+        lock (_gate) _activeCaptures.RemoveAll(x => x.Capture.TokenId == capture.TokenId);
+    }
+
+    private void WriteTransfersUnlocked(string tag, List<TransferOutEntry> list)
+    {
+        var p = TransfersPath(tag);
+        if (list.Count == 0)
+        {
+            TryDelete(p);
+            return;
+        }
+        File.WriteAllText(p + ".part", JsonSerializer.Serialize(list));
+        File.Move(p + ".part", p, overwrite: true);
+    }
+
+    private List<TransferOutEntry> FilterRetainedTransfersUnlocked(string tag, List<TransferOutEntry> list)
+    {
+        if (list.Count == 0) return list;
+        PruneExpiredActiveCapturesUnlocked();
+        var snaps = Snapshots(tag);
+        var activeForTag = _activeCaptures.Where(x => x.Capture.Tag == tag).Select(x => x.Capture).ToList();
+        if (snaps.Count == 0 && activeForTag.Count == 0) return list;
+
+        var w = ReadWorld(tag);
+        bool AppliesToAnyRetainedOrActive(TransferOutEntry t)
+        {
+            foreach (var cap in activeForTag)
+                if (t.AppliesToSnapshot(cap.CaptureSeq, cap.CapturedUtc)) return true;
+            foreach (var s in snaps)
+            {
+                long? sq = w.SnapshotSeq.TryGetValue(s.File, out long v) && v > 0 ? v : null;
+                if (t.AppliesToSnapshot(sq, s.TakenUtc)) return true;
+            }
+            return false;
+        }
+
+        return list
+            .Where(AppliesToAnyRetainedOrActive)
+            .OrderBy(t => t.EffectiveRemovedSeq)
+            .ThenBy(t => t.Seq)
+            .ThenBy(t => t.ClaimedUtc)
+            .ToList();
+    }
+
+    private void PruneTransfersUnlocked(string tag)
+    {
+        var list = TransfersOut(tag);
+        if (list.Count == 0) return;
+        var kept = FilterRetainedTransfersUnlocked(tag, list);
+        if (kept.Count != list.Count)
+            WriteTransfersUnlocked(tag, kept);
+    }
+
+    /// <summary>Record an outgoing item drop claimed by a peer in world <paramref name="tag"/> (atomic .part + rename, zero game hitch).</summary>
+    public TransferOutEntry? RecordTransferOut(string tag, uint dropId, string itemClass, int amount, float health)
+    {
+        CheckTag(tag);
+        if (dropId == 0 || amount <= 0 || !Guid.TryParse(itemClass, out var clsGuid)) return null;
+        lock (_gate)
+        {
+            Directory.CreateDirectory(WorldDir(tag));
+            var list = TransfersOut(tag);
+            var claimedUtc = NextMonotonicUtcUnlocked(tag, _now(), list);
+            long claimSeq = 0;
+            UpdateWorld(tag, w =>
+            {
+                claimSeq = ++w.NextSeq;
+                if (w.LastEventUtc is null || claimedUtc > w.LastEventUtc.Value) w.LastEventUtc = claimedUtc;
+            });
+            long removedSeq = claimSeq;
+            DateTime removedUtc = claimedUtc;
+            long selfPickupSeq = 0;
+            DateTime? selfPickupUtc = null;
+            if (_pendingOutDrops.Remove((tag, dropId), out var pending))
+            {
+                removedSeq = pending.RemovedSeq;
+                removedUtc = pending.RemovedUtc;
+                selfPickupSeq = pending.SelfPickupSeq;
+                selfPickupUtc = pending.SelfPickupUtc;
+            }
+            var entry = new TransferOutEntry(
+                dropId, clsGuid.ToString("D"), amount, health,
+                claimedUtc, claimSeq, removedSeq, removedUtc, selfPickupSeq, selfPickupUtc);
+            list.Add(entry);
+            list = FilterRetainedTransfersUnlocked(tag, list);
+            WriteTransfersUnlocked(tag, list);
+            _log($"MP-HENRY world {tag}: recorded peer-claimed drop {dropId} ({entry.Class[..8]} x{amount}, removed_seq={removedSeq}, self_pickup_seq={selfPickupSeq}, claim_seq={claimSeq})");
+            return entry;
+        }
+    }
+
+    private Pick ApplyPendingTransfers(string tag, Snapshot s, WhsSave.HenryParts p, string how)
+    {
+        var transfers = TransfersOut(tag);
+        if (transfers.Count == 0) return new Pick(s, p, how);
+        long? snapSeq = null;
+        lock (_gate)
+        {
+            if (ReadWorld(tag).SnapshotSeq.TryGetValue(s.File, out long sq) && sq > 0) snapSeq = sq;
+        }
+        var applicable = transfers
+            .Where(t => t.AppliesToSnapshot(snapSeq, s.TakenUtc))
+            .Select(t => (t.Class, t.Amount))
+            .ToList();
+        if (applicable.Count == 0) return new Pick(s, p, how);
+        int deducted = WhsSave.ApplyTransferredOut(p, applicable);
+        if (deducted > 0)
+        {
+            _log($"MP-HENRY world {tag}: applied {applicable.Count} peer-claimed transfer(s) (-{deducted} item(s)) onto snapshot {s.Short}");
+            how += $" (-{deducted} transferred-out item(s))";
+        }
+        return new Pick(s, p, how);
     }
 
     // ------------------------------------------------------------------ write
@@ -166,9 +470,10 @@ public sealed class HenryStore
     /// Then the world is pruned to the pairs of its newest <see cref="KeepPerWorld"/>
     /// host saves, at most <see cref="KeepPerHostSave"/> each, oldest first.
     /// </summary>
-    public Snapshot Store(string tag, WhsSave.HenryParts parts, string md5, string source, string detail)
+    public Snapshot Store(string tag, WhsSave.HenryParts parts, string md5, string source, string detail, SnapshotCapture? capture = null)
     {
         CheckTag(tag);
+        if (capture is not null && capture.Tag != tag) throw new ArgumentException("capture belongs to a different world tag");
         md5 = md5.ToLowerInvariant();
         if (!Regex.IsMatch(md5, "^[0-9a-f]{32}$")) throw new ArgumentException("md5 must be 32 hex characters");
         if (!Regex.IsMatch(source, "^[a-z]+$")) throw new ArgumentException("bad source");
@@ -177,11 +482,12 @@ public sealed class HenryStore
             var dir = WorldDir(tag);
             Directory.CreateDirectory(dir);
             var data = WhsSave.SerializeBlock(parts);
-            var t = _now();
+            var t = capture?.CapturedUtc ?? NextMonotonicUtcUnlocked(tag, _now());
             string name;
             int bump = 0;
             do name = $"snap-{t.AddMilliseconds(bump++):yyyyMMddHHmmssfff}-{md5}-{source}.hblk";
             while (File.Exists(Path.Combine(dir, name)));
+            var takenUtc = t.AddMilliseconds(bump - 1);
             string final = Path.Combine(dir, name), part = final + ".part";
             using (var fs = new FileStream(part, FileMode.CreateNew, FileAccess.Write))
             {
@@ -196,12 +502,17 @@ public sealed class HenryStore
                 throw new IOException("the snapshot does not read back as written");
             }
             WhsSave.ParseBlock(back);   // throws if it would not load later
-            var snap = new Snapshot(tag, name, md5, t, source, data.Length);
+            var snap = new Snapshot(tag, name, md5, takenUtc, source, data.Length);
             UpdateWorld(tag, w =>
             {
                 w.FirstSource ??= source;
                 w.Pairs[name] = detail;
+                long capSeq = capture?.CaptureSeq ?? ++w.NextSeq;
+                if (capSeq > w.NextSeq) w.NextSeq = capSeq;
+                w.SnapshotSeq[name] = capSeq;
+                if (w.LastEventUtc is null || takenUtc > w.LastEventUtc.Value) w.LastEventUtc = takenUtc;
             });
+            if (capture is not null) _activeCaptures.RemoveAll(x => x.Capture.TokenId == capture.TokenId);
             _log($"MP-HENRY world {tag}: stored {source} snapshot {snap.Short} ({data.Length} B, read back: hash + parse ok){(detail != "" ? " -- " + detail : "")}");
             Prune(tag);
             return snap;
@@ -254,9 +565,14 @@ public sealed class HenryStore
             else { kept[s.Md5] = n + 1; continue; }
             TryDelete(Path.Combine(WorldDir(tag), s.File));
             TryDelete(ChestLedgerPath(s));
-            UpdateWorld(tag, w => w.Pairs.Remove(s.File));
+            UpdateWorld(tag, w =>
+            {
+                w.Pairs.Remove(s.File);
+                w.SnapshotSeq.Remove(s.File);
+            });
             _log($"MP-HENRY world {tag}: pruned snapshot {s.Short} ({why})");
         }
+        PruneTransfersUnlocked(tag);
     }
 
     public void MarkJoined(string tag) => UpdateWorld(tag, w => w.LastJoinedUtc = _now());
@@ -346,8 +662,11 @@ public sealed class HenryStore
     private sealed class WorldFile
     {
         public DateTime LastJoinedUtc { get; set; }
+        public DateTime? LastEventUtc { get; set; }
         public string? FirstSource { get; set; }
         public Dictionary<string, string> Pairs { get; set; } = new(StringComparer.Ordinal);
+        public long NextSeq { get; set; }
+        public Dictionary<string, long> SnapshotSeq { get; set; } = new(StringComparer.Ordinal);
         /// <summary>WO-157: the host whose world this is (null before WO-157).</summary>
         public uint? HostKey { get; set; }
         /// <summary>WO-157: the plain seed tag of a host-qualified folder.</summary>

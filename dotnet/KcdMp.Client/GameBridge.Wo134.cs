@@ -446,7 +446,7 @@ public partial class GameBridge
     /// <summary>WO-125 restore hook (M2: per-player chest ledger sidecar retired).</summary>
     private void Wo134OnRestorePick(HenryStore.Snapshot? s) => _w134RestoreSnap = null;
 
-    /// <summary>After the join's Ready (M2: per-player chest ledger apply retired; host's .whs save is the chest truth).</summary>
+    /// <summary>Before the join's Ready (M2: per-player chest ledger apply retired; host's .whs save is the chest truth).</summary>
     private void Wo134AfterReady(string tag)
     {
         lock (_w134Gate)

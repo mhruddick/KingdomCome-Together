@@ -40,6 +40,8 @@ public static partial class WhsSave
         public byte[]?[] Side = new byte[]?[6];
         /// <summary>0x05AD key-binding entries (whole TLV nodes) naming one of this Henry's own items.</summary>
         public List<byte[]> KeyEntries = [];
+        /// <summary>Named extension blobs carried by v2+ Henry blocks (empty on v1 blocks).</summary>
+        public SortedDictionary<string, byte[]> Extensions = new(StringComparer.Ordinal);
         public string Build = "";
         public uint? Seed;
         public string Origin = OriginSave;
@@ -55,7 +57,10 @@ public static partial class WhsSave
     {
         var rec = NodeBytes(raw, HenryChain(raw)[^1]);
         var items = RecordItemSet(rec);
+        var ps = ExtractPersonalStash(raw);
+        items.UnionWith(PersonalStashItemSet(ps));
         var p = new HenryParts { Record = rec, Build = build, Seed = ReadSeed(raw), Origin = origin };
+        p.Extensions[PersonalStashExtensionKey] = ps;
         for (int i = 0; i < SideBlocks.Length; i++) p.Side[i] = Payload(raw, PathNodes(raw, SideBlocks[i])[^1]);
         foreach (var (entry, key) in KeyEntries(raw).Entries)
             if (items.Contains(key)) p.KeyEntries.Add(entry);
@@ -73,25 +78,34 @@ public static partial class WhsSave
     // ------------------------------------------------------------------ the stored block
 
     private static readonly byte[] BlockMagic = "KCDMPHB1"u8.ToArray();
-    private const int BlockVersion = 1;
+    public const int BlockVersion = 2;
+    public const int MaxBlockExtensions = 256;
+    public const int MaxBlockExtensionBytes = 64 * 1024 * 1024;
 
     /// <summary>
     /// <code>
-    ///   "KCDMPHB1" [u32 version=1] [str build] [u8 hasSeed][u32 seed] [str origin]
+    ///   "KCDMPHB1" [u32 version=2] [str build] [u8 hasSeed][u32 seed] [str origin]
     ///   [u32 len][player_henry record]
     ///   [u8 6] { [i32 len (-1 = the host's block stays)][payload] } x6
     ///   [u32 n] { [u16 len][0x05AD entry] } x n
+    ///   [i32 extCount] { [u16 keyLen][utf8 key][i32 valLen][bytes] } x extCount   (v2+)
     ///   [32-byte SHA-256 of everything before]
     /// </code>
     /// No save header, no world: nothing but Henry.
     /// </summary>
-    public static byte[] SerializeBlock(HenryParts p)
+    public static byte[] SerializeBlock(HenryParts p) => SerializeBlockCore(p, BlockVersion);
+
+    public static byte[] SerializeBlockV1(HenryParts p) => SerializeBlockCore(p, 1);
+
+    private static byte[] SerializeBlockCore(HenryParts p, int version)
     {
+        if (version >= 2 && p.Extensions.Count > MaxBlockExtensions)
+            throw new InvalidDataException($"Henry block extension count {p.Extensions.Count} exceeds {MaxBlockExtensions}");
         using var ms = new MemoryStream();
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
             w.Write(BlockMagic);
-            w.Write(BlockVersion);
+            w.Write(version);
             void Str(string s) { var b = Encoding.UTF8.GetBytes(s); w.Write((ushort)b.Length); w.Write(b); }
             Str(p.Build);
             w.Write((byte)(p.Seed is null ? 0 : 1));
@@ -107,6 +121,21 @@ public static partial class WhsSave
             }
             w.Write(p.KeyEntries.Count);
             foreach (var e in p.KeyEntries) { w.Write((ushort)e.Length); w.Write(e); }
+            if (version >= 2)
+            {
+                w.Write(p.Extensions.Count);
+                foreach (var (ek, ev) in p.Extensions)
+                {
+                    if (string.IsNullOrEmpty(ek)) throw new InvalidDataException("Henry block extension key must not be empty");
+                    var kb = Encoding.UTF8.GetBytes(ek);
+                    if (kb.Length > ushort.MaxValue) throw new InvalidDataException("Henry block extension key length out of range");
+                    if (ev is null || ev.Length > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block extension value length out of range");
+                    w.Write((ushort)kb.Length);
+                    w.Write(kb);
+                    w.Write(ev.Length);
+                    w.Write(ev);
+                }
+            }
         }
         var body = ms.ToArray();
         var o = new byte[body.Length + 32];
@@ -115,7 +144,7 @@ public static partial class WhsSave
         return o;
     }
 
-    /// <summary>Parse and fully check a stored block. Throws <see cref="InvalidDataException"/> on anything wrong.</summary>
+    /// <summary>Parse and fully check a stored block (v1 or v2). Throws <see cref="InvalidDataException"/> on anything wrong.</summary>
     public static HenryParts ParseBlock(byte[] b)
     {
         if (b.Length < BlockMagic.Length + 4 + 32 || !b.AsSpan(0, BlockMagic.Length).SequenceEqual(BlockMagic))
@@ -124,12 +153,20 @@ public static partial class WhsSave
             throw new InvalidDataException("Henry block hash mismatch");
         var p = new HenryParts();
         using var r = new BinaryReader(new MemoryStream(b, 0, b.Length - 32), Encoding.UTF8);
+        byte[] ExactBytes(int len)
+        {
+            if (len == 0) return [];
+            if (len < 0 || r.BaseStream.Length - r.BaseStream.Position < len) throw new InvalidDataException("Henry block truncated");
+            var buf = r.ReadBytes(len);
+            if (buf.Length != len) throw new InvalidDataException("Henry block truncated");
+            return buf;
+        }
         try
         {
-            r.ReadBytes(BlockMagic.Length);
+            ExactBytes(BlockMagic.Length);
             int ver = r.ReadInt32();
-            if (ver != BlockVersion) throw new InvalidDataException($"Henry block version {ver}");
-            string Str() => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
+            if (ver is not (1 or BlockVersion)) throw new InvalidDataException($"Henry block version {ver}");
+            string Str() => Encoding.UTF8.GetString(ExactBytes(r.ReadUInt16()));
             p.Build = Str();
             bool hasSeed = r.ReadByte() == 1;
             uint seed = r.ReadUInt32();
@@ -137,20 +174,34 @@ public static partial class WhsSave
             p.Origin = Str();
             int rl = r.ReadInt32();
             if (rl < 38 || rl > 16 * 1024 * 1024) throw new InvalidDataException("Henry block record length out of range");
-            p.Record = r.ReadBytes(rl);
+            p.Record = ExactBytes(rl);
             int n = r.ReadByte();
             if (n != SideBlocks.Length) throw new InvalidDataException($"Henry block carries {n} side blocks, not {SideBlocks.Length}");
             p.Side = new byte[]?[n];
             for (int i = 0; i < n; i++)
             {
                 int l = r.ReadInt32();
-                if (l < -1 || l > 64 * 1024 * 1024) throw new InvalidDataException("Henry block side length out of range");
-                p.Side[i] = l < 0 ? null : r.ReadBytes(l);
-                if (l > 0 && p.Side[i]!.Length != l) throw new InvalidDataException("Henry block truncated");
+                if (l < -1 || l > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block side length out of range");
+                p.Side[i] = l < 0 ? null : ExactBytes(l);
             }
             int k = r.ReadInt32();
             if (k < 0 || k > 100000) throw new InvalidDataException("Henry block key count out of range");
-            for (int i = 0; i < k; i++) p.KeyEntries.Add(r.ReadBytes(r.ReadUInt16()));
+            for (int i = 0; i < k; i++) p.KeyEntries.Add(ExactBytes(r.ReadUInt16()));
+            if (ver >= 2)
+            {
+                int extCount = r.ReadInt32();
+                if (extCount < 0 || extCount > MaxBlockExtensions) throw new InvalidDataException("Henry block extension count out of range");
+                for (int i = 0; i < extCount; i++)
+                {
+                    int keyLen = r.ReadUInt16();
+                    if (keyLen == 0) throw new InvalidDataException("Henry block extension key must not be empty");
+                    string key = Encoding.UTF8.GetString(ExactBytes(keyLen));
+                    int valLen = r.ReadInt32();
+                    if (valLen < 0 || valLen > MaxBlockExtensionBytes) throw new InvalidDataException("Henry block extension value length out of range");
+                    var val = ExactBytes(valLen);
+                    if (!p.Extensions.TryAdd(key, val)) throw new InvalidDataException($"Henry block duplicate extension key '{key}'");
+                }
+            }
             if (r.BaseStream.Position != r.BaseStream.Length) throw new InvalidDataException("Henry block has trailing bytes");
         }
         catch (EndOfStreamException) { throw new InvalidDataException("Henry block truncated"); }
@@ -465,7 +516,328 @@ public static partial class WhsSave
         }
         if (a.KeyEntries.Count != b.KeyEntries.Count || a.KeyEntries.Zip(b.KeyEntries).Any(p => !p.First.AsSpan().SequenceEqual(p.Second)))
             o.Add($"keys ({a.KeyEntries.Count} vs {b.KeyEntries.Count})");
+        foreach (var k in a.Extensions.Keys.Union(b.Extensions.Keys).OrderBy(x => x, StringComparer.Ordinal))
+            if (!a.Extensions.TryGetValue(k, out var ex) || !b.Extensions.TryGetValue(k, out var ey) || !ex.AsSpan().SequenceEqual(ey))
+                o.Add($"ext {k} ({(a.Extensions.TryGetValue(k, out var ex2) ? ex2.Length : -1)} vs {(b.Extensions.TryGetValue(k, out var ey2) ? ey2.Length : -1)} B)");
         return o;
+    }
+
+    // ------------------------------------------------------------------ transferred-out drop deduction
+
+    /// <summary>
+    /// Deduct items that this joiner dropped and a peer claimed after <paramref name="parts"/>'s snapshot was taken.
+    /// Prefers unequipped stacks in Henry's inventory (0x1301/0x0007), cleans equipment presets (0x1301/0x0006) and
+    /// 000B key bindings for any fully removed item instances, and falls back to personal_stash if needed.
+    /// Returns total item pieces deducted.
+    /// </summary>
+    public static int ApplyTransferredOut(HenryParts parts, IReadOnlyList<(string Class, int Amount)> transfers)
+    {
+        if (transfers.Count == 0) return 0;
+        var needByClass = new Dictionary<string, int>(StringComparer.Ordinal);
+        var classOrder = new List<string>();
+        foreach (var (cls, amt) in transfers)
+        {
+            if (amt <= 0 || !Guid.TryParse(cls, out var cg)) continue;
+            string norm = cg.ToString("D");
+            if (!needByClass.ContainsKey(norm)) classOrder.Add(norm);
+            needByClass[norm] = needByClass.GetValueOrDefault(norm) + amt;
+        }
+        if (needByClass.Count == 0) return 0;
+
+        int totalDeducted = 0;
+        var removedInstances = new HashSet<string>(StringComparer.Ordinal);
+
+        if (HasItemList(parts.Record))
+        {
+            var eqSet = CollectAllEquipmentInstances(parts.Record);
+            var ch = FieldChain(parts.Record, 0x1301, 0x0007);
+            var lst = ch[^1];
+            if (DeductFromItemContainer(parts.Record, lst, classOrder, needByClass, eqSet, removedInstances, ref totalDeducted, out var newInvPay))
+                parts.Record = Replace(parts.Record, ch, newInvPay);
+            if (removedInstances.Count > 0)
+                parts.Record = StripRemovedFromEquipment(parts.Record, removedInstances);
+        }
+
+        if (classOrder.Any(c => needByClass[c] > 0)
+            && parts.Extensions.TryGetValue(PersonalStashExtensionKey, out var psBytes) && psBytes.Length > 0)
+        {
+            parts.Extensions[PersonalStashExtensionKey] = DeductFromPersonalStashBytes(psBytes, classOrder, needByClass, removedInstances, ref totalDeducted);
+        }
+
+        if (removedInstances.Count > 0 && parts.KeyEntries.Count > 0)
+            parts.KeyEntries.RemoveAll(e => e.Length >= 47 && removedInstances.Contains(GuidStr(e.AsSpan(6 + 25, 16))));
+
+        return totalDeducted;
+    }
+
+    private static uint ReadSavedItemAmount(ReadOnlySpan<byte> itemPay, List<Node>? paramNodes)
+    {
+        foreach (var pn in paramNodes ?? [])
+            if (pn.Tag == 0x0000 && pn.Len == 4)
+                return BinaryPrimitives.ReadUInt32LittleEndian(itemPay.Slice(pn.PayloadOff, 4)) + 1u;
+        return 1u;
+    }
+
+    private static byte[] RewriteSavedItemAmount(byte[] itemPay, List<Node>? paramNodes, uint newAmt)
+    {
+        using var ms = new MemoryStream();
+        Span<byte> hdr = stackalloc byte[6];
+        Span<byte> u4 = stackalloc byte[4];
+        ms.Write(itemPay, 0, 36);
+        bool wroteAmt = false;
+        foreach (var pn in paramNodes ?? [])
+        {
+            if (pn.Tag == 0x0000 && pn.Len == 4)
+            {
+                wroteAmt = true;
+                if (newAmt > 1)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0000);
+                    BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], 4u);
+                    BinaryPrimitives.WriteUInt32LittleEndian(u4, newAmt - 1u);
+                    ms.Write(hdr);
+                    ms.Write(u4);
+                }
+            }
+            else ms.Write(itemPay, pn.Off, 6 + pn.Len);
+        }
+        if (!wroteAmt && newAmt > 1)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0000);
+            BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], 4u);
+            BinaryPrimitives.WriteUInt32LittleEndian(u4, newAmt - 1u);
+            ms.Write(hdr);
+            ms.Write(u4);
+        }
+        var pay = ms.ToArray();
+        var node = new byte[6 + pay.Length];
+        BinaryPrimitives.WriteUInt16LittleEndian(node, 0x0001);
+        BinaryPrimitives.WriteUInt32LittleEndian(node.AsSpan(2), (uint)pay.Length);
+        pay.CopyTo(node, 6);
+        return node;
+    }
+
+    private static bool DeductFromItemContainer(
+        byte[] buf,
+        Node container,
+        List<string> classOrder,
+        Dictionary<string, int> needByClass,
+        HashSet<string>? eqSet,
+        HashSet<string> removedInstances,
+        ref int totalDeducted,
+        out byte[] newContainerPayload)
+    {
+        var nodes = container.Len == 0 ? [] : (Children(buf, container.PayloadOff, container.End) ?? []);
+        int count = nodes.Count;
+        var insts = new string?[count];
+        var classes = new string?[count];
+        var amounts = new uint[count];
+        var payloads = new byte[]?[count];
+        var paramLists = new List<Node>?[count];
+        var removed = new bool[count];
+        var modified = new bool[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (nodes[i].Tag != 0x0001 || nodes[i].Len < 36) continue;
+            var b = Payload(buf, nodes[i]);
+            payloads[i] = b;
+            insts[i] = GuidStr(b.AsSpan(0, 16));
+            classes[i] = GuidStr(b.AsSpan(20, 16));
+            paramLists[i] = b.Length > 36 ? Children(b, 36, b.Length) : [];
+            amounts[i] = ReadSavedItemAmount(b, paramLists[i]);
+        }
+
+        bool anyChange = false;
+        foreach (var cls in classOrder)
+        {
+            int want = needByClass[cls];
+            if (want <= 0) continue;
+            var candidates = Enumerable.Range(0, count)
+                .Where(i => classes[i] == cls && !removed[i] && amounts[i] > 0)
+                .OrderBy(i => eqSet is not null && eqSet.Contains(insts[i]!) ? 1 : 0)
+                .ThenBy(i => i)
+                .ToList();
+            foreach (int idx in candidates)
+            {
+                if (want <= 0) break;
+                uint take = (uint)Math.Min(want, (long)amounts[idx]);
+                amounts[idx] -= take;
+                want -= (int)take;
+                totalDeducted += (int)take;
+                anyChange = true;
+                if (amounts[idx] == 0)
+                {
+                    removed[idx] = true;
+                    removedInstances.Add(insts[idx]!);
+                }
+                else modified[idx] = true;
+            }
+            needByClass[cls] = want;
+        }
+
+        if (!anyChange)
+        {
+            newContainerPayload = [];
+            return false;
+        }
+
+        using var ms = new MemoryStream();
+        for (int i = 0; i < count; i++)
+        {
+            if (removed[i]) continue;
+            if (modified[i]) ms.Write(RewriteSavedItemAmount(payloads[i]!, paramLists[i], amounts[i]));
+            else ms.Write(buf, nodes[i].Off, 6 + nodes[i].Len);
+        }
+        newContainerPayload = ms.ToArray();
+        return true;
+    }
+
+    private static HashSet<string> CollectAllEquipmentInstances(byte[] rec)
+    {
+        var set = Equipped(rec);
+        List<Node> eqChain;
+        try { eqChain = FieldChain(rec, 0x1301, 0x0006); }
+        catch (InvalidDataException) { return set; }
+        var eqPay = Payload(rec, eqChain[^1]);
+        foreach (var pr in Children(eqPay, 0, eqPay.Length) ?? [])
+        {
+            if (pr.Tag == 0x0000) continue;
+            foreach (var sub in Children(eqPay, pr.PayloadOff, pr.End) ?? [])
+            {
+                if (sub.Tag == 0x0000)
+                {
+                    for (int off = 0; off + 16 <= sub.Len; off += 16)
+                        set.Add(GuidStr(eqPay.AsSpan(sub.PayloadOff + off, 16)));
+                }
+                else
+                {
+                    var subPay = Payload(eqPay, sub);
+                    foreach (var bk in Children(subPay, 0, subPay.Length) ?? [])
+                    {
+                        if (bk.Tag < 0x0001 || bk.Len < 26) continue;
+                        foreach (var hk in Children(subPay, bk.PayloadOff + 4, bk.End) ?? [])
+                            if (hk.Len == 16) set.Add(GuidStr(subPay.AsSpan(hk.PayloadOff, 16)));
+                    }
+                }
+            }
+        }
+        return set;
+    }
+
+    private static byte[] StripRemovedFromEquipment(byte[] rec, HashSet<string> removedInstances)
+    {
+        List<Node> eqChain;
+        try { eqChain = FieldChain(rec, 0x1301, 0x0006); }
+        catch (InvalidDataException) { return rec; }
+        var eqPay = Payload(rec, eqChain[^1]);
+        var presets = Children(eqPay, 0, eqPay.Length);
+        if (presets is null) return rec;
+
+        Span<byte> hdr = stackalloc byte[6];
+        static void WriteNode(Stream s, Span<byte> h, ushort tag, ReadOnlySpan<byte> pay)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(h, tag);
+            BinaryPrimitives.WriteUInt32LittleEndian(h[2..], (uint)pay.Length);
+            s.Write(h);
+            s.Write(pay);
+        }
+
+        using var eqMs = new MemoryStream();
+        bool changed = false;
+        foreach (var pr in presets)
+        {
+            if (pr.Tag == 0x0000) { eqMs.Write(eqPay, pr.Off, 6 + pr.Len); continue; }
+            var subs = Children(eqPay, pr.PayloadOff, pr.End);
+            if (subs is null) { eqMs.Write(eqPay, pr.Off, 6 + pr.Len); continue; }
+            bool hasOtherSubs = subs.Any(s => s.Tag != 0x0000);
+            using var prMs = new MemoryStream();
+            foreach (var sub in subs)
+            {
+                if (sub.Tag == 0x0000)
+                {
+                    using var keptGuids = new MemoryStream();
+                    for (int off = 0; off + 16 <= sub.Len; off += 16)
+                    {
+                        var slice = eqPay.AsSpan(sub.PayloadOff + off, 16);
+                        if (removedInstances.Contains(GuidStr(slice))) { changed = true; continue; }
+                        keptGuids.Write(slice);
+                    }
+                    if (keptGuids.Length > 0)
+                        WriteNode(prMs, hdr, 0x0000, keptGuids.ToArray());
+                    else if (!hasOtherSubs)
+                        WriteNode(prMs, hdr, 0x0000, new byte[16]);
+                    else changed = true;
+                }
+                else
+                {
+                    var subPay = Payload(eqPay, sub);
+                    foreach (var bk in Children(subPay, 0, subPay.Length) ?? [])
+                    {
+                        if (bk.Tag < 0x0001 || bk.Len < 26) continue;
+                        foreach (var hk in Children(subPay, bk.PayloadOff + 4, bk.End) ?? [])
+                        {
+                            if (hk.Len == 16 && removedInstances.Contains(GuidStr(subPay.AsSpan(hk.PayloadOff, 16))))
+                            {
+                                subPay.AsSpan(hk.PayloadOff, 16).Clear();
+                                changed = true;
+                            }
+                        }
+                    }
+                    WriteNode(prMs, hdr, sub.Tag, subPay);
+                }
+            }
+            WriteNode(eqMs, hdr, pr.Tag, prMs.ToArray());
+        }
+        return changed ? Replace(rec, eqChain, eqMs.ToArray()) : rec;
+    }
+
+    private static byte[] DeductFromPersonalStashBytes(
+        byte[] psBytes,
+        List<string> classOrder,
+        Dictionary<string, int> needByClass,
+        HashSet<string> removedInstances,
+        ref int totalDeducted)
+    {
+        if (psBytes.Length == 0) return [];
+        using var outMs = new MemoryStream();
+        Span<byte> hdr = stackalloc byte[6];
+        bool anyChanged = false;
+        foreach (var st in StashNodes(psBytes))
+        {
+            var stKids = st.Len == 16 ? [] : (Children(psBytes, st.PayloadOff + 16, st.End) ?? []);
+            int invIdx = stKids.FindIndex(k => k.Tag == 0x0005);
+            if (invIdx < 0) { outMs.Write(psBytes, st.Off, 6 + st.Len); continue; }
+            var invNode = stKids[invIdx];
+            if (!DeductFromItemContainer(psBytes, invNode, classOrder, needByClass, null, removedInstances, ref totalDeducted, out var newInvPay))
+            {
+                outMs.Write(psBytes, st.Off, 6 + st.Len);
+                continue;
+            }
+            anyChanged = true;
+            int remainingItems = newInvPay.Length == 0 ? 0 : (Children(newInvPay, 0, newInvPay.Length)?.Count(n => n.Tag == 0x0001) ?? 0);
+            if (remainingItems == 0) continue; // omit empty 0x0000 personal stash node
+
+            using var stPayMs = new MemoryStream();
+            stPayMs.Write(psBytes, st.PayloadOff, 16);
+            for (int i = 0; i < stKids.Count; i++)
+            {
+                if (i == invIdx)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0005);
+                    BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], (uint)newInvPay.Length);
+                    stPayMs.Write(hdr);
+                    stPayMs.Write(newInvPay);
+                }
+                else stPayMs.Write(psBytes, stKids[i].Off, 6 + stKids[i].Len);
+            }
+            var newStPay = stPayMs.ToArray();
+            BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x0000);
+            BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], (uint)newStPay.Length);
+            outMs.Write(hdr);
+            outMs.Write(newStPay);
+        }
+        return anyChanged ? outMs.ToArray() : psBytes;
     }
 
     // ------------------------------------------------------------------ CLI

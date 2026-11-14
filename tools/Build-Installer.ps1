@@ -162,7 +162,7 @@ if (-not $SkipPublish) {
     # them opened a socket to the relay. This hosts the real relay in-process
     # and proves every multi-length packet crosses it intact, in both lengths.
     # It is NOT optional: a packet-shape change that fails here does not ship.
-    if (-not $env:DOTNET_ROOT) {
+    if (-not $env:DOTNET_ROOT -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
         $env:DOTNET_ROOT = "$env:USERPROFILE\.dotnet-sdk8"
         $env:PATH = "$env:DOTNET_ROOT;$env:PATH"
     }

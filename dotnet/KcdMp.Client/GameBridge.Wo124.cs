@@ -86,6 +86,7 @@ public partial class GameBridge
         public string Mode = "bring";               // WO-125: bring | fresh | restore
         public string? WorldTag;
         public WhsSave.HenryParts? SplicedParts;
+        public HenryStore.SnapshotCapture? HenryCapture;
         public byte[]? OfferMd5;
         public TaskCompletionSource<bool>? LoadStarted, GameplayStarted, LoadFailed;
     }
@@ -101,7 +102,15 @@ public partial class GameBridge
     private string _henryOverride = "auto";        // mp_join_henry
     private Dictionary<string, string>? _questClasses;
 
+    private sealed class ReplyCaptureSlot
+    {
+        public HenryStore.SnapshotCapture? Capture;
+        public bool Closed;
+    }
+
     private readonly ConcurrentDictionary<string, TaskCompletionSource<string>> _wo124Replies = new();
+    private readonly ConcurrentDictionary<string, ReplyCaptureSlot> _wo124ReplyCaptures = new(StringComparer.Ordinal);
+    private string? _testSavesDirOverride = null;
 
     public sealed record HenrySource(int Playline, string File, string FullPath, long SaveTime)
     {
@@ -112,8 +121,8 @@ public partial class GameBridge
     // ---------------------------------------------------------------- lifecycle
 
     /// <summary>KCDMP_JOIN_SAVES_DIR (tests) or the engine's saves folder.</summary>
-    private static string? ResolveSavesDirForJoin() =>
-        Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR") is { Length: > 0 } d ? d : ResolveSavesDir() ?? Wo159Rules.CreateSavesDirIfGameRan();   // WO-159: a new player's first join
+    private string? ResolveSavesDirForJoin() =>
+        _testSavesDirOverride ?? (Environment.GetEnvironmentVariable("KCDMP_JOIN_SAVES_DIR") is { Length: > 0 } d ? d : ResolveSavesDir() ?? Wo159Rules.CreateSavesDirIfGameRan());   // WO-159: a new player's first join
 
     private static readonly Regex TransientName = new(@"^mpworld[0-9a-f]{1,8}\.(whs|part)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
@@ -513,6 +522,7 @@ public partial class GameBridge
             j.Source = choice.Save;
             j.Mode = choice.Mode;
             j.WorldTag = worldTag;
+            j.HenryCapture = choice.Capture;
 
             // ---- Phase 2: splice + check + verify, in memory
             _questClasses ??= WhsSave.QuestClasses(tables);
@@ -760,9 +770,11 @@ public partial class GameBridge
 
         // 5. Ready
         uint readySeq = _joinReceivedSeq;
+        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);   // WO-134: arm before Ready so a < 2 ms LAN host ledger is never wiped
         await SendJoinerReadyAsync("wo124");
-        if (j.WorldTag is string wt0) Wo134AfterReady(wt0);   // WO-134: the joiner's chest ledger (restored with the Henry), then the host's
-        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq);   // WO-125: the join save's matched pair
+        if (j.WorldTag is string wt && j.SplicedParts is { } sp) Wo125AfterReady(wt, j.Mode, sp, j.OfferMd5, readySeq, j.HenryCapture);   // WO-125: the join save's matched pair
+        else _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         j.Phase = "in";
         SetJoinUi("in", "In your host's world.");
         await ExecLuaAsync("if KCD2MP_Wo124Msg then KCD2MP_Wo124Msg(\"Co-op: you are in your host's world.\") end");
@@ -850,14 +862,21 @@ public partial class GameBridge
     // ---------------------------------------------------------------- asking the mod
 
     /// <summary>Call a mod function with a token; its reply comes back as wo124_reply &lt;tok&gt; &lt;payload&gt;.</summary>
-    private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null);
+    private Task<string> AskModAsync(string fn, int timeoutMs) => AskModAsync(fn, timeoutMs, null, null);
+
+    /// <summary>Call a mod function and capture the HenryStore boundary synchronously on the log-reader thread when ok=true arrives.</summary>
+    private Task<string> AskModAsync(string fn, int timeoutMs, ReplyCaptureSlot captureSlot) => AskModAsync(fn, timeoutMs, null, captureSlot);
 
     /// <summary>WO-183: with one more argument after the token, already a Lua literal ("..." for a string, a number).</summary>
-    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg)
+    private Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg) => AskModAsync(fn, timeoutMs, luaArg, null);
+
+    private async Task<string> AskModAsync(string fn, int timeoutMs, string? luaArg, ReplyCaptureSlot? captureSlot)
     {
         string tok = Convert.ToHexString(RandomNumberGenerator.GetBytes(4)).ToLowerInvariant();
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         _wo124Replies[tok] = tcs;
+        if (captureSlot is not null) _wo124ReplyCaptures[tok] = captureSlot;
+        bool completedFromReply = false;
         try
         {
             long t0 = Environment.TickCount64;
@@ -865,11 +884,33 @@ public partial class GameBridge
             await ExecLuaAsync($"if {fn} then {call} else KCD2MP_EmitEvent(\"wo124_reply\", \"{tok} missing\") end");
             long sent = Environment.TickCount64 - t0;
             var done = await Task.WhenAny(tcs.Task, Task.Delay(timeoutMs));
-            if (done == tcs.Task) return tcs.Task.Result;
+            if (done == tcs.Task)
+            {
+                completedFromReply = true;
+                return await tcs.Task;
+            }
             Console.WriteLine($"MP-ASK timeout fn={fn} tok={tok} send_ms={sent} waited_ms={Environment.TickCount64 - t0}");
             return "timeout";
         }
-        finally { _wo124Replies.TryRemove(tok, out _); }
+        finally
+        {
+            _wo124Replies.TryRemove(tok, out _);
+            _wo124ReplyCaptures.TryRemove(tok, out _);
+            if (captureSlot is not null)
+            {
+                HenryStore.SnapshotCapture? orphan = null;
+                lock (captureSlot)
+                {
+                    captureSlot.Closed = true;
+                    if (!completedFromReply)
+                    {
+                        orphan = captureSlot.Capture;
+                        captureSlot.Capture = null;
+                    }
+                }
+                if (orphan is not null) _henry.ReleaseCapture(orphan);
+            }
+        }
     }
 
     private void Wo124OnEvent(string name, string? arg)
@@ -881,6 +922,17 @@ public partial class GameBridge
                 var s = arg ?? "";
                 int sp = s.IndexOf(' ');
                 string tok = sp > 0 ? s[..sp] : s, payload = sp > 0 ? s[(sp + 1)..] : "";
+                if (_wo124ReplyCaptures.TryRemove(tok, out var capSlot)
+                    && payload.StartsWith("ok=true", StringComparison.Ordinal))
+                {
+                    lock (capSlot)
+                    {
+                        if (!capSlot.Closed && _joinedTag is string snapTag)
+                        {
+                            try { capSlot.Capture = _henry.CaptureBoundary(snapTag); } catch { }
+                        }
+                    }
+                }
                 if (_wo124Replies.TryGetValue(tok, out var t)) t.TrySetResult(payload);
                 else Console.WriteLine($"MP-ASK reply tok={tok} with no ask waiting (late) -- {payload}");
                 return;
@@ -903,6 +955,8 @@ public partial class GameBridge
     /// <summary>Before the load: abort to the host (it resumes), clean up, stay at the menu.</summary>
     private async Task AbortJoinerJoinAsync(JoinerJoin j, byte reason, string why, string message, bool sendAbort = true)
     {
+        _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         if (sendAbort)
             try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
         if (j.PlacedPath is string p)
@@ -929,6 +983,8 @@ public partial class GameBridge
     /// <summary>After the load: abort to the host, then leave its world (back to this player's own newest save).</summary>
     private async Task LeaveAfterFailedJoinAsync(JoinerJoin j, byte reason, string why, string message)
     {
+        _henry.ReleaseCapture(j.HenryCapture);
+        j.HenryCapture = null;
         try { await WriteJoinAsync(WorldReceiver.BuildAbort(j.Host, j.JoinId, reason)); } catch { }
         Console.WriteLine($"MP-JOIN joiner: join 0x{j.JoinId:x8} ABORTED after the load ({why}) -- JoinAbort {Protocol.JoinAbortName(reason)} sent (the host resumes)");
         _joinReceivedId = 0;

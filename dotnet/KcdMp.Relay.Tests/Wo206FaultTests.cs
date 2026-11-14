@@ -56,6 +56,7 @@ public sealed class FaultRelay : IAsyncDisposable
         int httpPort = FreePort();
         var args = new List<string>
         {
+            "--bind", "127.0.0.1",
             "--port", r.TcpPort.ToString(),
             "--Urls", $"http://127.0.0.1:{httpPort}",
             "--Serilog:WriteTo:1:Name", "Console",

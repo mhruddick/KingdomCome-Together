@@ -85,8 +85,8 @@ def relay(dll):
     st = load_state()
     if listening(PORT):
         print('%d already listening' % PORT); return
-    urls = ['--urls', os.environ['KCDMP_TEST_URLS']] if os.environ.get('KCDMP_TEST_URLS') else []   # WO-176: the relay's own HTTP port, too
-    r = subprocess.Popen(launch(os.path.abspath(dll)) + ['--port', str(PORT)] + urls, cwd=os.path.dirname(os.path.abspath(dll)),
+    urls = ['--urls', os.environ.get('KCDMP_TEST_URLS', 'http://127.0.0.1:5273')]   # WO-176: the relay's own HTTP port, too
+    r = subprocess.Popen(launch(os.path.abspath(dll)) + ['--bind', '127.0.0.1', '--port', str(PORT)] + urls, cwd=os.path.dirname(os.path.abspath(dll)),
                          stdout=open(os.path.join(live.LOGS, 'relay165.log'), 'a'), stderr=subprocess.STDOUT, creationflags=DETACHED)
     for _ in range(40):
         if listening(PORT): break

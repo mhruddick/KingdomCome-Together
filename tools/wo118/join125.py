@@ -52,7 +52,7 @@ def relay(dll):
     st = load()
     if listening(7778):
         print('7778 already listening'); return
-    r = subprocess.Popen(launch(os.path.abspath(dll)) + ['--port', '7778'], cwd=os.path.dirname(os.path.abspath(dll)),
+    r = subprocess.Popen(launch(os.path.abspath(dll)) + ['--bind', '127.0.0.1', '--port', '7778', '--urls', 'http://127.0.0.1:5273'], cwd=os.path.dirname(os.path.abspath(dll)),
                          stdout=open(os.path.join(live.LOGS, 'relay125.log'), 'a'), stderr=subprocess.STDOUT, creationflags=DETACHED)
     for _ in range(40):
         if listening(7778): break
