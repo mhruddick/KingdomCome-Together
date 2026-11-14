@@ -35616,6 +35616,9 @@ do
         for _, t in pairs(L.hostEsc or {}) do
             if t.escName == sname then return true end
         end
+        for _, r in ipairs(L.pendingReturns or {}) do
+            if r.escName == sname then return true end
+        end
         for _, s in pairs(L.sess or {}) do
             for _, t in pairs(s.pend or {}) do
                 if t.escName == sname then return true end
@@ -36030,10 +36033,11 @@ do
         local fresh = L.hostLive[name] == nil
         local h = L.hostLive[name] or { peers = {}, rev = 0, sig = nil, ids = {} }
         L.hostLive[name] = h
-        if fresh and next(L.hostEsc) == nil then
+        if fresh and next(L.hostEsc) == nil and #(L.pendingReturns or {}) == 0 then
             L.hostQueue = {}
             L.splitRemap = {}
         end
+        if L.flushPendingReturns then L.flushPendingReturns(name) end
         h.peers[tostring(peer)] = os.clock()
         h.at = os.clock()
         L.hostSend(name, true)
@@ -36159,10 +36163,51 @@ do
     end
 
     function L.hasHostEscClass(name, cls)
+        local now = os.clock()
         for _, t in pairs(L.hostEsc or {}) do
-            if t.body == name and t.cls == cls then return true end
+            if t.body == name and t.cls == cls and now >= t.at and (now - t.at) <= L.ASK_S then return true end
         end
         return false
+    end
+
+    function L.returnToBody(t, tok)
+        local tEsc = t.esc or L.escrow()
+        local e = L.resolve(t.body)
+        local beforeBack = e and L.ids(e) or {}
+        local back = e and tEsc and L.move(tEsc, t.w, e)
+        if back and e then
+            if tEsc then L.clearStash(tEsc) end
+            local afterBack = L.ids(e)
+            local backKey = afterBack[L.key(t.w)] and L.key(t.w) or nil
+            if not backKey then
+                for ek, ev in pairs(afterBack) do
+                    if ev.cls == t.cls and (not beforeBack[ek] or ev.amt > beforeBack[ek].amt) then backKey = ek; break end
+                end
+            end
+            if backKey then
+                L.recordSplitRemap(t.body, t.hostId, backKey)
+                if t.reqHostId then L.recordSplitRemap(t.body, t.reqHostId, backKey) end
+            end
+            L.markChestTouched(e)
+            L.stats.backToBody = L.stats.backToBody + 1
+            ledger("host", "cancelled", t.body, t.reqHostId or t.hostId, t.cls, t.amt, tok, "back=body")
+            L.hostSend(t.body, false)
+            return true
+        end
+        return false
+    end
+
+    function L.flushPendingReturns(onlyBody)
+        if not (L.pendingReturns and #L.pendingReturns > 0) then return end
+        local keep = {}
+        for _, r in ipairs(L.pendingReturns) do
+            if (not onlyBody or r.body == onlyBody) and L.returnToBody(r, r.tok) then
+                L.drainHostQueue(r.body, r.cls)
+            else
+                keep[#keep + 1] = r
+            end
+        end
+        L.pendingReturns = keep
     end
 
     function L.pruneHostQueue(now)
@@ -36194,6 +36239,7 @@ do
         name, hostId, tok, peer, cls = tostring(name), tostring(hostId), tostring(tok), tostring(peer), tostring(cls)
         local reqAmt = math.max(1, math.floor(tonumber(amt) or 1))
         local now = os.clock()
+        L.flushPendingReturns(name)
         L.pruneHostQueue(now)
         local e = L.resolve(name)
         local idsMap = e and L.ids(e) or {}
@@ -36317,28 +36363,14 @@ do
             L.stats.acks = L.stats.acks + 1
             ledger("host", "acked", t.body, t.reqHostId or t.hostId, t.cls, t.amt, tok, "escrow=deleted")
         else
-            local e = L.resolve(t.body)
-            local beforeBack = e and L.ids(e) or {}
-            local back = e and tEsc and L.move(tEsc, t.w, e)
-            if not back and tEsc and tEsc.inventory then pcall(function() tEsc.inventory:DeleteItem(t.w, -1) end) end
-            if tEsc then L.clearStash(tEsc) end
-            if back and e then
-                local afterBack = L.ids(e)
-                local backKey = afterBack[L.key(t.w)] and L.key(t.w) or nil
-                if not backKey then
-                    for ek, ev in pairs(afterBack) do
-                        if ev.cls == t.cls and (not beforeBack[ek] or ev.amt > beforeBack[ek].amt) then backKey = ek; break end
-                    end
-                end
-                if backKey then
-                    L.recordSplitRemap(t.body, t.hostId, backKey)
-                    if t.reqHostId then L.recordSplitRemap(t.body, t.reqHostId, backKey) end
-                end
-                L.markChestTouched(e)
+            if not L.returnToBody(t, tok) then
+                L.pendingReturns = L.pendingReturns or {}
+                L.pendingReturns[#L.pendingReturns + 1] = {
+                    body = t.body, esc = tEsc, escName = t.escName, w = t.w,
+                    cls = t.cls, amt = t.amt, hostId = t.hostId, reqHostId = t.reqHostId, tok = tok
+                }
+                ledger("host", "cancelled", t.body, t.reqHostId or t.hostId, t.cls, t.amt, tok, "back=deferred")
             end
-            L.stats.backToBody = L.stats.backToBody + 1
-            ledger("host", "cancelled", t.body, t.reqHostId or t.hostId, t.cls, t.amt, tok, back and "back=body" or "back=FAILED")
-            L.hostSend(t.body, false)
         end
         L.drainHostQueue(t.body, t.cls)
         L.setActive()
@@ -36352,6 +36384,7 @@ do
         for _, h in pairs(L.hostLive) do for _, _ in pairs(h.peers) do n = n + 1 end end
         for _, _ in pairs(L.hostEsc or {}) do n = n + 1 end
         if L.hostQueue then n = n + #L.hostQueue end
+        if L.pendingReturns then n = n + #L.pendingReturns end
         if (n > 0) ~= (L.active > 0) then KCD2MP_EmitEvent("w217_lootlive", tostring(n)) end
         L.active = n
     end
@@ -36508,29 +36541,53 @@ do
             for _, q in ipairs(s.takeQueue) do
                 if q.hid == it.id then pendTake = pendTake + (q.amt or 0) end
             end
+            local hostNet = math.max(0, it.amt - pendTake)
             local lid = s.map[it.id]
+            if not lid and s.puts then
+                for k, v in pairs(have) do
+                    local pr0 = not mapped[k] and s.puts[k] or nil
+                    if type(pr0) == "table" and v.cls == it.cls and math.abs(v.hp - it.hp) <= 0.01 then
+                        lid = k
+                        s.map[it.id] = lid
+                        mapped[lid] = it.id
+                        break
+                    end
+                end
+            end
             local pendPut = 0
             local pr = lid and s.puts and s.puts[lid] or nil
             if type(pr) == "table" then
-                if now - pr.at >= L.ASK_S then s.puts[lid] = nil
-                elseif pr.merged then
-                    local cur0 = have[lid]
-                    if cur0 and (it.amt - pendTake) >= cur0.amt then s.puts[lid] = nil
-                    else pendPut = pr.amt or 0 end
+                if now - pr.at >= L.ASK_S then
+                    s.puts[lid] = nil
+                else
+                    local baseAmt = pr.baseAmt or 0
+                    if hostNet > baseAmt then
+                        local confirmed = math.min(pr.amt or 0, hostNet - baseAmt)
+                        pr.amt = math.max(0, (pr.amt or 0) - confirmed)
+                        pr.baseAmt = hostNet
+                    end
+                    if (pr.amt or 0) <= 0 then
+                        s.puts[lid] = nil
+                    else
+                        pendPut = pr.amt
+                    end
                 end
             end
-            local wantAmt = it.amt - pendTake + pendPut
+            local wantAmt = hostNet + pendPut
             if wantAmt > 0 then
                 want[it.id] = true
                 if lid then
                     local cur = L.ids(e)[lid]
                     if cur and (cur.amt ~= wantAmt or math.abs(cur.hp - it.hp) > 0.01) then
+                        local oldLid = lid
+                        local savedPut = s.puts and s.puts[oldLid] or nil
                         local prevAmt = cur.amt
                         if L.move(e, cur.w, scr) then
                             pcall(function() scr.inventory:DeleteItem(cur.w, -1) end)
                         end
                         L.clearStash(scr)
-                        s.map[it.id] = nil; mapped[lid] = nil; lid = nil
+                        if s.puts then s.puts[oldLid] = nil end
+                        s.map[it.id] = nil; mapped[oldLid] = nil; lid = nil
                         local beforeE = L.ids(e)
                         pcall(function() scr.inventory:CreateItem(it.cls, it.hp, wantAmt) end)
                         for k, v in pairs(scr and L.ids(scr) or {}) do
@@ -36551,6 +36608,7 @@ do
                         L.clearStash(scr)
                         if lid then
                             s.map[it.id] = lid; mapped[lid] = it.id
+                            if savedPut and s.puts then s.puts[lid] = savedPut end
                             for _, t in pairs(s.pend) do if t.hid == it.id then t.lid = lid end end
                             for _, q in ipairs(s.takeQueue) do if q.hid == it.id then q.lid = lid end end
                         end
@@ -36631,25 +36689,12 @@ do
     function KCD2MP_W217LootPoll()
         if not KCD2MP_W217LootLive() then return false end
         local now = os.clock()
-        -- the host: expire stale un-acked escrows so a disconnected joiner never wedges L.hostQueue
-        local expiredHost = {}
-        for hk, t in pairs(L.hostEsc) do
-            if now < t.at or (now - t.at) > (L.ASK_S + 5.0) then
-                expiredHost[#expiredHost + 1] = { k = hk, t = t }
-            end
-        end
-        for _, ex in ipairs(expiredHost) do
-            L.hostEsc[ex.k] = nil
-            local t = ex.t
-            local tEsc = t.esc or L.escrow()
-            local e = L.resolve(t.body)
-            local back = e and tEsc and L.move(tEsc, t.w, e)
-            if not back and tEsc and tEsc.inventory then pcall(function() tEsc.inventory:DeleteItem(t.w, -1) end) end
-            if tEsc then L.clearStash(tEsc) end
-            if back and e then L.markChestTouched(e); L.hostSend(t.body, false) end
-            L.stats.backToBody = L.stats.backToBody + 1
-            ledger("host", "cancelled", t.body, t.reqHostId or t.hostId, t.cls, t.amt, ex.k, back and "why=timeout back=body" or "why=timeout back=FAILED")
-            L.drainHostQueue(t.body, t.cls)
+        -- the host: retry any cancelled returns waiting for an unstreamed chest to stream back in, and unblock L.hostQueue once ASK_S passes
+        L.flushPendingReturns()
+        if L.hostQueue and #L.hostQueue > 0 then
+            local qPairs = {}
+            for _, q in ipairs(L.hostQueue) do qPairs[q.name .. "\0" .. q.cls] = { name = q.name, cls = q.cls } end
+            for _, qp in pairs(qPairs) do L.drainHostQueue(qp.name, qp.cls) end
         end
         -- the host: every live body/chest's list on a change; its own takes logged; stale peers forgotten
         for name, h in pairs(L.hostLive) do
@@ -36764,8 +36809,10 @@ do
                         if putAmt > 0 then
                             packLoss[v.cls] = math.max(0, availLoss - putAmt)
                             local oldRec = s.puts[lid]
-                            local oldAmt = (type(oldRec) == "table" and (now - oldRec.at) < L.ASK_S) and (oldRec.amt or 0) or 0
-                            s.puts[lid] = { at = now, amt = oldAmt + putAmt, cls = v.cls, hp = v.hp, merged = (prev ~= nil) }
+                            local validOld = type(oldRec) == "table" and (now < oldRec.at or (now - oldRec.at) < L.ASK_S)
+                            local oldAmt = validOld and (oldRec.amt or 0) or 0
+                            local baseAmt = validOld and oldRec.baseAmt ~= nil and oldRec.baseAmt or (prev and prev.amt or 0)
+                            s.puts[lid] = { at = now, amt = oldAmt + putAmt, baseAmt = baseAmt, cls = v.cls, hp = v.hp, merged = (prev ~= nil) or validOld }
                             local tok = L.tok()
                             L.stats.puts = (L.stats.puts or 0) + 1
                             KCD2MP_EmitEvent("w134_put", string.format("%s %s %s %d %.4f", tok, name, v.cls, putAmt, v.hp))

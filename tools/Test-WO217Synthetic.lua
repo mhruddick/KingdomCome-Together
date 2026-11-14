@@ -697,6 +697,79 @@ KCD2MP_W134BodyState(farKeyJ, "update", 2, 1, 1, {})
 check("R3c mid-session flags=2 rolls unconfirmed put back into Henry's pack and closes live session",
     count(player.inventory, COAT) == 1 and count(farChestJ.inventory, COAT) == 0 and W217.L.sess[farKeyJ] == nil)
 
+-- ================= R4: delayed acks, partial deposit confirmations, and deferred unloaded cancel returns =================
+MERGE_STACKS[ARROW] = true
+MERGE_STACKS[APPLE] = true
+
+-- R4a: Delayed ack (> 10 s) after delivered grant NEVER returns items to Host chest, and late "applied" ack cleans up escrow
+world(); asHost(1)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}; W217.L.pendingReturns = {}
+local dAckChest = attachStash(mkWorldChest("dack_chest", "Stash88", "Stash", 101, 100, 10))
+dAckChest.inventory:CreateItem(ARROW, 1, 20)
+local dAckKey = KCD2MP_W217ChestKey(dAckChest)
+local dAckArrId = key(dAckChest.inventory.list[1])
+KCD2MP_W217HostOpen(1, dAckKey)
+KCD2MP_W217HostTakeReq(1, "701", dAckKey, dAckArrId, ARROW, 5)
+NOW = NOW + 15.0
+KCD2MP_W217LootPoll()
+check("R4a delayed ack (>10s) after grant keeps Host chest at 15 (never auto-returns to 20)",
+    count(dAckChest.inventory, ARROW) == 15 and W217.L.hostEsc["1:701"] ~= nil, count(dAckChest.inventory, ARROW))
+check("R4a late applied ack succeeds and deletes held escrow",
+    KCD2MP_W217HostAck(1, "701", "applied") == true and W217.L.hostEsc["1:701"] == nil and count(dAckChest.inventory, ARROW) == 15)
+
+-- R4b: Overlapping deposits (chest=2, pack=10; deposit 3 then 2; Host accepts 3 -> 5, rejects 2 on unload) -> 5 in chest + 7 in pack = 12 (never 15!)
+world(); asJoiner()
+local depChest = attachStash(mkWorldChest("dep_chest", "Stash89", "Stash", 101, 100, 10))
+depChest.inventory:CreateItem(APPLE, 1, 2)
+player.inventory:CreateItem(APPLE, 1, 10)
+local depKey = KCD2MP_W217ChestKey(depChest)
+depChest:OnUsed(player, 1)
+KCD2MP_W217BodyList(depKey, 1, 1, 1, { { id = "ha1", cls = APPLE, amt = 2, hp = 1.0, worn = 0, stolen = 0, owner = "-" } })
+-- Deposit 3 apples (pack 10 -> 7, chest 2 -> 5)
+do
+    local pw = player.inventory.list[1]
+    player.inventory:DeleteItem(pw, 3)
+    depChest.inventory:CreateItem(APPLE, 1, 1) -- wait: use AddItem so MERGE_STACKS merges 3 onto 2 -> 5
+    depChest.inventory:DeleteItem(depChest.inventory.list[#depChest.inventory.list], -1)
+    local tmp = newItem(APPLE, 1, 3)
+    depChest.inventory:AddItem(tmp)
+end
+KCD2MP_W217LootPoll()
+-- Deposit 2 more apples (pack 7 -> 5, chest 5 -> 7)
+do
+    local pw = player.inventory.list[1]
+    player.inventory:DeleteItem(pw, 2)
+    local tmp = newItem(APPLE, 1, 2)
+    depChest.inventory:AddItem(tmp)
+end
+KCD2MP_W217LootPoll()
+-- Host update confirms first deposit only (chest = 5), then Host unloads (flags = 2) rejecting second deposit
+KCD2MP_W217BodyList(depKey, 2, 1, 1, { { id = "ha1", cls = APPLE, amt = 5, hp = 1.0, worn = 0, stolen = 0, owner = "-" } })
+KCD2MP_W134BodyState(depKey, "update", 2, 1, 1, {})
+check("R4b aborting after first deposit confirmed refunds ONLY unconfirmed 2 apples (chest=5, pack=7, total=12, never 15)",
+    count(depChest.inventory, APPLE) == 5 and count(player.inventory, APPLE) == 7,
+    "chest=" .. count(depChest.inventory, APPLE) .. " pack=" .. count(player.inventory, APPLE))
+
+-- R4c: Cancelling while Host chest is unloaded preserves reserved items and restores 20 when chest streams back in
+world(); asHost(1)
+W217.L.hostQueue = {}; W217.L.splitRemap = {}; W217.L.pendingReturns = {}
+local unlChest = attachStash(mkWorldChest("unl_chest", "Stash90", "Stash", 101, 100, 10))
+unlChest.inventory:CreateItem(ARROW, 1, 20)
+local unlKey = KCD2MP_W217ChestKey(unlChest)
+local unlArrId = key(unlChest.inventory.list[1])
+KCD2MP_W217HostOpen(1, unlKey)
+KCD2MP_W217HostTakeReq(1, "703", unlKey, unlArrId, ARROW, 5)
+ENTS["unl_chest"] = nil   -- chest unloads on Host while 5 arrows are reserved in escrow
+KCD2MP_W217HostAck(1, "703", "cancel")
+check("R4c cancel while chest unloaded keeps 5 reserved arrows in pendingReturns",
+    #(W217.L.pendingReturns or {}) == 1)
+ENTS["unl_chest"] = unlChest   -- chest streams back in on Host
+KCD2MP_W217LootPoll()
+check("R4c once chest streams back in, 5 reserved arrows return -> chest has all 20 arrows",
+    count(unlChest.inventory, ARROW) == 20 and #(W217.L.pendingReturns or {}) == 0, count(unlChest.inventory, ARROW))
+
+MERGE_STACKS = {}
+
 check("no Lua errors", #ERRS == 0, ERRS[1])
 local pass, fail = 0, 0
 for _, r in ipairs(RESULTS) do if r:sub(1, 4) == "PASS" then pass = pass + 1 else fail = fail + 1 end end
