@@ -27042,13 +27042,13 @@ KCD2MP.w151.fight = KCD2MP.w151.fight or {}
 --   avatar rides here leave every NPC path at once: no puppet, no native writer, no park or hide, no
 --   join freeze; the host's stream for it is ignored while it is ridden and 3 s after (WO-136's settle).
 KCD2MP.w151.rideOwner = (KCD2MP.w151.rideOwner == nil) and true or KCD2MP.w151.rideOwner
--- Phase 5 (both): mp_crime_mode joint|individual (default joint, the maintainer's call) -- a crime by
+-- Phase 5 (both): mp_crime_mode joint|individual (default individual, M4) -- when joint, a crime by
 --   either player counts for both: the joiner's witnessed crime is raised natively in the host's world
 --   too (planted in the host's witnesses: the host's Henry is wanted for it), the host's own crime goes
 --   into the joiner's record, and a fine or punishment by either clears both. individual = WO-139.
 --   5.3: when a record clears, this machine's NPCs forget it (the game's crime:forgetCrimesData; a
 --   paused guard copy gets its brain back for the moment it takes) -- the wanted icon goes with it.
-KCD2MP.w151.crimeJoint = (KCD2MP.w151.crimeJoint == nil) and true or KCD2MP.w151.crimeJoint
+KCD2MP.w151.crimeJoint = KCD2MP.w151.crimeJoint == true
 -- Phase 3.8 (host): mp_join_engine_hold on|off (default on) -- the world is truly held for a whole join: the
 --   engine's own pause (the DLL, at most the join's timeout + 60 s, released when the agent goes away),
 --   from the verified join save to the join's end. The mod's ratio 0, NPC pauses and no_input stay too.

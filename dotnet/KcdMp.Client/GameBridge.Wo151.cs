@@ -44,11 +44,13 @@ public partial class GameBridge
     // (what its own battles, hostages and tied NPCs use) and the two hit-reaction switches, DLL op 5.
     private volatile bool _w151Reactions = true;
 
-    // ---- Phase 5: joint responsibility (mp_crime_mode joint|individual, default joint) ------------
-    // Host: the host's own crime seen by someone (w151_crime own ...) goes into every joiner's record;
-    // the host's own crime dialogue ending in a fine or a punishment (w151_crime resolved ...) clears every
-    // joiner's record; a joiner's stop that clears his record makes this world forget the host's too.
-    private volatile bool _w151CrimeJoint = true;
+    // ---- Phase 5: crime responsibility (mp_crime_mode joint|individual, default individual) --------
+    // Host (when joint): the host's own crime seen by someone (w151_crime own ...) goes into every joiner's
+    // record; the host's own crime dialogue ending in a fine or a punishment (w151_crime resolved ...) clears
+    // every joiner's record; a joiner's stop that clears his record makes this world forget the host's too.
+    private volatile bool _w151CrimeJoint;
+    internal bool Wo151CrimeJointForTest => _w151CrimeJoint;
+    internal void Wo151CfgForTest(string arg) => Wo151OnCfg(arg);
 
     // ---- Phase 3.7: the host's live weather ---------------------------------------------------------
     // Host: the DLL records every blend the game runs (EnvironmentModule BlendToProfile); a new one
