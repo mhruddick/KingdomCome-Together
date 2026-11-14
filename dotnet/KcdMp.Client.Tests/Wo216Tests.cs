@@ -142,6 +142,13 @@ public class Wo216Tests
         Assert.Equal("tkop_guard_3", n); Assert.True(on); Assert.Equal((ushort)120, s);
         Assert.True(Wo216Rules.TryParseExempt("horse_7 off 30", out _, out bool off, out _));
         Assert.False(off);
+        const string bracketHorse = "horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]";
+        Assert.True(Wo216Rules.TryParseExempt($"{bracketHorse} on 120", out var bh, out bool bhOn, out ushort bhSecs));
+        Assert.Equal(bracketHorse, bh); Assert.True(bhOn); Assert.Equal((ushort)120, bhSecs);
+        Assert.True(Wo216Rules.TryParseExempt($"{new string('h', 120)} on 30", out _, out _, out _));
+        Assert.False(Wo216Rules.TryParseExempt($"{new string('h', 121)} on 30", out _, out _, out _));
+        Assert.False(Wo216Rules.TryParseExempt("horse[animalcare//horseCare6] on 30", out _, out _, out _));
+        Assert.False(Wo216Rules.TryParseExempt("[bad_start] on 30", out _, out _, out _));
         Assert.False(Wo216Rules.TryParseExempt("a b on 5", out _, out _, out _));         // two names
         Assert.False(Wo216Rules.TryParseExempt("x maybe 5", out _, out _, out _));        // neither on nor off
         Assert.False(Wo216Rules.TryParseExempt("x on 0", out _, out _, out _));           // no time

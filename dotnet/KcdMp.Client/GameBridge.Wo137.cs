@@ -149,7 +149,7 @@ public partial class GameBridge
                 }
                 _w137JoinerWasActive = joinerActive;
                 _ = ExecLuaAsync($"if KCD2MP_W137Session then KCD2MP_W137Session({B(host)}, {B(joiner)}, {B(Wo137Active(holding))}) end");
-                await M3TickAsync(host && Wo137Active(holding), joinerActive);
+                await M3TickAsync(host && Wo137Active(holding), joiner, joinerActive);
                 if (wasHolding && !holding && host) Wo137ReleaseHeldRequests();
                 if (host) Wo154FlushCoalesced(false);   // WO-154 1
                 wasHolding = holding;

@@ -408,7 +408,7 @@ struct FindName { const char* name; uint32_t eid; };
 bool find_name_visit(void* e, void* ctx) {
     auto* f = static_cast<FindName*>(ctx);
     const char* n = engine::entity_name(e);
-    char buf[64]{};
+    char buf[128]{};
     if (!n) return false;
     size_t i = 0;
     KCDMP_FAULT_READ(site, "hits::find_name_visit");

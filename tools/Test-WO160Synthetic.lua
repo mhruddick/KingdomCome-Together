@@ -412,22 +412,51 @@ do
         removedIds[eid] = true
     end
 
-    -- O1: Joiner reports bracketed horse name and "-" on clear
+    -- O1: Joiner reports 65-char bracketed horse name, exempts full name in WO-216, unbinds lh* alias, and ignores unstreamed GetHorseId()==0
     local bracketName = "horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]"
+    local bracketAlias = KCD2MP_W217Alias(bracketName)
     local hBracket = mkHorse(bracketName, 701, 20, 20, 0, false)
+    local bracketHp = 100
+    hBracket.soul.GetState = function(_, k) return k == "health" and bracketHp or nil end
     local ownHorseId = hBracket.id
     player.player = { GetHorseId = function() return ownHorseId end }
     KCD2MP.w137.joiner, KCD2MP.w137.host, KCD2MP.w137.active = true, false, true
     KCD2MP.w160.ownHorse = { name = nil, at = -1e9 }
+    KCD2MP.npcPuppets[bracketAlias] = { nativeOwned = true }
+    W216.exemptAt = {}
     local mark = #LOG
     NOW = NOW + 10
     KCD2MP_W160OwnHorseTick()
-    check("O1: joiner reports 65-char bracketed Trosky horse name", countEvt("w160_ownhorse", bracketName, mark) == 1)
+    check("O1: joiner reports 65-char bracketed Trosky horse name, exempts full name in WO-216, and unbinds WO-217 lh* alias",
+        countEvt("w160_ownhorse", bracketName, mark) == 1
+        and countEvt("w216_exempt", bracketName .. " on 120", mark) == 1
+        and countEvt("npc_native", bracketAlias .. " off", mark) == 1
+        and KCD2MP.npcPuppets[bracketAlias] == nil
+        and KCD2MP_W136Ridden(bracketAlias) == true)
     ownHorseId = 0
+    BY_ID[701] = nil
+    ENTS[bracketName] = nil
     mark = #LOG
     NOW = NOW + 10
     KCD2MP_W160OwnHorseTick()
-    check("O1b: joiner clearing/selling horse emits w160_ownhorse -", countEvt("w160_ownhorse", "-", mark) == 1)
+    check("O1b: unstreamed horse layer (GetHorseId()==0 / GetEntity==nil) does NOT wipe ownHorse or emit w160_ownhorse -",
+        countEvt("w160_ownhorse", "-", mark) == 0
+        and KCD2MP.w160.ownHorse.name == bracketName)
+    BY_ID[701] = hBracket
+    ENTS[bracketName] = hBracket
+    ownHorseId = hBracket.id
+    bracketHp = 0
+    mark = #LOG
+    NOW = NOW + 10
+    KCD2MP_W160OwnHorseTick()
+    check("O1c: loaded dead horse (health <= 0) clears ownHorse and emits w160_ownhorse -",
+        countEvt("w160_ownhorse", "-", mark) == 1
+        and KCD2MP.w160.ownHorse.name == nil)
+    check("O1d: snapshot seed (KCD2MP_M3SeedOwnHorse) pre-arms whistle and stream hold before layer streams in",
+        KCD2MP_M3SeedOwnHorse("nebakovPruzkum_herynk") == true
+        and KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true
+        and KCD2MP_M3OnJoinerWhistle() == true)
+    KCD2MP_M3SeedOwnHorse("-")
 
     -- O2/O3/O4/O5: Host owns Pebbles, Joiner 1 owns tsem_horseForSale_2 with saddle + bridle
     KCD2MP.w137.joiner, KCD2MP.w137.host, KCD2MP.w137.active = false, true, true
@@ -440,16 +469,30 @@ do
     local saddle = "bf06d242-4dcb-48e9-bbf1-b6a36f368a57"
     local bridle = "505343b8-b5ff-4f47-94d9-470a1977a421"
     mark = #LOG
-    check("O2: host marks joiner's Horse B legal, emits context, and equips tack",
+    check("O2: host emits crime context and equips tack on Horse B WITHOUT flipping mountIsLegal true for Host",
         KCD2MP_W160PeerHorse(1, "tsem_horseForSale_2", saddle .. "," .. bridle) == true
-        and horseB.mountIsLegal == true
+        and horseB.mountIsLegal == false
         and countEvt("m3_peerhorse_ctx", "tsem_horseForSale_2 1", mark) == 1
         and horseB.eqItems["item:" .. saddle] == true
         and horseB.eqItems["item:" .. bridle] == true)
+    mark = #LOG
+    KCD2MP_W151OnMountStart(horseB, player)
+    KCD2MP.w151.mountingName, KCD2MP.w151.mountingAt = nil, nil
+    check("O2b: if Host mounts an originally-illegal peer horse, crime_ignoredHorseTheft_Horse is cleared so theft still applies",
+        countEvt("m3_peerhorse_ctx", "tsem_horseForSale_2 0", mark) == 1)
+    KCD2MP_M3HostTick()
 
+    -- L12: even if a peer claims an originally-legal world horse (lent_horse), W139HostHorses excludes it
+    KCD2MP_W160PeerHorse(9, "lent_horse", "")
     mark = #LOG
     KCD2MP_W139HostHorses()
-    check("O3: W139HostHorses shares lent world horses only (neither host's Pebbles nor joiner's private Horse B)",
+    check("O3: W139HostHorses excludes peer-owned horses even when originally legal on Host",
+        countEvt("w139_horses", "-", mark) == 1
+        and countEvt("w139_horses", "lent_horse", mark) == 0)
+    KCD2MP_W160PeerHorse(9, "-", "")
+    mark = #LOG
+    KCD2MP_W139HostHorses()
+    check("O3b: W139HostHorses shares unowned lent world horses only (neither host's Pebbles nor joiner's private Horse B)",
         countEvt("w139_horses", "lent_horse", mark) == 1
         and countEvt("w139_horses", "tsem_sedivka", mark) == 0
         and countEvt("w139_horses", "tsem_horseForSale_2", mark) == 0)
@@ -473,15 +516,20 @@ do
     check("O4: dismounting joiner's Horse B keeps it AI-paused at the dismount spot instead of walking back to Semine",
         sawPause == true and sawResume == false and KCD2MP.w160.parkedPeerHorses["tsem_horseForSale_2"] ~= nil)
 
-    -- O5: Pre-save strips mod-created tack from world horse; post-save restores it
+    -- O5: Pre-save strips mod-created tack from world horse; "busy" is ignored; 15s safety timeout / SaveDone restores it
     KCD2MP_M3BeforeHostSave()
     check("O5a: before host save, temp tack is stripped from world Horse B so .whs stays clean",
         next(horseB.invItems) == nil and next(horseB.eqItems) == nil)
-    KCD2MP_M3AfterHostSave()
-    check("O5b: after host save, temp tack is restored onto world Horse B",
-        horseB.eqItems["item:" .. saddle] == true and horseB.eqItems["item:" .. bridle] == true)
+    KCD2MP_W178SaveDone("busy", "", "quicksave:host:0")
+    check("O5b: KCD2MP_W178SaveDone('busy') does NOT prematurely restore tack while another save is writing",
+        KCD2MP.w160.saveTackStripped == true and next(horseB.eqItems) == nil)
+    NOW = NOW + 16
+    KCD2MP_M3HostTick()
+    check("O5c: 15 s safety timeout in M3HostTick auto-restores temp tack onto world Horse B",
+        KCD2MP.w160.saveTackStripped == false
+        and horseB.eqItems["item:" .. saddle] == true and horseB.eqItems["item:" .. bridle] == true)
 
-    -- O6: Same-soul collision (Joiner 2 also owns tsem_sedivka == Host's own horse!)
+    -- O6: Same-soul collision (Joiner 2 also owns tsem_sedivka == Host's own horse, and Joiner 3 also owns tsem_horseForSale_2 == Joiner 1's horse!)
     KCD2MP.ghosts["2"] = { entity = { id = 802, GetWorldPos = function() return { x = 8, y = 8, z = 1.5 } end, human = { ForceDismount = function() end, IsMounted = function() return false end } }, istate = { isRiding = true, spawnedAtClock = -100 } }
     KCD2MP.ghostHorseName["2"] = "tsem_sedivka"
     CMDS = {}
@@ -493,9 +541,43 @@ do
         and spawnedProxy ~= nil and spawnedProxy ~= pebbles
         and spawnedProxy:GetName() == "kcd2mp_peerhorse_2"
         and spawnedProxy.eqItems["item:" .. saddle] == true)
-    KCD2MP_RemoveHorse("2")
-    check("O6b: dismounting same-soul stand-in parks kcd2mp_peerhorse_2 without destroying it while Joiner 2 stays connected",
-        KCD2MP.w160.peerProxies["2"] ~= nil and removedIds[spawnedProxy.id] == nil)
+    -- M11: if proxy tack was cleared, M3HostTick re-asserts it
+    spawnedProxy.actor:UnequipInventoryItem("item:" .. saddle)
+    KCD2MP_M3HostTick()
+    check("O6b: M3HostTick re-asserts tack on kcd2mp_peerhorse_2 and dismount parks without destroying it",
+        spawnedProxy.eqItems["item:" .. saddle] == true
+        and (function() KCD2MP_RemoveHorse("2"); return KCD2MP.w160.peerProxies["2"] ~= nil and removedIds[spawnedProxy.id] == nil end)())
+
+    -- M9: two joiners (1 and 3) owning the same tsem_horseForSale_2 -> Joiner 1 keeps world horse, Joiner 3 gets NO_SAVE kcd2mp_peerhorse_3
+    KCD2MP.ghosts["3"] = { entity = { id = 805, GetWorldPos = function() return { x = 14, y = 10, z = 1.5 } end, human = { ForceDismount = function() end, IsMounted = function() return false end } }, istate = { isRiding = true, spawnedAtClock = -100 } }
+    KCD2MP.ghostHorseName["3"] = "tsem_horseForSale_2"
+    KCD2MP_W160PeerHorse(3, "tsem_horseForSale_2", bridle)
+    local proxy3 = KCD2MP_SpawnHorse("3", 14, 10, 0, 0)
+    check("O6c: second joiner owning same tsem_horseForSale_2 gets dedicated NO_SAVE kcd2mp_peerhorse_3 without overwriting Joiner 1's tack",
+        proxy3 ~= nil and proxy3 ~= horseB and proxy3:GetName() == "kcd2mp_peerhorse_3"
+        and proxy3.eqItems["item:" .. bridle] == true
+        and horseB.eqItems["item:" .. saddle] == true)
+    KCD2MP_RemoveHorse("3")
+    KCD2MP_W160PeerHorse(3, "-", "")
+
+    -- O8 (H5): riding an unowned horse uses generic proxy, and premature peerProxy swaps cleanly when world horse arrives
+    KCD2MP.ghosts["1"].istate.isRiding = true
+    KCD2MP.ghostHorseName["1"] = "unowned_bandit_horse"
+    local genericRide = KCD2MP_SpawnHorse("1", 12, 10, 0, 0)
+    check("O8a: joiner riding an unowned horse spawns generic kcd2mp_horse_1 instead of personal peerhorse stand-in",
+        genericRide ~= nil and genericRide:GetName() == "kcd2mp_horse_1" and KCD2MP.w160.peerProxies["1"] == nil)
+    KCD2MP_RemoveHorse("1")
+    ENTS["tsem_horseForSale_2"] = nil   -- simulate unstreamed when isRiding arrives before HorseInfoDown
+    KCD2MP.ghostHorseName["1"] = ""
+    local earlyPeerProxy = KCD2MP_SpawnHorse("1", 12, 10, 0, 0)
+    ENTS["tsem_horseForSale_2"] = horseB   -- streams in, then HorseInfoDown arrives
+    KCD2MP_SetGhostHorse("1", "tsem_horseForSale_2")
+    check("O8b: premature peerProxy swaps cleanly to world Horse B when HorseInfoDown arrives (no duplicate horse left behind)",
+        earlyPeerProxy ~= nil and earlyPeerProxy:GetName() == "kcd2mp_peerhorse_1"
+        and KCD2MP.horseGhosts["1"] ~= nil and KCD2MP.horseGhosts["1"].isWorldHorse == true
+        and removedIds[earlyPeerProxy.id] == true and KCD2MP.w160.peerProxies["1"] == nil)
+    KCD2MP.ghosts["1"].istate.isRiding = false
+    KCD2MP_RemoveHorse("1")
 
     -- O7: Disconnect / clear releases world horse + removes peer proxy
     mark = #LOG
@@ -504,16 +586,16 @@ do
     KCD2MP_W160PeerHorse(2, "-", "")
     local resumedHorseB = false
     for _, c in ipairs(CMDS) do if c == "wh_ai_ResumeNPC tsem_horseForSale_2" then resumedHorseB = true end end
-    check("O7: peer disconnect strips tack, restores legality, clears crime context, unparks Horse B, and deletes stand-in proxy",
+    check("O7: peer disconnect strips tack, keeps original legality false, clears crime context, unparks Horse B, and deletes stand-in proxy",
         next(horseB.invItems) == nil and horseB.mountIsLegal == false
         and countEvt("m3_peerhorse_ctx", "tsem_horseForSale_2 0", mark) == 1
         and resumedHorseB == true
         and removedIds[spawnedProxy.id] == true)
 
     -- Cleanup stubs
-    for _, n in ipairs({ bracketName, "tsem_sedivka", "tsem_horseForSale_2", "lent_horse", "kcd2mp_peerhorse_2" }) do ENTS[n] = nil end
-    KCD2MP.ghosts["1"] = nil; KCD2MP.ghosts["2"] = nil
-    KCD2MP.ghostHorseName["1"] = nil; KCD2MP.ghostHorseName["2"] = nil
+    for _, n in ipairs({ bracketName, "tsem_sedivka", "tsem_horseForSale_2", "lent_horse", "kcd2mp_peerhorse_1", "kcd2mp_peerhorse_2", "kcd2mp_peerhorse_3", "kcd2mp_horse_1" }) do ENTS[n] = nil end
+    KCD2MP.ghosts["1"] = nil; KCD2MP.ghosts["2"] = nil; KCD2MP.ghosts["3"] = nil
+    KCD2MP.ghostHorseName["1"] = nil; KCD2MP.ghostHorseName["2"] = nil; KCD2MP.ghostHorseName["3"] = nil
     KCD2MP.w137.host, KCD2MP.w137.joiner, KCD2MP.w137.active = false, false, false
     player.player = nil
     System.GetEntity = origGetEnt
@@ -585,28 +667,32 @@ do
         removedIds[eid] = true
     end
 
-    -- W1: Joiner whistle releases own horse from Host puppet stream for 15 s
+    -- W1: Joiner whistle & ownership permanently suppress own horse from Host puppet stream (H4)
     local jHorse = mkHorse("nebakovPruzkum_herynk", 901, 50, 50, 0)
     player.player = { GetHorseId = function() return jHorse.id end }
+    KCD2MP.w137.joiner, KCD2MP.w137.active = true, true
     KCD2MP.w131.joiner, KCD2MP.w131.guard, KCD2MP.w131.shared, KCD2MP.w131.aliveAt = true, true, true, NOW
     KCD2MP.npcPuppets["nebakovPruzkum_herynk"] = {}
     local mark = #LOG
-    check("W1: joiner whistle releases own horse from puppet stream for 15 s",
-        KCD2MP_M3OnJoinerWhistle(15.0) == true
+    check("W1: joiner whistle unbinds puppet and suppresses own horse from host stream",
+        KCD2MP_M3OnJoinerWhistle() == true
         and KCD2MP.npcPuppets["nebakovPruzkum_herynk"] == nil
         and KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true
         and countEvt("w136_ride", "nebakovPruzkum_herynk 1", mark) >= 1)
-    NOW = NOW + 10
-    KCD2MP_W136RideTick()
-    check("W1b: after 10 s (< 15 s), joiner's horse is still protected from stale host stream",
-        KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true)
-    NOW = NOW + 6
+    NOW = NOW + 20
+    KCD2MP.w131.aliveAt = NOW
     mark = #LOG
     KCD2MP_W136RideTick()
-    check("W1c: after 16 s (> 15 s) unmounted, stream hold expires cleanly",
+    check("W1b: after 20 s (> 15 s whistle / > 3 s dismount), joiner's own companion horse stays permanently suppressed from host stream",
+        KCD2MP_W136Ridden("nebakovPruzkum_herynk") == true
+        and countEvt("w136_ride", "nebakovPruzkum_herynk 0", mark) == 0)
+    mark = #LOG
+    KCD2MP_M3SeedOwnHorse("-")
+    check("W1c: clearing joiner's own horse lifts stream hold cleanly",
         KCD2MP_W136Ridden("nebakovPruzkum_herynk") == false
         and countEvt("w136_ride", "nebakovPruzkum_herynk 0", mark) == 1)
     ENTS["nebakovPruzkum_herynk"] = nil; BY_ID[901] = nil
+    KCD2MP.w137.joiner, KCD2MP.w137.active = false, false
     KCD2MP.w131.joiner, KCD2MP.w131.guard, KCD2MP.w131.shared = false, false, false
     player.player = nil
 

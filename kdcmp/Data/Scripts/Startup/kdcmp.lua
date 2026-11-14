@@ -7124,8 +7124,14 @@ end
 -- settle the host's stream is taken again, from where the rider left it -- the
 -- host's horse is there too, so nothing is teleported back.
 --   WO136-RIDE take npc=<horse> | return npc=<horse> after_s=<F1>
-KCD2MP.w136.ridden = {}          -- horse name -> { at = os.clock(), until = nil | release time }
+KCD2MP.w136.ridden = {}          -- horse name -> { at = os.clock(), untilAt = nil | release time, alias = nil | lh* }
+KCD2MP.w136.riddenAlias = KCD2MP.w136.riddenAlias or {}   -- lhXXXXXXXX -> horse name (WO-217 B.3 >= 60-char stream aliases)
 KCD2MP.w136.rideReturnS = 3.0    -- after the dismount, the host's stream is ignored this much longer
+
+function KCD2MP.w136.aliasOf(name)
+    if type(name) == "string" and #name >= 60 and KCD2MP_W217Alias then return KCD2MP_W217Alias(name) end
+    return nil
+end
 
 function KCD2MP.w136.body(name)
     local e = nil
@@ -7156,16 +7162,24 @@ function KCD2MP_W136MountedHorse()
     return nil
 end
 
--- Is this host-streamed horse ridden here (its host stream ignored)?
+-- Is this host-streamed horse ridden here (or owned by this joiner: H4)?
 function KCD2MP_W136Ridden(name)
-    local r = KCD2MP.w136.ridden[name]
+    if KCD2MP_M3IsJoinerOwnHorseStream and KCD2MP_M3IsJoinerOwnHorseStream(name) then return true end
+    local w = KCD2MP.w136
+    local key = name
+    local r = w.ridden[key]
+    if not r and w.riddenAlias and w.riddenAlias[name] then
+        key = w.riddenAlias[name]
+        r = w.ridden[key]
+    end
     if not r then return false end
     if r.untilAt and os.clock() > r.untilAt then
-        KCD2MP.w136.ridden[name] = nil
+        w.ridden[key] = nil
+        if r.alias and w.riddenAlias then w.riddenAlias[r.alias] = nil end
         mp_log(string.format("WO136-RIDE return npc=%s after_s=%.1f -- the host's world has its horse again (bound where the rider left it)",
-            name, os.clock() - (r.at or os.clock())))
-        KCD2MP_EmitEvent("w136_ride", name .. " 0")
-        if KCD2MP_W172GroundSnap then pcall(KCD2MP_W172GroundSnap, name, nil, "ride-return") end   -- WO-172 R1
+            key, os.clock() - (r.at or os.clock())))
+        KCD2MP_EmitEvent("w136_ride", key .. " 0")
+        if KCD2MP_W172GroundSnap then pcall(KCD2MP_W172GroundSnap, key, nil, "ride-return") end   -- WO-172 R1
         return false
     end
     return true
@@ -7174,19 +7188,31 @@ end
 function KCD2MP_W136RideTake(name)
     local w = KCD2MP.w136
     if w.ridden[name] and not w.ridden[name].untilAt then return end
+    local al = w.aliasOf and w.aliasOf(name) or nil
     local p = KCD2MP.npcPuppets[name]
-    local wasPuppet = p ~= nil
-    local wasParked = KCD2MP.w131 and KCD2MP.w131.parked[name] ~= nil
+    local pa = al and KCD2MP.npcPuppets[al] or nil
+    local wasPuppet = (p ~= nil) or (pa ~= nil)
+    local wasParked = KCD2MP.w131 and (KCD2MP.w131.parked[name] ~= nil or (al ~= nil and KCD2MP.w131.parked[al] ~= nil))
     if not (wasPuppet or wasParked or w.ridden[name]) then return end   -- not the host's horse copy: an ordinary local ride
-    w.ridden[name] = { at = os.clock() }
+    w.ridden[name] = { at = os.clock(), alias = al }
+    if al then w.riddenAlias[al] = name end
     w.stats.rides = w.stats.rides + 1
     if p then
         KCD2MP_NpcNativeSync(name, p, nil, false, "ridden")
         KCD2MP.npcPuppets[name] = nil
     end
-    if KCD2MP.w131 then KCD2MP.w131.parked[name] = nil end
+    if pa and al then
+        KCD2MP_NpcNativeSync(al, pa, nil, false, "ridden")
+        KCD2MP.npcPuppets[al] = nil
+    end
+    if KCD2MP.w131 then
+        KCD2MP.w131.parked[name] = nil
+        if al then KCD2MP.w131.parked[al] = nil end
+    end
     KCD2MP._npcResumePending[name] = nil
+    if al then KCD2MP._npcResumePending[al] = nil end
     mp_wo102_resume(name, "ridden")
+    if al then mp_wo102_resume(al, "ridden") end
     pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
     local e = KCD2MP.w136.body(name)
     if e then pcall(function() e:Hide(0) end) end
@@ -7196,11 +7222,17 @@ function KCD2MP_W136RideTake(name)
 end
 
 function KCD2MP_W136RideEnd(name)
-    local r = KCD2MP.w136.ridden[name]
+    local w = KCD2MP.w136
+    local r = w.ridden[name]
     if not r or r.untilAt then return end
-    r.untilAt = os.clock() + KCD2MP.w136.rideReturnS
+    if KCD2MP_M3IsJoinerOwnHorseStream and KCD2MP_M3IsJoinerOwnHorseStream(name) then
+        w.ridden[name] = nil
+        if r.alias and w.riddenAlias then w.riddenAlias[r.alias] = nil end
+        return
+    end
+    r.untilAt = os.clock() + w.rideReturnS
     mp_log(string.format("WO136-RIDE dismount npc=%s -- the host's stream takes it back in %.1f s (the host's horse follows the rider there)",
-        name, KCD2MP.w136.rideReturnS))
+        name, w.rideReturnS))
 end
 
 -- From the interp tick's riding check (100 ms): a mount / a dismount of a host horse copy.
@@ -11241,23 +11273,48 @@ function KCD2MP_SetGhostHorse(id, name)
 
     local hd = KCD2MP.horseGhosts[id]
     local ghost = KCD2MP.ghosts[id]
-    if name ~= "" and hd and not hd.isWorldHorse and not hd.isPeerProxy
-       and KCD2MP._mountedHorseName ~= name
-       and not (KCD2MP_M3IsHostOwnHorse and KCD2MP_M3IsHostOwnHorse(name))
-       and ghost and ghost.istate and ghost.istate.isRiding then
-        local world = nil
-        pcall(function() world = System.GetEntityByName(name) end)
-        if world and tostring(world.class or "") == "Horse" then
-            mp_log("GHOST_HORSE swapping proxy for world horse '" .. name .. "' id=" .. id)
+    if name ~= "" and hd and not hd.isWorldHorse and ghost and ghost.istate and ghost.istate.isRiding then
+        local wp = nil
+        pcall(function() wp = ghost.entity and ghost.entity:GetWorldPos() or nil end)
+        local gx = wp and wp.x or (ghost.istate.tx or 0)
+        local gy = wp and wp.y or (ghost.istate.ty or 0)
+        local gz = wp and wp.z or (ghost.istate.tz or 0)
+        local worldAdoptable = false
+        if KCD2MP.horseAdoptEnabled ~= false
+           and KCD2MP._mountedHorseName ~= name
+           and not (KCD2MP_M3IsCollidingPeerHorse and KCD2MP_M3IsCollidingPeerHorse(id, name))
+           and not (KCD2MP_M3IsHostOwnHorse and KCD2MP_M3IsHostOwnHorse(name)) then
+            local world = nil
+            pcall(function() world = System.GetEntityByName(name) end)
+            if world and tostring(world.class or "") == "Horse" then
+                local wpos = nil
+                pcall(function() wpos = world:GetWorldPos() end)
+                if wpos then
+                    local dx, dy = wpos.x - gx, wpos.y - gy
+                    worldAdoptable = (dx * dx + dy * dy) <= (60 * 60)
+                end
+            end
+        end
+        local shouldSwap = false
+        if hd.isPeerProxy then
+            local owned = KCD2MP_M3PeerHorseOf and KCD2MP_M3PeerHorseOf(id) or nil
+            shouldSwap = worldAdoptable or (owned ~= name)
+        else
+            shouldSwap = worldAdoptable or (KCD2MP_M3ShouldSwapGenericToPeerProxy and KCD2MP_M3ShouldSwapGenericToPeerProxy(id, name) == true)
+        end
+        if shouldSwap then
+            mp_log("GHOST_HORSE swapping proxy for '" .. name .. "' id=" .. id)
             if ghost.istate.nativeMounted then
+                if KCD2MP_W154RideNative then pcall(KCD2MP_W154RideNative, id, false) end
                 pcall(function() ghost.entity.human:ForceDismount() end)
                 ghost.istate.nativeMounted = false
             end
-            KCD2MP_RemoveHorse(id)
-            local wp = nil
-            pcall(function() wp = ghost.entity:GetWorldPos() end)
-            KCD2MP_SpawnHorse(id, wp and wp.x or 0, wp and wp.y or 0, wp and wp.z or 0,
-                ghost.istate.tr or 0)
+            if hd.isPeerProxy and KCD2MP_M3RetirePeerProxyForSwap then
+                KCD2MP_M3RetirePeerProxyForSwap(id, name, worldAdoptable)
+            else
+                KCD2MP_RemoveHorse(id)
+            end
+            KCD2MP_SpawnHorse(id, gx, gy, gz, ghost.istate.tr or 0)
         end
     end
 end
@@ -11275,7 +11332,8 @@ function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
     -- ridden; on dismount the entry is dropped and the engine takes the
     -- horse back (the WO-32 release principle -- verified on human NPCs,
     -- horse behaviour is live-gated).
-    local wantName = KCD2MP.ghostHorseName[id]
+    local rawWantName = KCD2MP.ghostHorseName[id]
+    local wantName = rawWantName
     -- WO-40 Phase 0: both real host crashes (19:25:05 / 20:23:54 in the
     -- 2026-08-18 bundles) landed within ~1.5 s of an inbound ghost mount.
     -- Two guards, both cheap:
@@ -11293,8 +11351,9 @@ function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
         mp_log("HorseAdopt: '" .. wantName .. "' is the LOCAL player's own mount -- proxy instead (crash guard) id=" .. id)
         wantName = nil
     end
-    if wantName and wantName ~= "" and KCD2MP_M3IsHostOwnHorse and KCD2MP_M3IsHostOwnHorse(wantName) then
-        mp_log("HorseAdopt: '" .. wantName .. "' is the HOST player's own companion horse -- dedicated peer proxy instead id=" .. id)
+    if wantName and wantName ~= "" and ((KCD2MP_M3IsCollidingPeerHorse and KCD2MP_M3IsCollidingPeerHorse(id, wantName))
+       or (KCD2MP_M3IsHostOwnHorse and KCD2MP_M3IsHostOwnHorse(wantName))) then
+        mp_log("HorseAdopt: '" .. wantName .. "' collides with host or another partner's companion horse -- dedicated peer proxy instead id=" .. id)
         wantName = nil
     end
     if wantName and wantName ~= "" then
@@ -11345,7 +11404,7 @@ function KCD2MP_SpawnHorse(id, x, y, z, rotZ)
     end
 
     if KCD2MP_M3TryMountPeerProxy then
-        local okP, peerProxy = pcall(KCD2MP_M3TryMountPeerProxy, id, x, y, z, rotZ)
+        local okP, peerProxy = pcall(KCD2MP_M3TryMountPeerProxy, id, x, y, z, rotZ, rawWantName)
         if okP and peerProxy then return peerProxy end
     end
 
@@ -20733,8 +20792,9 @@ function KCD2MP_W139HostHorses()
                 if n and not seen[n] and not string.find(n, "^kcd2mp_") then
                     seen[n] = true
                     local isHostOwn = (own ~= nil and own ~= 0 and h.id == own)
+                    local isPeerOwn = KCD2MP_M3IsPeerOwnedHorse and KCD2MP_M3IsPeerOwnedHorse(n) or false
                     local legal = false
-                    if not isHostOwn then
+                    if not isHostOwn and not isPeerOwn then
                         if KCD2MP_M3WorldHorseOrigLegal then
                             legal = KCD2MP_M3WorldHorseOrigLegal(n, h)
                         else
@@ -22172,7 +22232,7 @@ KCD2MP.w160.peerHorses = KCD2MP.w160.peerHorses or {}                       -- h
 KCD2MP.w160.horseNearM, KCD2MP.w160.horseSpotM = 15.0, 7.0
 KCD2MP.w160.horseStats = KCD2MP.w160.horseStats or { told = 0, marked = 0, fetched = 0, near = 0, refused = 0 }
 
--- JOINER, from the session tick: this player's own horse changed (bought, bonded, sold) -> the host is told its name.
+-- JOINER, from the session tick: this player's own horse changed (bought, bonded, died) -> the host is told its name.
 function KCD2MP_W160OwnHorseTick()
     local w = KCD2MP.w160
     if not w.horseFetch then return end
@@ -22183,22 +22243,52 @@ function KCD2MP_W160OwnHorseTick()
     o.at = now
     local id = nil
     if player and player.player and player.player.GetHorseId then pcall(function() id = player.player:GetHorseId() end) end
+    local e = nil
+    if id and id ~= 0 then pcall(function() e = System.GetEntity(id) end) end
+    local function isHorseDead(ent)
+        if not ent then return false end
+        local dead = false
+        pcall(function()
+            if ent.actor and ent.actor.IsDead and ent.actor:IsDead() == true then dead = true end
+            if not dead and ent.soul and ent.soul.GetState then
+                local hp = tonumber(ent.soul:GetState("health"))
+                if hp ~= nil and hp <= 0 then dead = true end
+            end
+        end)
+        return dead
+    end
     local name = nil
-    if id and id ~= 0 then
-        local e = nil
-        pcall(function() e = System.GetEntity(id) end)
-        if e and e.class == "Horse" then pcall(function() name = e:GetName() end) end
+    if e and tostring(e.class or "") == "Horse" then
+        if isHorseDead(e) then
+            if o.name then
+                o.name = nil
+                if KCD2MP_M3SeedOwnHorse then pcall(KCD2MP_M3SeedOwnHorse, "-") end
+                mp_log("WO160-HORSE own: this player's horse died -- cleared on the host")
+                KCD2MP_EmitEvent("w160_ownhorse", "-")
+            end
+            return
+        end
+        pcall(function() name = e:GetName() end)
     end
     local okName = name and (KCD2MP_M3IsHorseName and KCD2MP_M3IsHorseName(name) or (string.find(name, "^[%w_]+$") and not string.find(name, "^kcd2mp_")))
     if not okName then name = nil end
-    if name == o.name then return end
-    local was = o.name
-    o.name = name
     if not name then
-        mp_log("WO160-HORSE own: this player has no horse of his own now")
-        if was then KCD2MP_EmitEvent("w160_ownhorse", "-") end
+        -- C2: an unstreamed layer returns GetHorseId() == 0 or GetEntity(id) == nil; never wipe a known ownHorse unless loaded and dead.
+        if o.name then
+            local knownEnt = nil
+            pcall(function() knownEnt = System.GetEntityByName(o.name) end)
+            if knownEnt and tostring(knownEnt.class or "") == "Horse" and isHorseDead(knownEnt) then
+                o.name = nil
+                if KCD2MP_M3SeedOwnHorse then pcall(KCD2MP_M3SeedOwnHorse, "-") end
+                mp_log("WO160-HORSE own: this player's horse died -- cleared on the host")
+                KCD2MP_EmitEvent("w160_ownhorse", "-")
+            end
+        end
         return
     end
+    if name == o.name then return end
+    o.name = name
+    if KCD2MP_M3SeedOwnHorse then pcall(KCD2MP_M3SeedOwnHorse, name) end
     KCD2MP.w160.horseStats.told = KCD2MP.w160.horseStats.told + 1
     mp_log(string.format("WO160-HORSE own %s -- told to the host (its world marks it as this player's)", name))
     KCD2MP_EmitEvent("w160_ownhorse", name)
@@ -26347,7 +26437,74 @@ do
     function KCD2MP_M3IsHorseName(s)
         if type(s) ~= "string" or #s < 1 or #s > 120 then return false end
         if not string.find(s, "^[%w_][%w_%[%]/%-:]*$") then return false end
+        if string.find(s, "//", 1, true) then return false end
         if string.find(string.lower(s), "^kcd2mp_") then return false end
+        return true
+    end
+
+    local function m3_aliasOf(name)
+        if type(name) == "string" and #name >= 60 and KCD2MP_W217Alias then return KCD2MP_W217Alias(name) end
+        return nil
+    end
+
+    local function m3_unbindJoinerHorseKey(key, why)
+        if not key or key == "" then return end
+        local p = KCD2MP.npcPuppets and KCD2MP.npcPuppets[key] or nil
+        if p then
+            KCD2MP_NpcNativeSync(key, p, nil, false, why or "own-horse")
+            KCD2MP.npcPuppets[key] = nil
+        end
+        if KCD2MP.w131 and KCD2MP.w131.parked then KCD2MP.w131.parked[key] = nil end
+        if KCD2MP._npcResumePending then KCD2MP._npcResumePending[key] = nil end
+        mp_wo102_resume(key, why or "own-horse")
+    end
+
+    function KCD2MP_M3SeedOwnHorse(name)
+        name = tostring(name or "")
+        if name == "" or name == "-" then
+            local prev = KCD2MP.m3OwnHorseStreamHold
+            if w.ownHorse then w.ownHorse.name = nil end
+            KCD2MP.m3OwnHorseStreamHold = nil
+            KCD2MP.m3OwnHorseToldRide = nil
+            if prev and prev.name then
+                if KCD2MP.w136 then
+                    if KCD2MP.w136.ridden then KCD2MP.w136.ridden[prev.name] = nil end
+                    if prev.alias and KCD2MP.w136.riddenAlias then KCD2MP.w136.riddenAlias[prev.alias] = nil end
+                end
+                KCD2MP_EmitEvent("w136_ride", prev.name .. " 0")
+            end
+            return true
+        end
+        if not KCD2MP_M3IsHorseName(name) then return false end
+        local al = m3_aliasOf(name)
+        if w.ownHorse then w.ownHorse.name = name end
+        KCD2MP.m3OwnHorseStreamHold = { name = name, alias = al }
+        m3_unbindJoinerHorseKey(name, "own-horse")
+        if al then m3_unbindJoinerHorseKey(al, "own-horse") end
+        pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+        local e = nil
+        pcall(function() e = System.GetEntityByName(name) end)
+        if e and e.Hide then pcall(function() e:Hide(0) end) end
+        if KCD2MP.m3OwnHorseToldRide ~= name then
+            KCD2MP.m3OwnHorseToldRide = name
+            KCD2MP_EmitEvent("w136_ride", name .. " 1")
+        end
+        return true
+    end
+
+    function KCD2MP_M3IsJoinerOwnHorseStream(name)
+        if type(name) ~= "string" or name == "" then return false end
+        local joinerOn = (KCD2MP.w137 and KCD2MP.w137.joiner == true)
+            or (KCD2MP.w131 and KCD2MP_W131IsActive and KCD2MP_W131IsActive() == true)
+        if not joinerOn then return false end
+        local hold = KCD2MP.m3OwnHorseStreamHold
+        local own = (hold and hold.name) or (w.ownHorse and w.ownHorse.name) or nil
+        if not own then return false end
+        local al = (hold and hold.alias) or m3_aliasOf(own)
+        if name ~= own and name ~= al then return false end
+        if (KCD2MP.npcPuppets and KCD2MP.npcPuppets[name]) or (KCD2MP.w131 and KCD2MP.w131.parked and KCD2MP.w131.parked[name]) then
+            m3_unbindJoinerHorseKey(name, "own-horse")
+        end
         return true
     end
 
@@ -26396,10 +26553,37 @@ do
 
     local function m3_ownerOf(horseName)
         if not horseName or horseName == "" then return nil end
+        local bestPeer, bestNum = nil, nil
         for p, hn in pairs(w.peerHorses or {}) do
-            if hn == horseName then return p end
+            if hn == horseName then
+                local ps = tostring(p)
+                local pn = tonumber(ps) or 1e9
+                if bestPeer == nil or pn < bestNum or (pn == bestNum and ps < bestPeer) then
+                    bestPeer, bestNum = ps, pn
+                end
+            end
         end
-        return nil
+        return bestPeer
+    end
+
+    local function m3_primaryOwnerOf(horseName)
+        if not horseName or horseName == "" or KCD2MP_M3IsHostOwnHorse(horseName) then return nil end
+        return m3_ownerOf(horseName)
+    end
+
+    function KCD2MP_M3IsPeerOwnedHorse(horseName)
+        return m3_ownerOf(horseName) ~= nil
+    end
+
+    function KCD2MP_M3PeerHorseOf(peer)
+        return w.peerHorses and w.peerHorses[tostring(peer)] or nil
+    end
+
+    function KCD2MP_M3IsCollidingPeerHorse(peer, horseName)
+        if not horseName or horseName == "" then return false end
+        if KCD2MP_M3IsHostOwnHorse(horseName) then return true end
+        local primary = m3_primaryOwnerOf(horseName)
+        return primary ~= nil and primary ~= tostring(peer)
     end
 
     local function m3_stripEntityTack(key, why)
@@ -26522,15 +26706,35 @@ do
         return pr
     end
 
-    function KCD2MP_M3TryMountPeerProxy(id, x, y, z, rotZ)
+    function KCD2MP_M3TryMountPeerProxy(id, x, y, z, rotZ, rawWantName)
         local peer = tostring(id)
         local owned = w.peerHorses[peer]
         if not owned then return nil end
-        local sameAsHost = KCD2MP_M3IsHostOwnHorse(owned)
+        local wn = tostring(rawWantName or "")
+        if wn ~= "" and wn ~= owned then return nil end   -- H5: partner mounted a different/unowned horse
+
+        local colliding = KCD2MP_M3IsCollidingPeerHorse(peer, owned)
+        if wn == "" and not colliding and KCD2MP.horseAdoptEnabled ~= false and KCD2MP._mountedHorseName ~= owned then
+            local world = nil
+            pcall(function() world = System.GetEntityByName(owned) end)
+            if world and tostring(world.class or "") == "Horse" then
+                local wpos = nil
+                pcall(function() wpos = world:GetWorldPos() end)
+                if wpos then
+                    local dx, dy = wpos.x - (x or 0), wpos.y - (y or 0)
+                    if (dx * dx + dy * dy) <= (60 * 60) then
+                        return nil   -- H5: wait for HorseInfoDown and swap cleanly onto world horse (no duplicate proxy)
+                    end
+                end
+            end
+        end
+
         local existing = w.peerProxies[peer]
-        if not sameAsHost and not existing and (w.peerHorseTackWanted[peer] or "") == "" then return nil end
+        if not colliding and not existing and (w.peerHorseTackWanted[peer] or "") == "" then return nil end
+        local hadBefore = existing ~= nil
         local pr = KCD2MP_M3EnsurePeerProxy(peer, x, y, z, rotZ or 0, owned)
         if not (pr and pr.entity) then return nil end
+        if not hadBefore then pr.spawnedForRide = true end
         KCD2MP.horseGhosts[peer] = {
             entity = pr.entity,
             entityId = pr.entityId,
@@ -26542,12 +26746,35 @@ do
         return pr.entity
     end
 
+    function KCD2MP_M3ShouldSwapGenericToPeerProxy(id, name)
+        local peer = tostring(id)
+        local owned = w.peerHorses[peer]
+        if not owned or owned ~= name then return false end
+        return KCD2MP_M3IsCollidingPeerHorse(peer, name)
+            or w.peerProxies[peer] ~= nil
+            or (w.peerHorseTackWanted[peer] or "") ~= ""
+    end
+
+    function KCD2MP_M3RetirePeerProxyForSwap(id, newName, worldAdoptable)
+        local peer = tostring(id)
+        local hd = KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] or nil
+        if KCD2MP.horseGhosts then KCD2MP.horseGhosts[peer] = nil end
+        local pr = w.peerProxies[peer]
+        local owned = w.peerHorses[peer]
+        if worldAdoptable or not owned or (newName ~= owned and pr and pr.spawnedForRide) then
+            m3_removePeerProxy(peer, worldAdoptable and "swap-to-world-horse" or "swap-to-other-horse")
+            return
+        end
+        if hd then KCD2MP_M3ParkPeerProxy(peer, hd) end
+    end
+
     function KCD2MP_M3ParkPeerProxy(id, horseData)
         local peer = tostring(id)
         if not w.peerHorses[peer] then
             m3_removePeerProxy(peer, "dismount-unowned")
             return false
         end
+        if w.peerProxies[peer] then w.peerProxies[peer].spawnedForRide = nil end
         local pname = (w.peerProxies[peer] and w.peerProxies[peer].name) or ("kcd2mp_peerhorse_" .. peer)
         if KCD2MP_W172HorseReleased then pcall(KCD2MP_W172HorseReleased, pname, horseData.entity) end
         pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. pname)
@@ -26555,33 +26782,13 @@ do
         return true
     end
 
-    local function m3_releaseWorldHorse(name, why, forceEvenIfOwned)
-        if not name or name == "" then return end
-        if not forceEvenIfOwned and m3_ownerOf(name) ~= nil and not KCD2MP_M3IsHostOwnHorse(name) then return end
-        m3_stripEntityTack("world:" .. name, why or "release")
-        local leg = w.peerHorseLegal[name]
-        if leg then
-            w.peerHorseLegal[name] = nil
-            local e = nil
-            pcall(function() e = System.GetEntityByName(name) end)
-            if e and not KCD2MP_M3IsHostOwnHorse(name) then
-                pcall(function() e:SetMountIsLegal(leg.orig == true) end)
-            end
-            if leg.ctxOn then KCD2MP_EmitEvent("m3_peerhorse_ctx", name .. " 0") end
-        end
-        if w.parkedPeerHorses[name] then
-            w.parkedPeerHorses[name] = nil
-            if not KCD2MP_M3IsHostOwnHorse(name) and not (KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(name)) then
-                pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
-            end
-        end
-    end
-
     local function m3_syncWorldHorse(peer, name)
         if not name or name == "" then return false, "none" end
         if KCD2MP_M3IsHostOwnHorse(name) then
-            m3_releaseWorldHorse(name, "host-owns-same-horse", true)
             return false, "same-as-host"
+        end
+        if KCD2MP_M3IsCollidingPeerHorse(peer, name) then
+            return false, "colliding-peer"
         end
         local e = nil
         pcall(function() e = System.GetEntityByName(name) end)
@@ -26595,13 +26802,58 @@ do
             leg = { orig = orig, ctxOn = false }
             w.peerHorseLegal[name] = leg
         end
-        pcall(function() e:SetMountIsLegal(true) end)
-        if not leg.ctxOn then
+        -- M10: NEVER call SetMountIsLegal(true) on Host's world horse (avoids .whs save pollution and Host free trader theft);
+        -- Joiner's avatar mounts via ForceMount and only needs the runtime XGenAI crime_ignoredHorseTheft_Horse context.
+        local hostMountingIt = (KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() == name) or KCD2MP._mountedHorseName == name
+        if not hostMountingIt and not leg.ctxOn then
             leg.ctxOn = true
             KCD2MP_EmitEvent("m3_peerhorse_ctx", name .. " 1")
         end
         m3_applyTackToEntity("world:" .. name, e, name, false, w.peerHorseTackWanted[peer] or "")
         return true, "loaded"
+    end
+
+    local function m3_releaseWorldHorse(name, why, forceEvenIfOwned)
+        if not name or name == "" then return end
+        local nextOwner = (not forceEvenIfOwned) and m3_primaryOwnerOf(name) or nil
+        if nextOwner ~= nil then
+            m3_syncWorldHorse(nextOwner, name)
+            return
+        end
+        m3_stripEntityTack("world:" .. name, why or "release")
+        local leg = w.peerHorseLegal[name]
+        if leg then
+            w.peerHorseLegal[name] = nil
+            if leg.ctxOn then KCD2MP_EmitEvent("m3_peerhorse_ctx", name .. " 0") end
+        end
+        if w.parkedPeerHorses[name] then
+            w.parkedPeerHorses[name] = nil
+            local activelyMounted = (KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() == name) or KCD2MP._mountedHorseName == name
+            if not activelyMounted then
+                for _, hd in pairs(KCD2MP.horseGhosts or {}) do
+                    if hd.isWorldHorse and hd.worldName == name then activelyMounted = true; break end
+                end
+            end
+            if not activelyMounted and KCD2MP.w136 and KCD2MP.w136.ridden then
+                local r = KCD2MP.w136.ridden[name]
+                if r and r.untilAt then
+                    KCD2MP.w136.ridden[name] = nil
+                    if r.alias and KCD2MP.w136.riddenAlias then KCD2MP.w136.riddenAlias[r.alias] = nil end
+                end
+            end
+            if not KCD2MP_M3IsHostOwnHorse(name) and not activelyMounted then
+                pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
+            end
+        end
+    end
+
+    function KCD2MP_M3OnHostLocalMountStart(horseName)
+        if not (KCD2MP.w137 and KCD2MP.w137.host) or not horseName then return end
+        local leg = w.peerHorseLegal and w.peerHorseLegal[horseName]
+        if leg and not leg.orig and leg.ctxOn then
+            leg.ctxOn = false
+            KCD2MP_EmitEvent("m3_peerhorse_ctx", horseName .. " 0")
+        end
     end
 
     function KCD2MP_M3SetPeerHorse(peer, name, tackCsv)
@@ -26626,6 +26878,9 @@ do
                 m3_removePeerProxy(peer, "peer-switched-horse")
             end
         end
+        if KCD2MP_M3IsHostOwnHorse(name) then
+            m3_releaseWorldHorse(name, "host-owns-same-horse", true)
+        end
         local loaded, state = m3_syncWorldHorse(peer, name)
         if loaded and not w.pendingFetch[peer] and w.peerProxies[peer]
            and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] and KCD2MP.horseGhosts[peer].isPeerProxy) then
@@ -26636,12 +26891,12 @@ do
         w.horseStats.marked = w.horseStats.marked + 1
         mp_log(string.format("WO160-HORSE marked %s as ghost %s's own horse here (%s)", name, peer,
             state == "loaded" and "loaded in this world"
-            or state == "same-as-host" and "same name as the host's horse -- uses NO_SAVE stand-in"
+            or (state == "same-as-host" or state == "colliding-peer") and "collides with another owner's horse -- uses NO_SAVE stand-in"
             or "not loaded here now -- it is fetched when it is"))
         return true
     end
 
-    function KCD2MP_M3OnJoinerWhistle(holdS)
+    function KCD2MP_M3OnJoinerWhistle()
         local name = nil
         if player and player.player and player.player.GetHorseId then
             local id = nil
@@ -26657,24 +26912,9 @@ do
         end
         if not (name and KCD2MP_M3IsHorseName(name)) then return false end
         if (KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() == name) or KCD2MP._mountedHorseName == name then return false end
-        local w136 = KCD2MP.w136
-        local hadActive = w136 and w136.ridden and w136.ridden[name] ~= nil and not w136.ridden[name].untilAt
         if KCD2MP_W136RideTake then pcall(KCD2MP_W136RideTake, name) end
-        local dur = tonumber(holdS) or 15.0
-        if w136 and w136.ridden then
-            local wasTracked = w136.ridden[name] ~= nil
-            if not hadActive then
-                w136.ridden[name] = { at = os.clock(), untilAt = os.clock() + dur }
-            end
-            if not wasTracked then
-                KCD2MP_EmitEvent("w136_ride", name .. " 1")
-            end
-        end
-        pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. name)
-        local e = nil
-        pcall(function() e = System.GetEntityByName(name) end)
-        if e and e.Hide then pcall(function() e:Hide(0) end) end
-        mp_log(string.format("WO160-HORSE joiner whistle: %s released from host stream for %.0f s so CallHorse can materialize/gallop it", name, dur))
+        KCD2MP_M3SeedOwnHorse(name)
+        mp_log(string.format("WO160-HORSE joiner whistle: %s held off host stream permanently while owned so CallHorse can materialize/gallop it", name))
         return true
     end
 
@@ -26717,9 +26957,9 @@ do
             return true
         end
 
-        local sameAsHost = KCD2MP_M3IsHostOwnHorse(name)
+        local colliding = KCD2MP_M3IsCollidingPeerHorse(src, name)
         local e = nil
-        if not sameAsHost then pcall(function() e = System.GetEntityByName(name) end) end
+        if not colliding then pcall(function() e = System.GetEntityByName(name) end) end
         if not (e and tostring(e.class or "") == "Horse") then
             local prExisting = w.peerProxies[src]
             if prExisting and prExisting.entity then
@@ -26728,6 +26968,7 @@ do
                 if pp0 then
                     local d0 = math.sqrt((ap.x - pp0.x) ^ 2 + (ap.y - pp0.y) ^ 2)
                     if d0 <= w.horseNearM then
+                        prExisting.spawnedForRide = nil
                         st.near = st.near + 1
                         mp_log(string.format("WO160-HORSE stand-in %s is already %.0f m from ghost %s's avatar -- left where it is", prExisting.name, d0, src))
                         return true
@@ -26736,13 +26977,14 @@ do
             end
             local pr = KCD2MP_M3EnsurePeerProxy(src, px, py, pz, yaw, name)
             if not (pr and pr.entity) then return refuse("stand-in spawn failed") end
+            pr.spawnedForRide = nil
             if KCD2MP_W172GroundSnap then pcall(KCD2MP_W172GroundSnap, pr.name, pr.entity, "whistle-standin") end
-            if not sameAsHost then
+            if not colliding then
                 w.pendingFetch[src] = { name = name, x = px, y = py, z = pz, yaw = yaw, at = os.clock(), standIn = true }
             end
             st.fetched = st.fetched + 1
             mp_log(string.format("WO160-HORSE stand-in fetch %s for %s: placed %.0f m beside ghost %s's avatar (%s)",
-                pr.name, name, w.horseSpotM, src, sameAsHost and "same name as host horse" or "world layer unstreamed"))
+                pr.name, name, w.horseSpotM, src, colliding and "colliding companion horse" or "world layer unstreamed"))
             return true
         end
 
@@ -26778,14 +27020,15 @@ do
 
     function KCD2MP_M3ShouldParkOnDismount(peer, horseName)
         if not horseName or horseName == "" or KCD2MP_M3IsHostOwnHorse(horseName) then return false end
-        return w.peerHorses[tostring(peer)] == horseName or m3_ownerOf(horseName) ~= nil
+        local primary = m3_primaryOwnerOf(horseName)
+        return primary ~= nil and (primary == tostring(peer) or w.peerHorses[tostring(peer)] == horseName)
     end
 
     function KCD2MP_M3OnWorldHorseAdopted(peer, horseName, ent)
         if not horseName then return end
         w.parkedPeerHorses[horseName] = nil
-        local owner = m3_ownerOf(horseName)
-        if owner and not KCD2MP_M3IsHostOwnHorse(horseName) and ent then
+        local owner = m3_primaryOwnerOf(horseName)
+        if owner and ent then
             m3_applyTackToEntity("world:" .. horseName, ent, horseName, false, w.peerHorseTackWanted[owner] or "")
         end
     end
@@ -26800,6 +27043,7 @@ do
     end
 
     function KCD2MP_M3BeforeHostSave()
+        w.saveTackStrippedAt = os.clock()
         if w.saveTackStripped then return true end
         w.saveTackStripped = true
         local keys = {}
@@ -26811,6 +27055,7 @@ do
     end
 
     function KCD2MP_M3AfterHostSave()
+        w.saveTackStrippedAt = nil
         if not w.saveTackStripped then return true end
         w.saveTackStripped = false
         for peer, name in pairs(w.peerHorses) do
@@ -26820,9 +27065,13 @@ do
     end
 
     function KCD2MP_M3HostTick()
+        if w.saveTackStripped and (os.clock() - (w.saveTackStrippedAt or 0)) >= 15.0 then
+            mp_log("WO160-HORSE saveTackStripped safety timeout (15 s) -- restoring peer horse tack")
+            KCD2MP_M3AfterHostSave()
+        end
         local maxPhysicsM = KCD2MP.W157_MOUNT_MAX_M or 150.0
         for src, pf in pairs(w.pendingFetch) do
-            if w.peerHorses[src] ~= pf.name or KCD2MP_M3IsHostOwnHorse(pf.name) then
+            if w.peerHorses[src] ~= pf.name or KCD2MP_M3IsCollidingPeerHorse(src, pf.name) then
                 w.pendingFetch[src] = nil
             else
                 local e = nil
@@ -26865,6 +27114,11 @@ do
                and not (KCD2MP.horseGhosts and KCD2MP.horseGhosts[peer] and KCD2MP.horseGhosts[peer].isPeerProxy) then
                 m3_removePeerProxy(peer, "world-horse-loaded")
             end
+            local pr = w.peerProxies[peer]
+            if pr and pr.entity then
+                -- M11: periodically re-assert tack on NO_SAVE stand-in proxies too
+                m3_applyTackToEntity("proxy:" .. peer, pr.entity, pr.name, true, w.peerHorseTackWanted[peer] or "")
+            end
             if loaded and w.parkedPeerHorses[name] and not (KCD2MP.w123 and KCD2MP.w123.paused)
                and not (KCD2MP_W151HorseRidden and KCD2MP_W151HorseRidden(name)) then
                 pcall(System.ExecuteCommand, "wh_ai_PauseNPC " .. name)
@@ -26875,6 +27129,7 @@ do
 
     function KCD2MP_M3ReleaseAllPeerHorses(why)
         w.saveTackStripped = false
+        w.saveTackStrippedAt = nil
         local peers = {}
         for p in pairs(w.peerHorses) do peers[#peers + 1] = p end
         for _, p in ipairs(peers) do KCD2MP_M3SetPeerHorse(p, "-", "") end
@@ -26895,11 +27150,22 @@ do
             return origBeforeSave(why)
         end
     end
+    local origW174Clean = KCD2MP_W174Clean
+    if origW174Clean then
+        function KCD2MP_W174Clean(why)
+            if tostring(why or "") == "save" and KCD2MP.w137 and KCD2MP.w137.host then
+                pcall(KCD2MP_M3BeforeHostSave)
+            end
+            return origW174Clean(why)
+        end
+    end
     local origSaveDone = KCD2MP_W178SaveDone
     if origSaveDone then
         function KCD2MP_W178SaveDone(result, file, why)
             local r = origSaveDone(result, file, why)
-            pcall(KCD2MP_M3AfterHostSave)
+            if tostring(result or "") ~= "busy" then
+                pcall(KCD2MP_M3AfterHostSave)
+            end
             return r
         end
     end
@@ -27710,10 +27976,15 @@ do
         pcall(function() name = horse:GetName() end)
         local okName = name and ((KCD2MP_M3IsHorseName and KCD2MP_M3IsHorseName(name)) or (string.find(name, "^[%w_]+$") and not string.find(name, "^kcd2mp_")))
         if not okName then return end
+        if KCD2MP_M3OnHostLocalMountStart then pcall(KCD2MP_M3OnHostLocalMountStart, name) end
         W.mountingName, W.mountingAt = name, os.clock()
         W.rideStats.mountStarts = W.rideStats.mountStarts + 1
         mp_log("WO151-RIDE mount starts npc=" .. name .. " -- the rider's: no puppet, no writer, no park, the host's stream ignored")
-        if KCD2MP.npcPuppets[name] or (KCD2MP.w131 and KCD2MP.w131.parked[name]) then KCD2MP_W136RideTake(name) end
+        local al = (#name >= 60 and KCD2MP_W217Alias) and KCD2MP_W217Alias(name) or nil
+        if KCD2MP.npcPuppets[name] or (al and KCD2MP.npcPuppets[al])
+           or (KCD2MP.w131 and (KCD2MP.w131.parked[name] or (al and KCD2MP.w131.parked[al]))) then
+            KCD2MP_W136RideTake(name)
+        end
     end
 
     -- A partner's avatar adopts this world horse (KCD2MP_SpawnHorse): out of every NPC path, its stream
@@ -27724,24 +27995,36 @@ do
         local w = KCD2MP.w136
         local r = w.ridden[name]
         if r and not r.untilAt then return end
+        local al = w.aliasOf and w.aliasOf(name) or nil
         local p = KCD2MP.npcPuppets[name]
-        local wasParked = KCD2MP.w131 and KCD2MP.w131.parked[name] ~= nil
+        local pa = al and KCD2MP.npcPuppets[al] or nil
+        local wasParked = KCD2MP.w131 and (KCD2MP.w131.parked[name] ~= nil or (al ~= nil and KCD2MP.w131.parked[al] ~= nil))
         if p then
             KCD2MP_NpcNativeSync(name, p, nil, false, "ridden-by-avatar")
             KCD2MP.npcPuppets[name] = nil
         end
-        if KCD2MP.w131 then KCD2MP.w131.parked[name] = nil end
+        if pa and al then
+            KCD2MP_NpcNativeSync(al, pa, nil, false, "ridden-by-avatar")
+            KCD2MP.npcPuppets[al] = nil
+        end
+        if KCD2MP.w131 then
+            KCD2MP.w131.parked[name] = nil
+            if al then KCD2MP.w131.parked[al] = nil end
+        end
         KCD2MP._npcResumePending[name] = nil
-        if p or wasParked or KCD2MP._npcPaused[name] then
+        if al then KCD2MP._npcResumePending[al] = nil end
+        if p or pa or wasParked or KCD2MP._npcPaused[name] or (al and KCD2MP._npcPaused[al]) then
             mp_wo102_resume(name, "ridden-by-avatar")
+            if al then mp_wo102_resume(al, "ridden-by-avatar") end
             pcall(System.ExecuteCommand, "wh_ai_ResumeNPC " .. tostring(name))
         end
         local e = w.body(name)
         if e then pcall(function() e:Hide(0) end) end
-        w.ridden[name] = { at = os.clock(), by = "avatar" }
+        w.ridden[name] = { at = os.clock(), by = "avatar", alias = al }
+        if al and w.riddenAlias then w.riddenAlias[al] = name end
         W.rideStats.avatarTakes = W.rideStats.avatarTakes + 1
         mp_log(string.format("WO151-RIDE avatar takes npc=%s puppet=%s parked=%s -- the avatar's ride drives it; the NPC stream for it is ignored",
-            name, tostring(p ~= nil), tostring(wasParked)))
+            name, tostring(p ~= nil or pa ~= nil), tostring(wasParked)))
         KCD2MP_EmitEvent("w136_ride", name .. " 1")
     end
 
@@ -27749,6 +28032,11 @@ do
     function KCD2MP_W151AvatarLeavesHorse(name)
         local r = name and KCD2MP.w136.ridden[name]
         if not r or r.by ~= "avatar" or r.untilAt then return end
+        if KCD2MP_M3IsJoinerOwnHorseStream and KCD2MP_M3IsJoinerOwnHorseStream(name) then
+            KCD2MP.w136.ridden[name] = nil
+            if r.alias and KCD2MP.w136.riddenAlias then KCD2MP.w136.riddenAlias[r.alias] = nil end
+            return
+        end
         r.untilAt = os.clock() + KCD2MP.w136.rideReturnS
         W.rideStats.avatarReturns = W.rideStats.avatarReturns + 1
         mp_log(string.format("WO151-RIDE avatar leaves npc=%s -- the NPC stream takes it back in %.1f s", name, KCD2MP.w136.rideReturnS))
@@ -36103,8 +36391,8 @@ do
                 local real = KCD2MP_W217RealName(al)
                 if real then s = verb .. " " .. real .. (rest or ""); cmd = s end
             end
-            local name = string.match(s, "^%s*wh_ai_ResumeNPC%s+([%w_%-%.]+)")
-            if name and not string.find(name, "^kcd2mp") and KCD2MP_W216JoinerBrainsOff() then
+            local name = string.match(s, "^%s*wh_ai_ResumeNPC%s+([%w_%.%[%]/%-:]+)")
+            if name and #name <= 120 and not string.find(name, "//", 1, true) and not string.find(name, "^kcd2mp") and KCD2MP_W216JoinerBrainsOff() then
                 if W216_RELEASE then
                     W216.stats.blocked = W216.stats.blocked + 1
                     if W216.stats.blocked <= 100 or W216.stats.blocked % 50 == 0 then
@@ -36154,12 +36442,14 @@ do
         end
         return true
     end
-    -- the agent, every 5 s on a joiner: the horse this player rides stays exempt while ridden
+    -- the agent, every 5 s on a joiner: the horse this player rides (or owns as companion) stays exempt
     function KCD2MP_W216Tick()
         if not KCD2MP_W216JoinerBrainsOff() then return false end
         local m = KCD2MP_W151LocalMount and KCD2MP_W151LocalMount() or nil
         if not m and KCD2MP._mountedHorseName then m = KCD2MP._mountedHorseName end
         if m then W216.exemptAt[m] = nil; KCD2MP_W216Exempt(m, 30, "ridden") end
+        local own = KCD2MP.w160 and KCD2MP.w160.ownHorse and KCD2MP.w160.ownHorse.name or nil
+        if own and own ~= m then W216.exemptAt[own] = nil; KCD2MP_W216Exempt(own, 30, "own-horse") end
         return true
     end
     for k, label in pairs(W216.NAMES) do

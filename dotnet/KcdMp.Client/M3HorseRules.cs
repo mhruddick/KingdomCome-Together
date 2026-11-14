@@ -11,12 +11,13 @@ namespace KcdMp.Client;
 public static class M3HorseRules
 {
     public const int MaxHorseEntityNameLen = 120;
+    public const int LongNameMinLen = 60;
     public const int MaxTackClasses = 16;
 
     /// <summary>
     /// Validates authored KCD2 horse entity names, including Trosky bracketed/slashed names such as
     /// <c>horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]</c>, while rejecting spaces, quotes,
-    /// semicolons, control characters, and mod-spawned <c>kcd2mp_*</c> proxies.
+    /// semicolons, consecutive <c>//</c>, control characters, and mod-spawned <c>kcd2mp_*</c> proxies.
     /// </summary>
     public static bool IsHorseEntityName(string? s)
     {
@@ -29,8 +30,26 @@ public static class M3HorseRules
             char c = s[i];
             bool ok = char.IsAsciiLetterOrDigit(c) || c is '_' or '[' or ']' or '/' or '-' or ':';
             if (!ok) return false;
+            if (c == '/' && i > 0 && s[i - 1] == '/') return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// Computes the WO-217 B.3 (<c>long_names</c>) 10-char stream alias (<c>lhXXXXXXXX</c>) for entity names of
+    /// length &gt;= 60, matching <c>wo217rules::long_alias</c> and <c>KCD2MP_W217Alias</c>; returns null when &lt; 60 chars.
+    /// </summary>
+    public static string? LongAlias(string? name)
+    {
+        if (string.IsNullOrEmpty(name) || name.Length < LongNameMinLen) return null;
+        uint h1 = 0, h2 = 0;
+        foreach (char c in name)
+        {
+            uint b = (byte)c;
+            h1 = (h1 * 31u + b) % 65521u;
+            h2 = (h2 * 37u + b) % 65519u;
+        }
+        return $"lh{h1:x4}{h2:x4}";
     }
 
     public static bool IsItemClassGuid(string? s, out string normalized)
@@ -113,4 +132,7 @@ public static class M3HorseRules
 
     public static List<string> ExtractEquippedTackClasses(WhsSave.HenryParts? parts) =>
         parts is null ? [] : WhsSave.ExtractHorseEquippedTackClasses(parts);
+
+    public static bool TryReadSnapshotHorseNameAndTack(WhsSave.HenryParts? parts, out string? horseName, out List<string> tackClasses) =>
+        WhsSave.TryExtractHorseCompanionInfo(parts, out horseName, out tackClasses);
 }

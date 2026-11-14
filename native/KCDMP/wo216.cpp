@@ -535,7 +535,7 @@ void b_spawns(double now) {
 
 void b_actions() {
     int budget = kPerFrame;
-    char cmd[96];
+    char cmd[160];
     while (budget > 0 && !g_pauseQ.empty()) {
         const uint32_t eid = g_pauseQ.back();
         g_pauseQ.pop_back();

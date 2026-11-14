@@ -60,6 +60,7 @@ int wo139_rules_tests(int* passed) {
         RCHECK(is_entity_name("tsem_horseForSale_2", 19), "standard horse entity name");
         RCHECK(!is_entity_name("kcd2mp_peerhorse_1", 18) && !is_entity_name("KCD2MP_horse_2", 14), "mod proxy names refused");
         RCHECK(!is_entity_name("[bad_start]", 11) && !is_entity_name("bad\"quote", 9) && !is_entity_name("bad space", 9), "unsafe chars refused");
+        RCHECK(!is_entity_name("horse[animalcare//horseCare6]", 29), "consecutive // comment marker refused");
         char tooLong[130]; for (int i = 0; i < 121; ++i) tooLong[i] = 'h'; tooLong[121] = 0;
         RCHECK(is_entity_name(tooLong, 120) && !is_entity_name(tooLong, 121), "120 characters at most for entity contexts");
     }

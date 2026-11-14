@@ -1926,6 +1926,7 @@ public partial class GameBridge(ClientConfig config)
             tailForPause.SkipTimeStateChanged += OnLocalSkipTime;
             tailForPause.StoryBeatDetected += OnLocalStoryBeat;
             tailForPause.SaveInitiated += Wo174OnSaveInitiated;      // WO-174
+            tailForPause.SaveInitiated += M3OnHostSaveInitiated;     // M3: strip temp peer horse tack before native host saves
             tailForPause.LevelDetected += OnLocalLevel;              // WO-94
             tailForPause.CutsceneStateChanged += OnLocalCutscene;    // WO-94
             tailForPause.PlayerTeleported += OnLocalTeleport;        // WO-94
@@ -2347,6 +2348,7 @@ public partial class GameBridge(ClientConfig config)
                 tailForPause2.SkipTimeStateChanged -= OnLocalSkipTime;
                 tailForPause2.StoryBeatDetected -= OnLocalStoryBeat;   // WO-90
                 tailForPause2.SaveInitiated -= Wo174OnSaveInitiated;    // WO-174
+                tailForPause2.SaveInitiated -= M3OnHostSaveInitiated;   // M3
                 tailForPause2.LevelDetected -= OnLocalLevel;            // WO-94
                 tailForPause2.CutsceneStateChanged -= OnLocalCutscene;  // WO-94
                 tailForPause2.PlayerTeleported -= OnLocalTeleport;      // WO-94
@@ -4717,6 +4719,7 @@ public partial class GameBridge(ClientConfig config)
             if (payload.Length != 2 + nameLen + Protocol.NpcStateFixedTail) return;
             string npcName = Encoding.UTF8.GetString(payload, 2, nameLen);
             if (!NpcNamePattern.IsMatch(npcName)) return;
+            if (M3DropOwnHorseStream(npcName)) return;   // M3 / H4: joiner's own companion horse (and its lh* alias) is never fed to native writer
             if (!_w136Ridden.IsEmpty && Wo136Rules.DropRidden(_w136Ridden, npcName, DateTime.UtcNow)) return;   // WO-136: the rider's horse
             if (!_w148Held.IsEmpty && Wo148DropCarried(npcName)) return;   // WO-148: a carried body is the carrier's
             int o = 2 + nameLen;

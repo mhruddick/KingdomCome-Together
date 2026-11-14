@@ -274,6 +274,117 @@ public class M3HorseSaveTests
     }
 
     [Fact]
+    public void TryReadSnapshotHorseNameAndTack_extracts_0x12F9_horse_name_and_tack_or_null_for_no_horse()
+    {
+        var (_, js) = WhsSaveTests.Pair();
+        const string bracketHorse = "horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]";
+        var joinHorse = new HorseSpec(
+            HorseBInst, HorseBShared, bracketHorse, 0x7788UL, 42, [0x10],
+            Items: [new("ad7098a2-b7df-4011-85ff-706df42fa574", SaddleCls)],
+            Equipped0001: ["ad7098a2-b7df-4011-85ff-706df42fa574"]);
+
+        var withHorse = WhsSave.PartsFromFile(BuildSaveWithCompanions(js, [BuildHorseSoul(joinHorse)], [(WhsSave.HenrySoul, HorseBInst)]), WhsSave.HenryParts.OriginSnapshot);
+        Assert.True(M3HorseRules.TryReadSnapshotHorseNameAndTack(withHorse, out var hName, out var hTack));
+        Assert.Equal(bracketHorse, hName);
+        Assert.Equal([SaddleCls], hTack);
+
+        var withoutHorse = WhsSave.PartsFromFile(BuildSaveWithCompanions(js, [BuildHorseSoul(joinHorse)], []), WhsSave.HenryParts.OriginSnapshot);
+        Assert.True(M3HorseRules.TryReadSnapshotHorseNameAndTack(withoutHorse, out var noneName, out var noneTack));
+        Assert.Null(noneName);
+        Assert.Empty(noneTack);
+    }
+
+    [Fact]
+    public void FreshDefaultParts_and_v1_fresh_blocks_strip_Hosts_horse_companion_while_preserving_Mutt()
+    {
+        var (hs, _) = WhsSaveTests.Pair();
+        var hostPebbles = new HorseSpec(PebblesInst, PebblesShared, "tsem_sedivka", 0x1001UL, 10, [0xAA]);
+        var hostFile = BuildSaveWithCompanions(
+            hs,
+            [BuildHorseSoul(hostPebbles), BuildDogSoul(MuttInst, WhsSave.MuttSharedSoul, "tvez_vorech")],
+            [(WhsSave.HenrySoul, MuttInst), (WhsSave.HenrySoul, PebblesInst)]);
+
+        // H6: FreshDefaultParts carries no horse_companion extension -> must strip Henry -> Pebbles from 1160!
+        var freshParts = WhsSave.FreshDefaultParts(WhsSave.Inflate(hostFile).Raw);
+        Assert.False(freshParts.Extensions.ContainsKey(WhsSave.HorseCompanionExtensionKey));
+        var freshRes = WhsSave.SpliceParts(hostFile, freshParts, Quest, WhsSave.QuestItemMode.Strip);
+        Assert.True(WhsSave.Verify(freshRes.File).Ok);
+        Assert.Empty(WhsSave.CheckParts(hostFile, freshParts, freshRes.File, Quest, WhsSave.QuestItemMode.Strip));
+
+        var freshOutRaw = WhsSave.Inflate(freshRes.File).Raw;
+        Assert.Null(WhsSave.ReadHenryHorseGuid(freshOutRaw));
+        Assert.Equal([(WhsSave.HenrySoul, MuttInst)], WhsSave.ReadCompanionLinks(freshOutRaw));
+    }
+
+    [Fact]
+    public void Minimal_0x115D_host_horse_promotion_zeroes_foreign_entity_guid_and_omits_foreign_seed_0x12FF()
+    {
+        var (hs, js) = WhsSaveTests.Pair();
+        hs.Seed = 0x11112222u;
+        js.Seed = 0x99998888u;   // foreign playthrough ("Bring my character")
+
+        var hostMinimal115D = Tlv(0x115D, Cat(G(HorseBInst), G(HorseBShared), [0x01, 0x00, 0x00, 0x00]));
+        var joinHorseB = new HorseSpec(
+            HorseBInst, HorseBShared, "nebakovPruzkum_herynk", 0xDEADBEEF12345678UL, 55, [0xFE, 0xDC, 0xBA],
+            Items: [new("ad7098a2-b7df-4011-85ff-706df42fa574", SaddleCls)],
+            Equipped0001: ["ad7098a2-b7df-4011-85ff-706df42fa574"]);
+
+        var hostFile = BuildSaveWithCompanions(hs, [hostMinimal115D], []);
+        var joinParts = WhsSave.PartsFromFile(BuildSaveWithCompanions(js, [BuildHorseSoul(joinHorseB)], [(WhsSave.HenrySoul, HorseBInst)]), WhsSave.HenryParts.OriginSave);
+
+        var res = WhsSave.SpliceParts(hostFile, joinParts, Quest, WhsSave.QuestItemMode.Strip);
+        Assert.True(WhsSave.Verify(res.File).Ok);
+        Assert.Empty(WhsSave.CheckParts(hostFile, joinParts, res.File, Quest, WhsSave.QuestItemMode.Strip));
+
+        var outRaw = WhsSave.Inflate(res.File).Raw;
+        var outHorse = WhsSave.FindSoul(outRaw, HorseBInst)!.Value;
+        Assert.Equal((ushort)0x115E, outHorse.Tag);
+        var fields = WhsSave.SoulFields(outRaw, outHorse);
+        Assert.False(fields.ContainsKey(0x12FF));   // foreign-seed 0x12FF omitted
+        var pay12f9 = WhsSave.Payload(outRaw, fields[0x12F9][0]);
+        Assert.Equal(0UL, BinaryPrimitives.ReadUInt64LittleEndian(pay12f9.AsSpan(pay12f9.Length - 8)));   // entity_guid == 0
+
+        // Missing jHorseGuid in host world: no dangling link in 1160
+        var hostWithoutHorseB = BuildSaveWithCompanions(hs, [], []);
+        var resMissing = WhsSave.SpliceParts(hostWithoutHorseB, joinParts, Quest, WhsSave.QuestItemMode.Strip);
+        Assert.True(WhsSave.Verify(resMissing.File).Ok);
+        Assert.Empty(WhsSave.CheckParts(hostWithoutHorseB, joinParts, resMissing.File, Quest, WhsSave.QuestItemMode.Strip));
+        Assert.Empty(WhsSave.ReadCompanionLinks(WhsSave.Inflate(resMissing.File).Raw));
+    }
+
+    [Fact]
+    public void Quest_only_saddlebag_removes_0x1301_in_Strip_mode_and_QuestItemMode_Host_preserves_host_horse_quest_items()
+    {
+        var (hs, js) = WhsSaveTests.Pair();
+        var hostHorseWithQuest = new HorseSpec(
+            HorseBInst, HorseBShared, "tsem_horseForSale_2", 0x2002UL, 20, [0xCC],
+            Items: [new("88888888-0000-0000-0000-000000000008", QuestLetterCls)],
+            Equipped0001: []);
+        var joinHorseQuestOnly = new HorseSpec(
+            HorseBInst, HorseBShared, "tsem_horseForSale_2", 0x2002UL, 77, [0x11],
+            Items: [new("77777777-0000-0000-0000-000000000007", QuestLetterCls)],
+            Equipped0001: ["77777777-0000-0000-0000-000000000007"]);
+
+        var hostFile = BuildSaveWithCompanions(hs, [BuildHorseSoul(hostHorseWithQuest)], []);
+        var joinFile = BuildSaveWithCompanions(js, [BuildHorseSoul(joinHorseQuestOnly)], [(WhsSave.HenrySoul, HorseBInst)]);
+
+        // Strip mode: 0 items remain -> 0x1301 field omitted completely
+        var stripRes = WhsSave.Splice(hostFile, joinFile, Quest, WhsSave.QuestItemMode.Strip);
+        Assert.Empty(WhsSave.Check(hostFile, joinFile, stripRes.File, Quest, WhsSave.QuestItemMode.Strip));
+        var stripRaw = WhsSave.Inflate(stripRes.File).Raw;
+        var stripHorse = WhsSave.FindSoul(stripRaw, HorseBInst)!.Value;
+        Assert.False(WhsSave.SoulFields(stripRaw, stripHorse).ContainsKey(0x1301));
+
+        // Host mode: Joiner's quest item stripped, Host's horse quest item preserved!
+        var hostModeRes = WhsSave.Splice(hostFile, joinFile, Quest, WhsSave.QuestItemMode.Host);
+        Assert.Empty(WhsSave.Check(hostFile, joinFile, hostModeRes.File, Quest, WhsSave.QuestItemMode.Host));
+        var hostModeRaw = WhsSave.Inflate(hostModeRes.File).Raw;
+        var hostModeItems = WhsSave.DecodeSoulInventoryItems(hostModeRaw, WhsSave.FindSoul(hostModeRaw, HorseBInst)!.Value);
+        var keptQuest = Assert.Single(hostModeItems);
+        Assert.Equal("88888888-0000-0000-0000-000000000008", keptQuest.Instance);
+    }
+
+    [Fact]
     public void Real_backup_saves_splice_horse_companions_and_saddlebags_cleanly_when_present()
     {
         const string backupDir = @"d:\Code\kcd2\kct-save-backups";

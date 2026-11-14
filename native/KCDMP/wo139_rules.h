@@ -72,6 +72,7 @@ inline bool is_entity_name(const char* s, size_t n) {
         const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
                         c == '_' || c == '[' || c == ']' || c == '/' || c == '-' || c == ':';
         if (!ok) return false;
+        if (c == '/' && i > 0 && s[i - 1] == '/') return false;
     }
     return true;
 }

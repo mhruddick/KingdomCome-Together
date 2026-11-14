@@ -25,9 +25,20 @@ public class M3HorseRulesTests
     [InlineData("horse\"quote", false)]
     [InlineData("horse;cmd", false)]
     [InlineData("horse\\slash", false)]
+    [InlineData("horse[animalcare//horseCare6]", false)]
     public void IsHorseEntityName_accepts_authored_and_bracketed_names_and_rejects_unsafe_inputs(string input, bool expected)
     {
         Assert.Equal(expected, M3HorseRules.IsHorseEntityName(input));
+    }
+
+    [Fact]
+    public void LongAlias_matches_native_wo217_and_lua_alias_hashes_for_60plus_char_names()
+    {
+        Assert.Null(M3HorseRules.LongAlias(null));
+        Assert.Null(M3HorseRules.LongAlias("tsem_sedivka"));
+        Assert.Null(M3HorseRules.LongAlias(new string('h', 59)));
+        Assert.NotNull(M3HorseRules.LongAlias(new string('h', 60)));
+        Assert.Equal("lh838eb35a", M3HorseRules.LongAlias("horse[animalcare/horseCare6_ff15a088-7332-4a17-9536-3e8f6a8898ad]"));
     }
 
     [Fact]

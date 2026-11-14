@@ -263,6 +263,50 @@ public static partial class WhsSave
         return classes.ToList();
     }
 
+    /// <summary>
+    /// Reads the joiner's owned horse entity/soul name (<c>0x12F9</c>) and equipped tack classes from <paramref name="parts"/>.
+    /// Returns true when <paramref name="parts"/> carries explicit horse ownership state (including <c>horseName == null</c> for no horse).
+    /// </summary>
+    public static bool TryExtractHorseCompanionInfo(HenryParts? parts, out string? horseName, out List<string> tackClasses)
+    {
+        horseName = null;
+        tackClasses = [];
+        if (parts is null) return false;
+        if (!parts.Extensions.TryGetValue(HorseCompanionExtensionKey, out var ext))
+            return parts.Origin is HenryParts.OriginFreshDefault or HenryParts.OriginFreshSave;
+
+        DecodeHorseCompanionExtension(ext, out bool hasHorse, out _, out var horseRec);
+        if (!hasHorse) return true;
+
+        if (SoulFields(horseRec, RecordNode(horseRec)).TryGetValue(0x12F9, out var nf) && nf.Count > 0)
+        {
+            var b = Payload(horseRec, nf[0]);
+            int nul = Array.IndexOf(b, (byte)0);
+            if (nul < 0) nul = b.Length;
+            string s = Encoding.Latin1.GetString(b, 0, nul);
+            if (M3HorseRules.IsHorseEntityName(s)) horseName = s;
+        }
+        tackClasses = ExtractHorseEquippedTackClasses(parts);
+        return true;
+    }
+
+    private static byte[] RemoveSoulField(byte[] rec, ushort dropTag)
+    {
+        var rn = RecordNode(rec);
+        var kids = Children(rec, 6 + 32, 6 + rn.Len);
+        if (kids is null || !kids.Any(k => k.Tag == dropTag)) return rec;
+        using var ms = new MemoryStream();
+        ms.Write(rec, 6, 32);
+        foreach (var k in kids)
+            if (k.Tag != dropTag) ms.Write(rec, k.Off, 6 + k.Len);
+        var pay = ms.ToArray();
+        var o = new byte[6 + pay.Length];
+        BinaryPrimitives.WriteUInt16LittleEndian(o, rn.Tag);
+        BinaryPrimitives.WriteUInt32LittleEndian(o.AsSpan(2), (uint)pay.Length);
+        pay.CopyTo(o, 6);
+        return o;
+    }
+
     private static byte[] StripRemovedFromHorseEquipment0001(byte[] rec, HashSet<string> removedInstances)
     {
         if (removedInstances.Count == 0 || !HasField(rec, 0x1301)) return rec;
@@ -304,12 +348,57 @@ public static partial class WhsSave
         return changed ? Replace(rec, ch0001, ms.ToArray()) : rec;
     }
 
-    private static byte[] CleanHorseSoulRecord(byte[] horseRec, Dictionary<string, string> qclasses, SpliceReport? rep)
+    private static byte[] PrepareJoinerHorseSoul(
+        byte[] horseRec,
+        byte[] hostSoulNodeBytes,
+        Dictionary<string, string> qclasses,
+        QuestItemMode mode,
+        SpliceReport? rep)
     {
-        if (!HasItemList(horseRec) || qclasses.Count == 0) return horseRec;
+        List<(Node Node, string Inst, string Cls)> hostQuestItems = [];
+        if (mode == QuestItemMode.Host && qclasses.Count > 0
+            && hostSoulNodeBytes.Length >= 6 + 32 && RecordNode(hostSoulNodeBytes).Tag == 0x115E
+            && HasItemList(hostSoulNodeBytes))
+        {
+            hostQuestItems = InventoryItems(hostSoulNodeBytes).Items.Where(h => qclasses.ContainsKey(h.Cls)).ToList();
+        }
+
+        if (!HasItemList(horseRec))
+        {
+            var baseRec = HasField(horseRec, 0x1301) ? RemoveSoulField(horseRec, 0x1301) : horseRec;
+            if (hostQuestItems.Count == 0) return baseRec;
+
+            var hostLst = FieldChain(hostSoulNodeBytes, 0x1301, 0x0007)[^1];
+            using var lstMs = new MemoryStream();
+            foreach (var c in Children(hostSoulNodeBytes, hostLst.PayloadOff, hostLst.End) ?? [])
+                if (c.Tag == 0x0000) lstMs.Write(hostSoulNodeBytes, c.Off, 6 + c.Len);
+            foreach (var h in hostQuestItems)
+            {
+                lstMs.Write(hostSoulNodeBytes, h.Node.Off, 6 + h.Node.Len);
+                rep?.QuestItemsAdded.Add(qclasses[h.Cls]);
+            }
+            var lstBytes = lstMs.ToArray();
+            var pay1301 = new byte[6 + lstBytes.Length + 6];
+            BinaryPrimitives.WriteUInt16LittleEndian(pay1301, 0x0007);
+            BinaryPrimitives.WriteUInt32LittleEndian(pay1301.AsSpan(2), (uint)lstBytes.Length);
+            lstBytes.CopyTo(pay1301, 6);
+            BinaryPrimitives.WriteUInt16LittleEndian(pay1301.AsSpan(6 + lstBytes.Length), 0x0001);
+            BinaryPrimitives.WriteUInt32LittleEndian(pay1301.AsSpan(6 + lstBytes.Length + 2), 0u);
+            return AppendField(baseRec, 0x1301, pay1301);
+        }
+
         var (ch, items) = InventoryItems(horseRec);
-        var drop = items.Where(it => qclasses.ContainsKey(it.Cls)).ToList();
-        if (drop.Count == 0) return horseRec;
+        var drop = qclasses.Count == 0 ? [] : items.Where(it => qclasses.ContainsKey(it.Cls)).ToList();
+        foreach (var d in drop)
+            rep?.QuestItemsRemoved.Add(qclasses[d.Cls]);
+        foreach (var h in hostQuestItems)
+            rep?.QuestItemsAdded.Add(qclasses[h.Cls]);
+
+        int remainingCount = (items.Count - drop.Count) + hostQuestItems.Count;
+        if (remainingCount == 0)
+            return RemoveSoulField(horseRec, 0x1301);   // M8: real KCD2 empty horses carry no 0x1301 field
+
+        if (drop.Count == 0 && hostQuestItems.Count == 0) return horseRec;
 
         var lst = ch[^1];
         var body = new List<byte>(Payload(horseRec, lst));
@@ -319,8 +408,8 @@ public static partial class WhsSave
             body.RemoveRange(d.Node.Off - lst.PayloadOff, 6 + d.Node.Len);
             removedIds.Add(d.Inst);
         }
-        foreach (var d in drop)
-            rep?.QuestItemsRemoved.Add(qclasses[d.Cls]);
+        foreach (var h in hostQuestItems)
+            body.AddRange(NodeBytes(hostSoulNodeBytes, h.Node));
 
         var cleaned = Replace(horseRec, ch, body.ToArray());
         cleaned = StripRemovedFromHorseEquipment0001(cleaned, removedIds);
@@ -328,15 +417,47 @@ public static partial class WhsSave
         return cleaned;
     }
 
-    private static byte[] MergeHorseSoulIntoHost(byte[] hostSoulNodeBytes, byte[] cleanedJoinerHorseBytes)
+    private static byte[] MergeHorseSoulIntoHost(byte[] hostRaw, HenryParts parts, byte[] hostSoulNodeBytes, byte[] cleanedJoinerHorseBytes)
     {
         var hostNode = RecordNode(hostSoulNodeBytes);
         if (hostNode.Tag != 0x115E)
         {
-            // Promote minimal 0x115D soul using host's 32-byte GUID prefix + joiner's 0x115E fields
-            var promoted = (byte[])cleanedJoinerHorseBytes.Clone();
-            if (hostSoulNodeBytes.Length >= 6 + 32)
-                hostSoulNodeBytes.AsSpan(6, 32).CopyTo(promoted.AsSpan(6, 32));
+            if (hostSoulNodeBytes.Length < 6 + 32) return hostSoulNodeBytes;
+            bool sameSeed = parts.Seed is uint js && ReadSeed(hostRaw) is uint hs && js == hs;
+            var joinKids0 = Children(cleanedJoinerHorseBytes, 6 + 32, cleanedJoinerHorseBytes.Length)
+                ?? throw new InvalidDataException("joiner horse 0x115E record does not parse");
+            using var pms = new MemoryStream();
+            Span<byte> hdr = stackalloc byte[6];
+            pms.Write(hostSoulNodeBytes, 6, 32);
+            foreach (var jk in joinKids0)
+            {
+                if (jk.Tag == 0x12F9)
+                {
+                    // M7: zero foreign entity_guid in 0x12F9 when promoting an unloaded 0x115D soul
+                    var p12f9 = Payload(cleanedJoinerHorseBytes, jk);
+                    int nul = Array.IndexOf(p12f9, (byte)0);
+                    int nameLen = nul >= 0 ? nul : p12f9.Length;
+                    var clean12f9 = new byte[nameLen + 1 + 8];
+                    p12f9.AsSpan(0, nameLen).CopyTo(clean12f9);
+                    BinaryPrimitives.WriteUInt16LittleEndian(hdr, 0x12F9);
+                    BinaryPrimitives.WriteUInt32LittleEndian(hdr[2..], (uint)clean12f9.Length);
+                    pms.Write(hdr);
+                    pms.Write(clean12f9);
+                }
+                else if (jk.Tag == 0x12FF)
+                {
+                    if (sameSeed) pms.Write(cleanedJoinerHorseBytes, jk.Off, 6 + jk.Len);
+                }
+                else
+                {
+                    pms.Write(cleanedJoinerHorseBytes, jk.Off, 6 + jk.Len);
+                }
+            }
+            var ppay = pms.ToArray();
+            var promoted = new byte[6 + ppay.Length];
+            BinaryPrimitives.WriteUInt16LittleEndian(promoted, 0x115E);
+            BinaryPrimitives.WriteUInt32LittleEndian(promoted.AsSpan(2), (uint)ppay.Length);
+            ppay.CopyTo(promoted, 6);
             return promoted;
         }
 
@@ -386,11 +507,40 @@ public static partial class WhsSave
         return outNode;
     }
 
+    private static bool TryResolveJoinerHorseCompanion(
+        byte[] hostRaw,
+        HenryParts parts,
+        out bool hasHorse,
+        out string jHorseGuid,
+        out byte[] jHorseNodeBytes)
+    {
+        if (parts.Extensions.TryGetValue(HorseCompanionExtensionKey, out var ext))
+        {
+            DecodeHorseCompanionExtension(ext, out hasHorse, out jHorseGuid, out jHorseNodeBytes);
+            return true;
+        }
+        // H6: FreshDefaultParts / v1 fresh blocks have no horse_companion extension --
+        // a "Start fresh" Joiner starts with NO horse rather than inheriting Host's companion horse,
+        // while leaving legacy synthetic 4-byte 00 00 00 00 test fixtures untouched.
+        if (parts.Origin is HenryParts.OriginFreshDefault or HenryParts.OriginFreshSave
+            && TryReadCompanionEntries(hostRaw, out _, out bool isSyntheticZero)
+            && !isSyntheticZero)
+        {
+            hasHorse = false;
+            jHorseGuid = "";
+            jHorseNodeBytes = [];
+            return true;
+        }
+        hasHorse = false;
+        jHorseGuid = "";
+        jHorseNodeBytes = [];
+        return false;
+    }
+
     internal static byte[] BuildMergedCompanionPayload(byte[] hostRaw, HenryParts parts)
     {
-        if (!parts.Extensions.TryGetValue(HorseCompanionExtensionKey, out var ext))
+        if (!TryResolveJoinerHorseCompanion(hostRaw, parts, out bool hasHorse, out string jHorseGuid, out _))
             return PathGet(hostRaw, CompanionBlock) is Node n0 ? Payload(hostRaw, n0) : [];
-        DecodeHorseCompanionExtension(ext, out bool hasHorse, out string jHorseGuid, out _);
         if (!TryReadCompanionEntries(hostRaw, out var hostEntries, out _)) return [];
 
         using var ms = new MemoryStream();
@@ -446,32 +596,32 @@ public static partial class WhsSave
         public byte[] TransformSoulRecord(string soulGuid, byte[] hostRaw, byte[] currentSoulNodeBytes,
                                           HenryParts parts, Dictionary<string, string> qclasses, QuestItemMode mode, SpliceReport rep)
         {
-            if (!parts.Extensions.TryGetValue(HorseCompanionExtensionKey, out var ext)) return currentSoulNodeBytes;
-            DecodeHorseCompanionExtension(ext, out bool hasHorse, out string jHorseGuid, out var jHorseNodeBytes);
+            if (!TryResolveJoinerHorseCompanion(hostRaw, parts, out bool hasHorse, out string jHorseGuid, out var jHorseNodeBytes))
+                return currentSoulNodeBytes;
             if (!hasHorse || soulGuid != jHorseGuid) return currentSoulNodeBytes;
-            var cleanedJoinerHorse = CleanHorseSoulRecord(jHorseNodeBytes, qclasses, rep);
-            return MergeHorseSoulIntoHost(currentSoulNodeBytes, cleanedJoinerHorse);
+            var cleanedJoinerHorse = PrepareJoinerHorseSoul(jHorseNodeBytes, currentSoulNodeBytes, qclasses, mode, rep);
+            return MergeHorseSoulIntoHost(hostRaw, parts, currentSoulNodeBytes, cleanedJoinerHorse);
         }
 
         public void AddBlockJobs(byte[] hostRaw, HenryParts parts, Dictionary<string, string> qclasses,
                                  QuestItemMode mode, SpliceReport rep, List<(ushort[] Tags, byte[] Payload)> jobs)
         {
-            if (!parts.Extensions.ContainsKey(HorseCompanionExtensionKey)) return;
+            if (!TryResolveJoinerHorseCompanion(hostRaw, parts, out _, out _, out _)) return;
             if (PathGet(hostRaw, CompanionBlock) is null) return;
             jobs.Add((CompanionBlock, BuildMergedCompanionPayload(hostRaw, parts)));
         }
 
         public void AddSplicedPaths(byte[] hostRaw, HenryParts parts, HashSet<string> splicedPaths)
         {
-            if (parts.Extensions.ContainsKey(HorseCompanionExtensionKey) && PathGet(hostRaw, CompanionBlock) is not null)
+            if (TryResolveJoinerHorseCompanion(hostRaw, parts, out _, out _, out _) && PathGet(hostRaw, CompanionBlock) is not null)
                 splicedPaths.Add("01f4/01f8/7308/3529/1160");
         }
 
         public void CheckSpliced(byte[] hostRaw, byte[] outRaw, HenryParts parts, Dictionary<string, string> qclasses,
                                  QuestItemMode mode, List<string> fails)
         {
-            if (!parts.Extensions.TryGetValue(HorseCompanionExtensionKey, out var ext)) return;
-            DecodeHorseCompanionExtension(ext, out bool hasHorse, out string jHorseGuid, out var jHorseNodeBytes);
+            if (!TryResolveJoinerHorseCompanion(hostRaw, parts, out bool hasHorse, out string jHorseGuid, out var jHorseNodeBytes))
+                return;
 
             if (PathGet(hostRaw, CompanionBlock) is not null)
             {
@@ -485,21 +635,28 @@ public static partial class WhsSave
                     fails.Add("RPGModule 1160 companion block does not match expected merge");
             }
 
-            if (hasHorse && FindSoul(hostRaw, jHorseGuid) is not null)
+            if (hasHorse && FindSoul(hostRaw, jHorseGuid) is Node hostHorse)
             {
                 if (FindSoul(outRaw, jHorseGuid) is not Node outHorse || outHorse.Tag != 0x115E)
                 {
                     fails.Add($"joiner horse soul {jHorseGuid} missing or not 0x115E in output");
                     return;
                 }
+                var hostHorseBytes = NodeBytes(hostRaw, hostHorse);
                 var expItems = DecodeSoulInventoryItems(jHorseNodeBytes, RecordNode(jHorseNodeBytes))
                     .Where(i => !qclasses.ContainsKey(i.Class))
                     .ToList();
+                if (mode == QuestItemMode.Host && hostHorse.Tag == 0x115E)
+                    expItems.AddRange(DecodeSoulInventoryItems(hostRaw, hostHorse).Where(i => qclasses.ContainsKey(i.Class)));
+
                 var actItems = DecodeSoulInventoryItems(outRaw, outHorse);
                 if (!expItems.SequenceEqual(actItems))
                     fails.Add($"joiner horse {jHorseGuid} saddlebag inventory mismatch ({actItems.Count} vs {expItems.Count} items)");
 
-                var cleanedRec = CleanHorseSoulRecord(jHorseNodeBytes, qclasses, null);
+                if (expItems.Count == 0 && SoulFields(outRaw, outHorse).ContainsKey(0x1301))
+                    fails.Add($"joiner horse {jHorseGuid} carries empty 0x1301 after item strip");
+
+                var cleanedRec = PrepareJoinerHorseSoul(jHorseNodeBytes, hostHorseBytes, qclasses, mode, null);
                 var expEq = ReadSoulEquippedInstances(cleanedRec);
                 var actEq = ReadSoulEquippedInstances(NodeBytes(outRaw, outHorse));
                 if (!expEq.SequenceEqual(actEq))
