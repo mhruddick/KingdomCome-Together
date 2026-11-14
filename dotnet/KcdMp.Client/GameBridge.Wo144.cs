@@ -66,8 +66,19 @@ public partial class GameBridge
         if (_w144ParkedCrime.TryRemove(name, out var parked) && (DateTime.UtcNow - parked.At).TotalHours < 2)
         {
             int dropped = parked.Rec.DropReportedTrespasses();   // WO-157 1.2: his own machine's trespass reports are not trusted
-            _w139Records[id] = parked.Rec;
+            if (parked.Rec.Count > 0) _w139Records[id] = parked.Rec;
+            Wo139PersistNamedPlayerRecord(name, parked.Rec);
             Console.WriteLine($"MP-W139 host: ghost {id} is back -- the crime record kept for that player is his again ({parked.Rec.Count} crime(s)){(dropped > 0 ? $"; {dropped} trespass(es) his own game reported were dropped (WO-157)" : "")}");
+        }
+        else if (Wo139TryRestoreFromStore(name, out var stored))
+        {
+            int dropped = stored.DropReportedTrespasses();
+            if (stored.Count > 0)
+            {
+                _w139Records[id] = stored;
+                if (dropped > 0) Wo139PersistNamedPlayerRecord(name, stored);
+                Console.WriteLine($"MP-W139 host: ghost {id} connected -- restored persisted crime record ({stored.Count} crime(s)){(dropped > 0 ? $"; {dropped} trespass(es) dropped (WO-157)" : "")}");
+            }
         }
     }
 
@@ -77,8 +88,12 @@ public partial class GameBridge
         string? name = _peers.Disconnected(id);
         Wo191ForgetSender(id, "disconnected");   // WO-191 1a
         Wo203CamOnPeerGone(id);                  // WO-203B: his conversation's view ends here; he no longer listens to ours
-        if (name is not null && _w139Records.TryRemove(id, out var rec) && rec.Count > 0)
-            _w144ParkedCrime[name] = (rec, DateTime.UtcNow);
+        if (name is not null && _w139Records.TryRemove(id, out var rec))
+        {
+            if (rec.Count > 0) _w144ParkedCrime[name] = (rec, DateTime.UtcNow);
+            else _w144ParkedCrime.TryRemove(name, out _);
+            Wo139PersistNamedPlayerRecord(name, rec);
+        }
         Console.WriteLine($"MP-PEERS ghost {id} disconnected ({LivePartners().Count} partner(s) now) -- it stays removed until the relay names that id again");
         // WO-151 3.6: a partner who left holds nothing here any more (his talks and stops ended with him)
         _ = ExecLuaAsync($"if KCD2MP_W151ReleasePeerHolds then KCD2MP_W151ReleasePeerHolds({id}) end");

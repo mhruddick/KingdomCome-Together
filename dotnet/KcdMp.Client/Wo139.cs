@@ -326,6 +326,17 @@ public sealed class JoinerCrimeRecord
         return true;
     }
 
+    internal void Restore(IEnumerable<Crime> crimes)
+    {
+        _open.Clear();
+        foreach (var c in crimes)
+        {
+            if (c.Witnesses <= 0) continue;
+            _open.Add(c);
+            if (_open.Count > 200) _open.RemoveAt(0);
+        }
+    }
+
     /// <summary>
     /// WO-157 1.2: the trespasses this player's OWN machine reported (Id != 0) leave the record; every other crime stays.
     /// 0.45.1 judged those reports without asking the host's world (a shop open there was private on the joiner's), and

@@ -197,8 +197,9 @@ public partial class GameBridge
             Interlocked.Increment(ref _w151CrimeOwn);
             foreach (byte peer in Wo134Peers())
             {
-                var c = new JoinerCrimeRecord.Crime { Id = 0, Kind = f[1], Settlement = settlement, Witnesses = wit, Guards = guards, AtMs = Environment.TickCount64 };
+                var c = new JoinerCrimeRecord.Crime { Id = 0, Kind = f[1], Settlement = settlement, Witnesses = wit, Guards = guards, AtWorldS = _lastPolledWorldTime ?? 0, AtMs = Environment.TickCount64 };
                 bool kept = Wo139Record(peer).Add(c);
+                Wo139PersistPeerRecord(peer);
                 Console.WriteLine($"MP-W151 crime joint: the host's own {f[1]} ({wit} witness(es), {guards} guard(s) in {(settlement.Length > 0 ? settlement : "the wilds")}) -- ghost {peer} answers for it too{(kept ? "" : " (merged)")}");
             }
         }
@@ -209,6 +210,7 @@ public partial class GameBridge
             {
                 if (!_w139Records.TryGetValue(peer, out var rec)) continue;
                 int n = rec.Clear(null);
+                Wo139PersistPeerRecord(peer);
                 foreach (var (g, p) in _w139Pursuits.ToArray()) if (p.Peer == peer) await Wo139EndPursuitAsync(g, "the host's record is cleared (joint)");
                 await Wo139SendAsync(Protocol.CrimeHostUp, peer, Protocol.CrimeHostCleared, 0, Wo139Rules.ClearedText("partner-" + f[1], null));
                 Console.WriteLine($"MP-W151 crime joint: the host {f[1]} -- ghost {peer}'s record cleared too ({n} crime(s))");
