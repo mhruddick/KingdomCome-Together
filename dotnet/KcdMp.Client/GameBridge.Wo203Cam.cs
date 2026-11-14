@@ -100,7 +100,14 @@ public partial class GameBridge
     private void W3cEndTalk(W203Talk talk, string reason)
     {
         byte[] told;
-        lock (_w3cLock) { told = [.. talk.Told]; talk.Listeners.Clear(); }
+        bool hadListeners;
+        lock (_w3cLock)
+        {
+            told = [.. talk.Told];
+            hadListeners = talk.Listeners.Count > 0;
+            talk.Listeners.Clear();
+        }
+        if (hadListeners) Wo200NoteTalkEndedWithListeners(talk.Cid);
         talk.Pump?.Cancel();
         if (talk.Armed) { talk.Armed = false; _ = W3cNativeAsync(Protocol.Wo203OpConvCamPoll, [0]); }
         string text = Wo203CamRules.EndText(talk.Cid, reason);

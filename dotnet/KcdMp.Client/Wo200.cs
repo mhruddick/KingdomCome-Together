@@ -191,6 +191,61 @@ public static class Wo200Rules
     public const int QClassChunk = 32;
     /// <summary>A count above this is no quest item's (a malformed or hostile frame).</summary>
     public const int QCountMax = 9999;
+
+    // ---- M4: runtime dialogue & haggle isolation + shared listened-in / quest reputation ----
+
+    /// <summary>Shop / bribe haggling dialogues and haggle-denial buff nodes: always personal to the haggling player.</summary>
+    public static bool IsHaggleDialogue(string? path, string? port = null)
+    {
+        string p = path ?? "", q = port ?? "";
+        return p.Contains("smlouvani_v_obchode", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("bribeHaggleNegotiation", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("bribe_haggle_negotiation", StringComparison.OrdinalIgnoreCase)
+            || p.Contains("add_haggle_denial", StringComparison.OrdinalIgnoreCase)
+            || q.Contains("add_haggle_denial", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Bathhouse service dialogues (Barbora.open_world.lazne_a_lazebnice.*): personal service payment/buffs; time-skip rides WO-140.</summary>
+    public static bool IsBathhouseServiceDialogue(string? path)
+    {
+        string p = path ?? "";
+        return p.Contains(".lazne_a_lazebnice.", StringComparison.OrdinalIgnoreCase)
+            || p.EndsWith(".lazne_a_lazebnice", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Guard arrest and crime punishment dialogues: handled per-player by WO-139, never replayed onto the host's Henry.</summary>
+    public static bool IsCrimePunishmentDialogue(string? path)
+    {
+        string p = path ?? "";
+        return p.Contains(".nextnextgenpunishment", StringComparison.OrdinalIgnoreCase)
+            || p.Contains(".utils.crime.punishment", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsAlwaysLocalDialogue(string? path, string? port = null) =>
+        IsHaggleDialogue(path, port) || IsBathhouseServiceDialogue(path) || IsCrimePunishmentDialogue(path);
+
+    public static bool IsOpenWorldDialogue(string? path) =>
+        (path ?? "").StartsWith("Barbora.open_world.", StringComparison.Ordinal);
+
+    /// <summary>
+    /// M4: decides whether a joiner's captured dialogue out-port is sent to the host as an OutPortReplay.
+    ///   1. Haggle, bathhouse service, and crime punishment dialogues stay strictly local even when listened to.
+    ///   2. Barbora.open_world.* dialogues stay local when solo (!hasListeners) and replay when a partner listens in (hasListeners).
+    ///   3. Story and side-quest dialogues (Barbora.trosecko.*, Barbora.kutnohorsko.*, Barbora.klaster.*, etc.) replay as normal.
+    /// </summary>
+    public static bool ShouldReplayDialogueOutPort(string? path, string? port, bool hasListeners, out string reason)
+    {
+        if (IsHaggleDialogue(path, port)) { reason = "haggle-local"; return false; }
+        if (IsBathhouseServiceDialogue(path)) { reason = "bathhouse-local"; return false; }
+        if (IsCrimePunishmentDialogue(path)) { reason = "punishment-local"; return false; }
+        if (IsOpenWorldDialogue(path))
+        {
+            reason = hasListeners ? "open-world-listened" : "open-world-solo";
+            return hasListeners;
+        }
+        reason = "quest";
+        return true;
+    }
 }
 
 /// <summary>
